@@ -2246,7 +2246,7 @@ static void par_flush(VkExec *ex) {
 // ---- a pass end that does not wait for its slices (TOTK_PAR_DEFER)
 // Waiting for the slices at the end of a sliced pass, the submitting thread recorded the slices left over itself and
 // then waited for the workers: about 2.4 ms of a 10.7 ms frame on the route's Lake Level (3.2.0, 4 threads), on the
-// frame's critical path. With TOTK_PAR_DEFER the pass end is held back instead: its calls (the query end, the end of
+// frame's critical path. With TOTK_PAR_DEFER (on by default; 0 waits as before) the pass end is held back instead: its calls (the query end, the end of
 // rendering, the BC stand-ins' copies) are captured (vk_rec.c rec_capture_begin), the part that holds the pass is left
 // open (vk_sync_split_defer), and the walk goes on in a new part while the workers record. par_settle waits for them
 // later, makes vkCmdExecuteCommands and the captured calls into the open part, and submits it ahead of the new one.
@@ -2273,7 +2273,7 @@ static void par_flush(VkExec *ex) {
 // held pass were still recording, 32-63 ms came before the walk's first change.
 static int par_defer_ok(const VkExec *ex) {
     if (par_defer_mode < 0) {
-        par_defer_mode = rt_knob("PAR_DEFER", "0");
+        par_defer_mode = rt_knob("PAR_DEFER", "1");
         rt_log("vk: the end of a sliced pass %s for its slices (TOTK_PAR_DEFER=%s)",
                par_defer_mode == 2 ? "does not wait in the B blocks" : par_defer_mode ? "does not wait" : "waits",
                par_defer_mode == 2 ? "ab" : par_defer_mode ? "1" : "0");
