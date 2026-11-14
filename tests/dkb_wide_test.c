@@ -33,6 +33,7 @@ void rt_patch_switch(int set, int on) {
 }
 void *rt_patch_page(void) { page_reads++; return test_page; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
+int res_heapdef_grown(void) { return 0; }
 
 static void reset(const char *text) {
     resolution = text;

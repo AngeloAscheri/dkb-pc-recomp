@@ -40,13 +40,50 @@ static float dkb_scene_ratio(void) {
     return ratio;
 }
 
-// WORKAROUND, not a fix: the largest render-target pool scene_res grows. A larger one crashes the game before it shows
-// anything (access violation reading 0xa0 in main+0x128d40 on 3.2.0, an allocation that comes back null), whatever the
-// scene size: a 5760x3240 output on auto, an 800 MiB pool and a small scene, crashes the same way. At a 3840x2160
-// output, pools of 452 and 474 MiB ran, 514 MiB and up crashed; the limit is likely the heap the pool is carved from,
-// still to be found, and this cap should go once it is. A ratio whose pool would pass it is raised to the smallest
-// ratio whose pool fits, so the scene keeps the sizes the pool is grown for.
+// The render-target pool is carved from the GSys heap, 518144 KiB (506 MiB) in
+// System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs. A pool GSys cannot hold leaves the game with a null
+// allocation, and it crashes before it shows anything (access violation reading 0xa0 in main+0x128d40 on 3.2.0): at a
+// 3840x2160 output, pools of 474 MiB ran and 514 MiB crashed, and a 5760x3240 output on auto (800 MiB) the same.
+// So GSys grows by what the pool adds to the stock 200 MiB (dkb_wide_heap_extra_kib; resolution.c rewrites the table,
+// memory.c adds the amount to the application pool, so no other heap shrinks). When the table cannot be rewritten
+// (a RomFS without it, a format resolution.c does not know), scene_res keeps the pool within the 474 MiB that ran.
+#define DKB_POOL_BASE 0xc800000u
 #define DKB_SCENE_POOL_MAX (474u << 20)
+
+// The pool scene_res asks for at that ratio: the game sizes it for its own ratio, 1.5, so it grows by (1.5 / ratio)^2,
+// rounded up to 2 MiB.
+static uint32_t dkb_scene_pool(uint32_t pool, float ratio) {
+    float grow = (1.5f / ratio) * (1.5f / ratio);
+    if (grow <= 1.0f) return pool;
+    const uint64_t align = 2u << 20;
+    uint64_t bytes = (uint64_t)((double)pool * grow + 0.999);
+    bytes = (bytes + align - 1) / align * align;
+    return (uint32_t)(bytes < 0x80000000u ? bytes : 0x80000000u);   // 2 GiB at most (7680x4320 at ratio 1.0 would ask 3.1)
+}
+
+// TOTK_OUTPUT_RES as dkb_wide_init accepts it; 0 for any other value (dkb_wide_init says why).
+static int dkb_output_size(unsigned *width, unsigned *height) {
+    int allow_wide = cfg_bool("TOTK_ULTRAWIDE");
+    char tail;
+    return sscanf(cfg_value("TOTK_OUTPUT_RES"), "%ux%u%c", width, height, &tail) == 2 && *width >= 1280 &&
+           *width <= 7680 && *height >= 720 && *height <= 4320 && !(*width % 2) && !(*height % 2) &&
+           *width * 9 >= *height * 16 && (allow_wide || *width * 9 == *height * 16);
+}
+
+// What the render-target pool adds to the stock 200 MiB at the configured output and scene_res, in KiB: GSys grows by
+// it (resolution.c). Read once memory.c has read the settings, before dkb_wide_init, from the same settings.
+uint64_t dkb_wide_heap_extra_kib(void) {
+    static int done;
+    static uint64_t extra;
+    if (done) return extra;
+    done = 1;
+    unsigned width, height;
+    if (rt_patch_set("dkbwide") < 0 || !dkb_output_size(&width, &height)) return extra = 0;
+    uint32_t pool = dkb_wide_pool_bytes(width, height);
+    float ratio = dkb_scene_ratio();
+    if (ratio && rt_patch_set("dkbscene") >= 0) pool = dkb_scene_pool(pool, ratio);
+    return extra = pool > DKB_POOL_BASE ? (uint64_t)(pool - DKB_POOL_BASE) >> 10 : 0;
+}
 
 static void dkb_wide_scene(uint8_t *page, float ratio) {
     int set = rt_patch_set("dkbscene");
@@ -56,25 +93,24 @@ static void dkb_wide_scene(uint8_t *page, float ratio) {
     }
     uint32_t pool;
     memcpy(&pool, page + 0x110, 4);
-    // The pool grows by (1.5 / ratio)^2, so the smallest ratio that keeps it within the cap is 1.5 * sqrt(pool / cap).
-    // At 1.5 it does not grow, so the ratio is not raised past that: an output whose own pool is past the cap (5760x3240
-    // and up) is the open crash above, and a smaller scene would not help it.
-    float floor_ratio = (float)(1.5 * sqrt((double)pool / DKB_SCENE_POOL_MAX));
-    if (floor_ratio > 1.5f) floor_ratio = 1.5f;
-    if (ratio < floor_ratio) {
-        rt_log("Bananza resolution: scene_res ratio %.3f would grow the render-target pool to %u MiB, past the %u MiB "
-               "the game was seen to run with; using %.3f",
-               ratio, (unsigned)((double)pool * (1.5 / ratio) * (1.5 / ratio)) >> 20, DKB_SCENE_POOL_MAX >> 20,
-               floor_ratio);
-        ratio = floor_ratio;
+    if (!res_heapdef_grown()) {
+        // GSys keeps its stock size: the pool grows by (1.5 / ratio)^2, so the smallest ratio that keeps it within the
+        // cap is 1.5 * sqrt(pool / cap), and not past 1.5, where it does not grow.
+        float floor_ratio = (float)(1.5 * sqrt((double)pool / DKB_SCENE_POOL_MAX));
+        if (floor_ratio > 1.5f) floor_ratio = 1.5f;
+        if (ratio < floor_ratio) {
+            rt_log("Bananza resolution: the GSys heap keeps its stock size, so scene_res ratio %.3f (a %u MiB render-target "
+                   "pool) is raised to %.3f",
+                   ratio, dkb_scene_pool(pool, ratio) >> 20, floor_ratio);
+            ratio = floor_ratio;
+        }
     }
-    float grow = (1.5f / ratio) * (1.5f / ratio);
-    if (grow > 1.0f) {
-        const uint64_t align = 2u << 20;
-        uint64_t bytes = (uint64_t)((double)pool * grow + 0.999);
-        bytes = (bytes + align - 1) / align * align;
-        if (bytes > DKB_SCENE_POOL_MAX) bytes = DKB_SCENE_POOL_MAX;   // the rounding up to 2 MiB can pass it by one step
-        pool = (uint32_t)bytes;
+    uint32_t grown = dkb_scene_pool(pool, ratio);
+    // The 2 MiB rounding can pass the cap by a step; the cap only limits growth, never the pool the output itself needs.
+    if (!res_heapdef_grown() && grown > pool && grown > DKB_SCENE_POOL_MAX)
+        grown = pool > DKB_SCENE_POOL_MAX ? pool : DKB_SCENE_POOL_MAX;
+    if (grown != pool) {
+        pool = grown;
         memcpy(page + 0x110, &pool, 4);
     }
     memcpy(page + 0x118, &ratio, 4);
@@ -115,14 +151,8 @@ void dkb_wide_init(void) {
     }
     rt_patch_switch(set, 0);
     float scene = dkb_scene_ratio();
-    int allow_wide = cfg_bool("TOTK_ULTRAWIDE");
     unsigned width = 0, height = 0;
-    char tail;
-    const char *value = cfg_value("TOTK_OUTPUT_RES");
-    if (sscanf(value, "%ux%u%c", &width, &height, &tail) != 2 ||
-        width < 1280 || width > 7680 || height < 720 || height > 4320 ||
-        width % 2 || height % 2 || width * 9 < height * 16 ||
-        (!allow_wide && width * 9 != height * 16)) {
+    if (!dkb_output_size(&width, &height)) {
         rt_patch_switch(set, 0);
         rt_log("Bananza resolution: use an even 16:9 resolution, or enable ultrawide for a wider resolution; using stock 2880x1620");
         if (scene) rt_log("Bananza resolution: scene_res needs a valid output resolution and is not applied");
