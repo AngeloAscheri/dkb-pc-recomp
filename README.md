@@ -30,11 +30,15 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
 
 - Device lost on NVIDIA in the Glacier rock ride ([#196](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/196))
   and in Layer 500 ([#197](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/197)): one bug, with the same draw in
-  flight in both. Fast-linked pipelines and the pipeline cache are ruled out; a recorded crashing run is being replayed.
+  flight in both, reported on RTX 5070 Ti, 5080 and 5090. Fast-linked pipelines and the pipeline cache are ruled out;
+  recorded crashing runs replay here on an RTX 5060 Ti without the fault.
 - Device lost on AMD cards with AMD's Windows driver. On 0.3.0, `vk_recorder = 0` in `dkb.ini` stopped it for three
   players (#84, #155, #142), then #124 and #123, and it is the default on `bananza` since d161f88. Other AMD reports
-  wait for a retest (#176, #193, #206). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204).
-- Guest crashes in later areas (#148, #157, #136, #218, #229).
+  wait for a retest (#176, #193, #206). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204); 25d1089 fences
+  the command buffer the recorder writes, a retest is asked.
+- Guest crashes (#148, #136, #218, #229). One loader fault at `main+0x82fee0` hits three machines at the title screen
+  or on loads (#157, #173, #206) and is not reproduced here yet.
+- Intel Arc A770: a driver fault about 20 s in (#3).
 - Missing effects in the Tempest layer (falling golden hail, tornadoes: #221, #183).
 - Heavy scenes below 60 fps (#141, #156, #194, #207). On `bananza` (70c1b4a) new defaults raise our heavy test scene
   from about 53 to 58 fps and halve the frames over 25 ms; a stall of about 0.45 s on area loads is left. See
@@ -42,7 +46,7 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
 - A soft 3D picture: the game's dynamic resolution draws the scene at 2/3 of the output (1280x720 at 1080p, #210).
   On `bananza` (9190e6b), `scene_res = full` draws it at the output size.
 
-Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 13 November 2026.
+Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 14 November 2026.
 
 | Phase | | State |
 | --- | --- | --- |
