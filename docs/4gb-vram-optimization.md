@@ -6,12 +6,20 @@ Tuning and telemetry for running Donkey Kong Bananza PC Recomp on budget discret
 
 ## The 4GB VRAM Bottleneck
 
-On systems with 4GB of VRAM, Windows Desktop Window Manager (DWM) and background applications typically consume 400–800 MB of VRAM, leaving only ~3.2 to 3.5 GB of usable video memory for the game.
+On systems with 4GB of physical VRAM, Windows Desktop Window Manager (DWM) and background applications typically consume 400–800 MB, leaving only ~3.2 to 3.5 GB of usable video memory for the game.
 
-During initial telemetry on an 11th Gen Intel Core i7-11800H and RTX 3050 Ti Laptop GPU:
-* **Initial VRAM usage:** ~2.2 GB (stable 59.7 FPS).
-* **VRAM creep over 10–12 minutes:** Without texture eviction, resident textures accumulated past **3.48 GB**, hitting the engine's internal budget ceiling (`2929 of 3041 MiB in use`).
-* **Symptom:** Emergency GPU pool releases caused severe 1.6-second freezes (`replay: 1648.2 ms`), progressively degrading gameplay framerate from 60 FPS down to 27 FPS.
+### Benchmark & Telemetry Environment
+* **Recomp Build:** Bananza 1.0.0 (build `0.3.0+a5796d9`)
+* **CPU:** 11th Gen Intel Core i7-11800H @ 2.30 GHz (8 cores / 16 threads)
+* **GPU:** NVIDIA GeForce RTX 3050 Ti Laptop GPU (4 GB GDDR6, 75W TGP)
+* **Display Driver:** NVIDIA Game Ready Driver 572.70 / Vulkan 621.01 (WDDM 3.2)
+* **OS:** Windows 11 Home 64-bit (Build 26100)
+* **System RAM:** 16 GB DDR4-3200
+
+### Observed Behavior (Default Configuration)
+* **Initial baseline:** ~2.2 GB VRAM allocated, holding a stable 59.7 FPS.
+* **VRAM creep over 10–12 minutes:** Without proactive texture eviction, resident textures accumulated past **3.48 GB**, hitting the engine's internal budget ceiling (`2929 of 3041 MiB in use`).
+* **Symptom:** Emergency GPU pool releases caused severe 1.6-second freezes (`replay: 1648.2 ms`), progressively degrading gameplay framerate from 60 FPS down to 27 FPS over extended play sessions.
 
 ---
 
@@ -22,15 +30,17 @@ Add or uncomment the following settings in your configuration file (`totk.ini` /
 ```ini
 [frame rate]
 fps_limit = 60
-realtime = 1
-cloth_realtime = 1
-highfps_fix = 1
+# Optional / Experimental: real-time frame step & cloth simulation (see Issue #201 for wall climbing above 60 fps).
+# Keep commented for the safe baseline profile.
+# realtime = 1
+# cloth_realtime = 1
+# highfps_fix = 1
 
 [performance]
 # Virtual core preemption: forces guest threads to yield when waiting, preventing thread starvation
 async_preempt = 1
 
-# Replay threading & smaller submission batches (eliminates 35-86ms replay queue freezes)
+# Replay threading & GPU work submission pacing (eliminates 35-86ms replay queue freezes)
 replay_async = 1
 replay_threads = 6
 split_draws = 16
@@ -65,9 +75,6 @@ output_res = 1920x1080
 upscaler = fsr
 sharpness = 40
 frame_gen = off
-
-[diagnostics]
-nx2_read_nowait = 1
 ```
 
 ---
@@ -75,22 +82,26 @@ nx2_read_nowait = 1
 ## Key Tuning Insights
 
 ### 1. Stale Texture Eviction (`tex_vram_pressure = 75`)
-* **What it does:** Instructs the Vulkan texture allocator to release out-of-view, cached textures whenever VRAM utilization crosses 75% of total capacity.
-* **Impact:** Caps total VRAM utilization around 2.3–2.6 GB, preventing GPU memory thrashing over the PCIe bus and eliminating long-session framerate degradation.
+* **What it does:** The default engine value in `runtime/cfg.c` is `90` (`0..100`, where `0` disables eviction). Lowering `tex_vram_pressure` to `75` instructs the texture cache to proactively release unreferenced textures whenever VRAM utilization exceeds 75% of the device-local budget.
+* **Impact:** Caps active VRAM utilization around 2.3–2.6 GB, preventing GPU memory thrashing across the PCIe bus and eliminating the 1.6-second emergency pool garbage-collection hitches.
 
-### 2. Draw Batch Slicing (`split_draws = 16`, `split_us = 100`)
-* **What it does:** Cuts NVN draw submission slices down from the default (64 draws / 300 µs) to 16 draws / 100 µs.
-* **Impact:** Large geometry passes (2,000+ draws) are smoothly distributed across CPU replay worker threads instead of stalling on single-threaded fallback execution (`TOTK_REPLAY_PAR=0`).
+### 2. GPU Work Submission & Replay Worker Threads
+* **`split_draws = 16`, `split_us = 100`:** Default is `64` draws / `1000` µs. These keys do not distribute work across CPU worker threads; rather, they submit GPU command batches in smaller chunks between passes so the GPU starts processing work earlier instead of waiting on a large monolithic command buffer.
+* **`replay_threads = 6` (with `replay_async = 1`):** Assigns NVN submission replay to dedicated CPU worker threads (recommended: set to physical core count, e.g., 6 on 6-core / 8-core laptops), keeping submission off the critical guest thread.
 
-### 3. Presentation on 144Hz Displays (`vk_present = mailbox`)
+### 3. Optional: Real-Time Frame Clock (`realtime = 1`, `cloth_realtime = 1`)
+* **Status:** Marked optional / experimental on Bananza.
+* **Caveat:** As tracked in [Issue #201](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/201), real-time clock steps can trigger animation anomalies and physics glitches during wall climbing at framerates above 60 FPS. Leave commented out unless specifically testing high-refresh pacing.
+
+### 4. Presentation on 144Hz Displays (`vk_present = mailbox`)
 * **What it does:** Uses Vulkan mailbox presentation (triple-buffered fast sync) instead of standard FIFO VSync.
 * **Impact:** On 144Hz laptop screens, standard FIFO VSync causes micro-stutter when targeting 60 FPS due to non-integer refresh intervals (144 / 60 = 2.4). Mailbox delivers tear-free, perfectly paced 60 FPS frames.
 
-### 4. Avoiding the Handheld 480p Downscale Bug
+### 5. Avoiding the Handheld 480p Downscale Bug
 * **Finding:** Setting `output_res = 1280x720` forces Bananza into handheld rendering mode, which aggressively drops the internal 3D raster to **854x480 (standard definition)**. Applying AMD FSR with high sharpness to a 480p image results in extreme ringing, crushed contrast, and washed-out colors.
 * **Fix:** Keep `output_res = 1920x1080`. The engine will render at its native 1600x900 docked size and scale cleanly to 1080p via FSR.
 
-### 5. External Frame Generation Compatibility
+### 6. External Frame Generation Compatibility
 * Setting `assume_focus = 1` and `window_mode = borderless` ensures external capture tools (such as Lossless Scaling or MFG Super Motion) can hook the borderless swapchain and double the stable 60 FPS base to **120 FPS** on 144Hz panels with zero focus-loss stutter.
 
 ---
