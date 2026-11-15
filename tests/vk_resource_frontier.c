@@ -194,7 +194,7 @@ static void synthetic_destroy_set_layout(VkDevice d, VkDescriptorSetLayout l, co
 // The sparse mirror cache and the slice threads' write-back lists (vk_memory.c) stay empty in this fixture.
 static int mirror_sparse;
 static void sparse_cache_close(void) {}
-typedef struct WbLocal { void *a; int n, cap; struct WbLocal *next; } WbLocal;
+typedef struct WbLocal { void *a; int n, cap; void *k; int nk, ck; struct WbLocal *next; } WbLocal;
 static WbLocal *wb_locals;
 #define cmd_pool memory_cmd_pool
 @MEMORY_FUNCTIONS@
