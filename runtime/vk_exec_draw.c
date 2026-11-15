@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "gfx_spirv.h"
 #include "msort.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -3235,6 +3236,7 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
     static int nine = -1;
     if (nine < 0) nine = !strcasecmp(cfg_value("TOTK_FIX_VS_FAULT"), "9");
     if (!nine) return 0;
+    if (gfx_spirv_lq_folded(vs)) return 0;   // gfx_spirv.c folds this vertex stage, so its draws are drawn
     if (vs_origin == 0xcae0ef8e9fe9147full) {
         warn_once(W_FAULT_SKIP2, "the light quads of NVN 2 vertex stage cae0ef8e9fe9147f are skipped (#9)");
         return 1;
