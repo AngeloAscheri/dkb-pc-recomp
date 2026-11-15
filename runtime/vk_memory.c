@@ -2240,6 +2240,10 @@ static void kept_take(void) {
     static int call;
     static size_t scap;
     int n = 0;
+    // Most submissions keep nothing: skip the lock and the sort. The slices have ended, so no thread adds to its list now.
+    for (WbLocal *w = wb_locals; w; w = w->next) n += w->nk;
+    if (!n) return;
+    n = 0;
     plat_mutex_lock(&mirror_lock);
     for (WbLocal *w = wb_locals; w; w = w->next) {
         while (call < n + w->nk) grow((void **)&all, &call, sizeof *all);
@@ -3024,7 +3028,7 @@ void vk_mem_shutdown(void) {
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
     pool_index.n = 0;
     nm = npend = nwbl = 0;   // mirrors went with their pools
-    for (WbLocal *w = wb_locals; w; w = w->next) w->n = 0;
+    for (WbLocal *w = wb_locals; w; w = w->next) w->n = w->nk = 0;   // pending kept ranges point at pools just freed
     plat_mutex_lock(&shadow_lock);
     nstouch = nspend = nsblocked = spend_dirty = 0;   // shadows too
     s_live_n = s_live_bytes = 0;
