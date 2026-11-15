@@ -31,6 +31,18 @@ SHA-256 is in the superblock. `tools/extract_nup.py` reads it (an independent re
   checking every file against its SHA-256 record. The image is then read back against the preflight list as for loose
   input. The container is not hashed as a whole; a change after preflight shows up as a failed record check.
 
+### .nx input
+
+`--nup` (and the window's picker) also takes a `.nx` archive, the [NXFormat](https://github.com/fab918/nxformat) container
+(MIT, `docs/SPEC.md`). `tools/extract_nx.py`, written from the specification, presents it to `extract_nup.py` like a
+`.nup`: each snapshot of the first application is a package (base, update, or add-on content that carries its title id),
+read from the `exefs/` and `romfs/` folders of the snapshot's tree. The file is told apart by its `NXAR` magic, so the
+choices, checks, output folders and `--nup-package` behave as in the `.nup` section above. Blocks are RAW or zstd (the
+same `dkb.nup_zstd` rule); there is no encryption. The header CRC-32C and the catalog, manifest and block-index SHA-256
+are checked at open and each file's SHA-256 when it is read; the per-16-KiB block CRCs are not. Source resources of
+NX 0.3 are ignored. An update snapshot is a complete tree, so laying it over the base also keeps files the update
+deleted, as for a `.nup`.
+
 Run from this checkout with Python 3.12 or later, with the generator's dependencies (`tools/requirements.txt`). The
 window also needs tkinter. The source checkout must contain the full runtime; the older TotK prebuilt runtime
 library cannot build Bananza. A Windows tool package supplies:
