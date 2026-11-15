@@ -9,8 +9,8 @@ Laptop, GTX 1650 or GTX 1050 Ti) with 6 to 8-core CPUs. The settings go in `dkb.
 On a 4 GB card, Windows (the desktop compositor) and background programs often take 400 to 800 MB of VRAM, which leaves
 the game about 3.2 to 3.5 GB.
 
-One run on an Intel Core i7-11800H with an RTX 3050 Ti Laptop GPU (reported by the author of this guide; build and
-driver not recorded):
+One run reported by the author of this guide: Bananza 1.0.0 on build `0.3.0+a5796d9`, an Intel Core i7-11800H (8 cores,
+16 threads), an RTX 3050 Ti Laptop GPU (4 GB, 75 W), NVIDIA driver 572.70, 16 GB of DDR4-3200, Windows 11:
 
 - VRAM in use at the start was about 2.2 GB, at a steady 59.7 fps.
 - Over 10 to 12 minutes the resident textures grew past 3.48 GB, up to the budget the log reports
