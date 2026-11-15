@@ -1554,7 +1554,8 @@ static PlatMutex mirror_lock = PLAT_MUTEX_INIT;
 // vk_spec_count is set once, by the replay thread, so a caller reads it once and pairs the two on that reading.
 static int mem_workers;   // vk_mem_threads: the workers of sliced passes (vk_exec.c) bind mirrors too
 static int mirror_lock_if_shared(void) {
-    if (!vk_spec_count() && !__atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE)) return 0;
+    // TOTK_MEMORY=verify reads r->kept on the completion thread (kept_page), so it always takes the lock.
+    if (!mirror_verify && !vk_spec_count() && !__atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE)) return 0;
     if (plat_mutex_trylock(&mirror_lock)) return 1;
     uint64_t t0 = kern_now_ns();   // contended: TOTK_TRACE=perf counts the long waits (perf_lock_wait)
     plat_mutex_lock(&mirror_lock);
