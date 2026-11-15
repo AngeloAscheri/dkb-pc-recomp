@@ -2553,8 +2553,7 @@ typedef struct {
     uint64_t ibuf;
 } MergeKey;
 
-static _Thread_local struct {
-    int read, on;         // read: TOTK_MERGE_STATS was read on this thread
+typedef struct {
     int ready;            // merge_prep filled key[cur] for the draw being recorded
     int have;             // key[!cur] holds the previous recorded draw
     int cur;
@@ -2579,14 +2578,21 @@ static _Thread_local struct {
         MergeTally sizes[MG_TALLY], strides[MG_TALLY];
         uint64_t win_calls, copy_calls;   // instanced draws for those runs: one per 64 KiB window; one per 256 draws
     } w;
-} MG;
+} MergeStats;
+
+// TOTK_MERGE_STATS is read once (-1: not yet). Each recording thread allocates its counters on its first draw with
+// it on: as a thread-local struct they would take about 15 KiB in every thread of the process, guest threads included.
+static int merge_stats = -1;
+static _Thread_local MergeStats *MG;
 
 static int merge_on(void) {
-    if (!MG.read) {
+    if (merge_stats < 0) {
         const char *e = cfg_get("TOTK_MERGE_STATS");
-        MG.on = e && *e && strcmp(e, "0"), MG.read = 1;
+        merge_stats = e && *e && strcmp(e, "0");
     }
-    return MG.on;
+    if (!merge_stats) return 0;
+    if (!MG) MG = calloc(1, sizeof *MG);   // kept for the thread's life
+    return MG != NULL;
 }
 
 // The uniform slots (c3 and up, as ex->ubo indices) a stage of the pipeline reads, as blocks and as the source of
@@ -2634,7 +2640,7 @@ static size_t merge_tally_str(char *o, size_t cap, const MergeTally t[MG_TALLY],
 // The followed slot's next block: in the open window when the window still spans at most 64 KiB (one uniform buffer
 // range, the 4096 vec4 the translator declares) and 256 blocks, else in a new one.
 static void merge_window(uint64_t addr, uint64_t size) {
-    typeof(MG.run) *const r = &MG.run;
+    typeof(MG->run) *const r = &MG->run;
     uint64_t lo = addr < r->clo ? addr : r->clo, hi = addr + size > r->chi ? addr + size : r->chi;
     if (!r->cn) r->clo = addr, r->chi = addr + size, r->cn = 1;
     else if (hi - lo > 65536 || r->cn == 256) r->chunks++, r->clo = addr, r->chi = addr + size, r->cn = 1;
@@ -2643,32 +2649,32 @@ static void merge_window(uint64_t addr, uint64_t size) {
 
 // The open run ends; `last` is its last draw.
 static void merge_close(DrawCtx *dc, const MergeKey *last) {
-    if (!MG.len) return;
-    if (MG.len >= MG_LONG) {
-        uint64_t n = MG.len;
-        MG.w.long_draws += n;
+    if (!MG->len) return;
+    if (MG->len >= MG_LONG) {
+        uint64_t n = MG->len;
+        MG->w.long_draws += n;
         for (int k = 0; k < 2; k++)
             for (int j = 0; j < 18; j++)
-                if (MG.run.slots[k] >> j & 1) MG.w.slot_draws[k][j] += n;
-        if (MG.run.track >= 0) {
-            if (MG.run.shared) MG.w.shared += n;
-            if (!MG.run.same_size) MG.w.size_changes += n;
-            merge_tally(MG.w.sizes, (int64_t)MG.run.size, n, &MG.w.sizes_other);
-            if (MG.run.steady) MG.w.steady += n, merge_tally(MG.w.strides, MG.run.stride, n, &MG.w.strides_other);
-            else MG.w.irregular += n;
-            MG.w.win_calls += MG.run.chunks + 1, MG.w.copy_calls += (n + 255) / 256;
+                if (MG->run.slots[k] >> j & 1) MG->w.slot_draws[k][j] += n;
+        if (MG->run.track >= 0) {
+            if (MG->run.shared) MG->w.shared += n;
+            if (!MG->run.same_size) MG->w.size_changes += n;
+            merge_tally(MG->w.sizes, (int64_t)MG->run.size, n, &MG->w.sizes_other);
+            if (MG->run.steady) MG->w.steady += n, merge_tally(MG->w.strides, MG->run.stride, n, &MG->w.strides_other);
+            else MG->w.irregular += n;
+            MG->w.win_calls += MG->run.chunks + 1, MG->w.copy_calls += (n + 255) / 256;
         }
     }
-    int b = merge_bucket(MG.len);
-    MG.w.hist_runs[b]++, MG.w.hist_draws[b] += MG.len;
-    if (MG.len >= 2) {
-        MG.w.merged += MG.len, MG.w.saved += MG.len - 1;
+    int b = merge_bucket(MG->len);
+    MG->w.hist_runs[b]++, MG->w.hist_draws[b] += MG->len;
+    if (MG->len >= 2) {
+        MG->w.merged += MG->len, MG->w.saved += MG->len - 1;
         for (int i = 0; i < 4; i++)
-            if (MG.var >> i & 1) MG.w.var_draws[i] += MG.len;
-        if (!(MG.var & ~MG_VAR_VS)) MG.w.clean += MG.len;
-        if (MG.len > MG.w.longest) MG.w.longest = MG.len, MG.w.longest_vs = stage_origin(dc, last->prog, NVN_STAGE_VS);
+            if (MG->var >> i & 1) MG->w.var_draws[i] += MG->len;
+        if (!(MG->var & ~MG_VAR_VS)) MG->w.clean += MG->len;
+        if (MG->len > MG->w.longest) MG->w.longest = MG->len, MG->w.longest_vs = stage_origin(dc, last->prog, NVN_STAGE_VS);
     }
-    MG.len = 0, MG.var = 0;
+    MG->len = 0, MG->var = 0;
 }
 
 static void merge_log(DrawCtx *dc, uint64_t frames) {
@@ -2677,47 +2683,47 @@ static void merge_log(DrawCtx *dc, uint64_t frames) {
     char h[192], r[512];
     size_t at = 0;
     for (int i = 0; i < MG_BUCKETS && at < sizeof h; i++)
-        at += (size_t)snprintf(h + at, sizeof h - at, "%s%.0f/%.0f", i ? " " : "", MG.w.hist_runs[i] / f, MG.w.hist_draws[i] / f);
+        at += (size_t)snprintf(h + at, sizeof h - at, "%s%.0f/%.0f", i ? " " : "", MG->w.hist_runs[i] / f, MG->w.hist_draws[i] / f);
     size_t rt = 0;
     for (int i = 0; i < MG_N && rt < sizeof r; i++)
-        if (MG.w.brk[i]) rt += (size_t)snprintf(r + rt, sizeof r - rt, "%s%s %.0f", rt ? ", " : "", MG_NAME[i], MG.w.brk[i] / f);
+        if (MG->w.brk[i]) rt += (size_t)snprintf(r + rt, sizeof r - rt, "%s%s %.0f", rt ? ", " : "", MG_NAME[i], MG->w.brk[i] / f);
     rt_log("vk_exec: merge stats (%s thread, per frame over %llu frames): %.0f draws, %.0f of them in %.0f runs of 2 or "
            "more (%.0f draw calls fewer); runs by length 1/2-3/4-7/8-15/16-63/64-255/256+ as runs/draws: %s",
-           who, (unsigned long long)frames, MG.w.draws / f, MG.w.merged / f, (MG.w.merged - MG.w.saved) / f,
-           MG.w.saved / f, h);
+           who, (unsigned long long)frames, MG->w.draws / f, MG->w.merged / f, (MG->w.merged - MG->w.saved) / f,
+           MG->w.saved / f, h);
     rt_log("vk_exec: merge stats: draws in those runs that vary vertex-only blocks %.0f, fragment blocks %.0f, address "
            "blocks %.0f, push constants %.0f; runs varying vertex-only blocks or nothing %.0f draws; longest run %u "
            "draws, vertex program %016llx; runs ended by: %s",
-           MG.w.var_draws[0] / f, MG.w.var_draws[1] / f, MG.w.var_draws[2] / f, MG.w.var_draws[3] / f, MG.w.clean / f,
-           MG.w.longest, (unsigned long long)MG.w.longest_vs, rt ? r : "nothing");
+           MG->w.var_draws[0] / f, MG->w.var_draws[1] / f, MG->w.var_draws[2] / f, MG->w.var_draws[3] / f, MG->w.clean / f,
+           MG->w.longest, (unsigned long long)MG->w.longest_vs, rt ? r : "nothing");
     char sl[2][256], sz[256], sd[256];
     for (int k = 0; k < 2; k++) {
         size_t a = 0;
         for (int j = 0; j < 18 && a < sizeof sl[k]; j++)
-            if (MG.w.slot_draws[k][j])
+            if (MG->w.slot_draws[k][j])
                 a += (size_t)snprintf(sl[k] + a, sizeof sl[k] - a, "%sslot %d (c%d) %.0f", a ? ", " : "", j, j + 3,
-                                      MG.w.slot_draws[k][j] / f);
+                                      MG->w.slot_draws[k][j] / f);
         if (!a) snprintf(sl[k], sizeof sl[k], "none");
     }
-    merge_tally_str(sz, sizeof sz, MG.w.sizes, MG.w.sizes_other, f);
-    merge_tally_str(sd, sizeof sd, MG.w.strides, MG.w.strides_other, f);
+    merge_tally_str(sz, sizeof sz, MG->w.sizes, MG->w.sizes_other, f);
+    merge_tally_str(sd, sizeof sd, MG->w.strides, MG->w.strides_other, f);
     rt_log("vk_exec: merge stats: runs of %d or more, %.0f draws; varying slots, vertex: %s; fragment: %s; followed "
            "slot: fragment binds the same range %.0f, sizes (bytes x draws) %s, size changed in the run %.0f; address "
            "steps by a constant stride %.0f (stride x draws: %s), irregular %.0f",
-           MG_LONG, MG.w.long_draws / f, sl[0], sl[1], MG.w.shared / f, sz, MG.w.size_changes / f, MG.w.steady / f, sd,
-           MG.w.irregular / f);
+           MG_LONG, MG->w.long_draws / f, sl[0], sl[1], MG->w.shared / f, sz, MG->w.size_changes / f, MG->w.steady / f, sd,
+           MG->w.irregular / f);
     rt_log("vk_exec: merge stats: those runs as instanced draws: %.0f with the followed slot's blocks bound as 64 KiB "
            "windows, %.0f with them copied 256 at a time",
-           MG.w.win_calls / f, MG.w.copy_calls / f);
-    memset(&MG.w, 0, sizeof MG.w);
+           MG->w.win_calls / f, MG->w.copy_calls / f);
+    memset(&MG->w, 0, sizeof MG->w);
 }
 
 // prepare_draw_impl, once the draw will be recorded: what it reads besides its own arguments, into key[cur].
 static void merge_prep(const VkExec *ex, const VkPipeInfo *info, const VkPipeState *s) {
     if (!merge_on()) return;
-    MergeKey *k = &MG.key[MG.cur];
+    MergeKey *k = &MG->key[MG->cur];
     memset(k, 0, sizeof *k);
-    k->cb = ex->cb, k->pass = ex->pass_serial, k->barrier = ex->barrier_at, k->upd = MG.upd;
+    k->cb = ex->cb, k->pass = ex->pass_serial, k->barrier = ex->barrier_at, k->upd = MG->upd;
     k->prog = ex->prog, k->info = info;
     memcpy(&k->s, s, sizeof k->s);   // with its padding, as the pipeline memo compares it
     memcpy(k->vp, ex->vp, sizeof k->vp), memcpy(k->depth_range, ex->depth_range, sizeof k->depth_range);
@@ -2735,7 +2741,7 @@ static void merge_prep(const VkExec *ex, const VkPipeInfo *info, const VkPipeSta
     memcpy(k->vbuf, ex->vbuf, sizeof k->vbuf);
     for (int w = 0; w < NVN2_ROOT_WORDS && w < 64; w++)   // only written words: the rest are not part of the draw
         if (ex->push_set[0][0] >> w & 1) k->push[w] = ex->push[0][0][w];
-    MG.ready = 1;
+    MG->ready = 1;
 }
 
 #define MG_DIFF(a, b, field) memcmp(&(a)->field, &(b)->field, sizeof (a)->field)
@@ -2743,16 +2749,16 @@ static void merge_prep(const VkExec *ex, const VkPipeInfo *info, const VkPipeSta
 // The draw prepared by merge_prep is recorded with these arguments: extend the open run or end it.
 static void merge_note(VkExec *ex, int kind, int prim, int32_t count, int32_t first, int itype, uint64_t ibuf,
                        int32_t instances, int32_t base_instance) {
-    if (!MG.on || !MG.ready) return;
+    if (!MG || !MG->ready) return;
     DrawCtx *const dc = DC_OF(ex);
-    MG.ready = 0;
-    MergeKey *n = &MG.key[MG.cur];
-    const MergeKey *p = &MG.key[!MG.cur];
+    MG->ready = 0;
+    MergeKey *n = &MG->key[MG->cur];
+    const MergeKey *p = &MG->key[!MG->cur];
     n->kind = kind, n->prim = prim, n->count = count, n->first = first, n->itype = itype, n->ibuf = ibuf;
     n->instances = instances > 1 ? instances : 1, n->base_instance = base_instance;
     int why = -1;
     uint32_t var = 0;
-    if (!MG.have) why = MG_N;   // the thread's first draw: a run starts without a counted break
+    if (!MG->have) why = MG_N;   // the thread's first draw: a run starts without a counted break
     else if (n->kind == 2 || p->kind == 2) why = MG_INDIRECT;
     else if (n->cb != p->cb) why = MG_CB;
     else if (n->pass != p->pass) why = MG_PASS;
@@ -2779,8 +2785,8 @@ static void merge_note(VkExec *ex, int kind, int prim, int32_t count, int32_t fi
             if (d & ptr[i]) var |= MG_VAR_PTR;
         }
         if (MG_DIFF(n, p, push)) var |= MG_VAR_PUSH;
-        typeof(MG.run) *const r = &MG.run;
-        if (MG.len == 1) {   // the run's second draw: follow its lowest varying slot, the vertex stage's first
+        typeof(MG->run) *const r = &MG->run;
+        if (MG->len == 1) {   // the run's second draw: follow its lowest varying slot, the vertex stage's first
             memset(r, 0, sizeof *r);
             r->tk = dv[0] ? 0 : 1, r->track = dv[r->tk] ? __builtin_ctz(dv[r->tk]) : -1;
             if (r->track >= 0) {
@@ -2803,21 +2809,21 @@ static void merge_note(VkExec *ex, int kind, int prim, int32_t count, int32_t fi
     }
     if (why >= 0) {
         merge_close(dc, p);
-        if (why < MG_N) MG.w.brk[why]++;
+        if (why < MG_N) MG->w.brk[why]++;
     } else {
-        MG.var |= var;
+        MG->var |= var;
         if (dc->DP.on > 0 && !IS_HELPER(dc)) {   // with DKB_DRAW_PROFILE: this draw's sections are what a merge saves
             for (int i = 0; i < DP_N; i++) dc->DP.cont[i] += dc->DP.last[i];
             dc->DP.cont_n++;
         }
     }
-    MG.len++, MG.w.draws++, MG.have = 1, MG.cur = !MG.cur;
+    MG->len++, MG->w.draws++, MG->have = 1, MG->cur = !MG->cur;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    if (!MG.frame0) MG.frame0 = f ? f : 1;
-    else if (f >= MG.frame0 + MG_FRAMES) {
-        uint64_t frames = f - MG.frame0;
+    if (!MG->frame0) MG->frame0 = f ? f : 1;
+    else if (f >= MG->frame0 + MG_FRAMES) {
+        uint64_t frames = f - MG->frame0;
         merge_log(dc, frames);
-        MG.frame0 = f;
+        MG->frame0 = f;
     }
 }
 
@@ -3858,6 +3864,8 @@ static void merge_pick(VkExec *ex, VkPipeState *s, VkPipeline *p, const VkPipeIn
     }
     why = MC_SHADER;
     if (!(vs = gfx_shader_instance_c4(s->vs)) || (rd[1] & 2 && !(fs = gfx_shader_instance_c4(s->fs)))) goto fall;
+    // A fragment stage kept as it is would read the vertex copy's instance if it has an input at that Location.
+    if (fs == s->fs && fs && gfx_shader_inputs(fs, NULL) >> GFX_INSTANCE_C4_LOC & 1) goto fall;
     why = MC_PENDING;
     VkPipeState s2 = *s;
     s2.vs = vs, s2.fs = fs;
@@ -4514,7 +4522,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     DrawCtx *const dc = DC_OF(ex);
     if (!u->size) return;
-    MG.upd++;   // merge_note: no run crosses an update (its copy needs a barrier inside the pass)
+    if (MG) MG->upd++;   // merge_note: no run crosses an update (its copy needs a barrier inside the pass)
     VkMemSpan sp;
     if (!vk_mem_resolve(u->dst, u->size, &sp)) return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
     cb_res(ex);

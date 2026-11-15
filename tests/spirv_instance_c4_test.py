@@ -5,8 +5,8 @@ The modules have the layout the rewrite expects: a c4 uniform block (a struct of
 through access chains with member 0 and an array index in the entry function. It checks that the vertex stage gains
 gl_InstanceIndex and a flat int output at Location 29, that the fragment stage gains the matching flat input, that every
 c4 read gets an OpIAdd of instance * 16 on its index, and that the results pass spirv-val. It also checks the refusals:
-a stage that reads the instance itself, Location 29 taken, a fragment stage without c4, a chain to the array alone and a
-read outside the entry function. It does not execute the shaders.
+a stage that reads the instance itself, Location 29 taken, a fragment stage without c4, a chain to the array alone, a
+read outside the entry function and a constant index past one 256-byte block. It does not execute the shaders.
 """
 import argparse
 from pathlib import Path
@@ -31,12 +31,13 @@ def string(s):
     return list(struct.unpack(f'<{len(b) // 4}I', b))
 
 
-def module(vertex, reads=2, binding=4, instance=False, taken=False, short=False, helper=False):
+def module(vertex, reads=2, binding=4, instance=False, taken=False, short=False, helper=False, first=3):
     """Ids are fixed. reads (1 to 4): c4 reads in the entry function, each of component 1 of one vec4. instance: the
     stage already declares gl_InstanceIndex. taken: an output (vertex) or input (fragment) already sits at Location 29.
-    short: one more read through a chain to the array alone. helper: one more read in a function ahead of main."""
+    short: one more read through a chain to the array alone. helper: one more read in a function ahead of main. first: the
+    constant vec4 index of the first read; the later reads add 3 to the one before."""
     (MAIN, HELPER, VOID, FN, F32, I32, V4, ARR, STRUCT, PUNI, UBO, PUF, PUARR, PUV4, POUT, OUT, PIN_I, INST, PO_I, EXTRA,
-     PI_I, K0, K1, K3, K4096, *V) = range(1, 200)
+     PI_I, K0, K1, K3, K4096, KF, *V) = range(1, 200)
     w = [0x07230203, 0x00010300, 0, 200, 0]
     w += instr(17, 1)                                                    # Shader
     w += instr(14, 0, 1)
@@ -53,6 +54,7 @@ def module(vertex, reads=2, binding=4, instance=False, taken=False, short=False,
     w += instr(71, ARR, 6, 16) + instr(71, STRUCT, 2) + instr(72, STRUCT, 0, 35, 0)
     w += instr(19, VOID) + instr(33, FN, VOID) + instr(22, F32, 32) + instr(21, I32, 32, 1) + instr(23, V4, F32, 4)
     w += instr(43, I32, K0, 0) + instr(43, I32, K1, 1) + instr(43, I32, K3, 3) + instr(43, I32, K4096, 4096)
+    w += instr(43, I32, KF, first)
     w += instr(28, ARR, V4, K4096) + instr(30, STRUCT, ARR) + instr(32, PUNI, 2, STRUCT) + instr(59, PUNI, UBO, 2)
     w += instr(32, PUF, 2, F32) + instr(32, PUARR, 2, ARR) + instr(32, PUV4, 2, V4)
     w += instr(32, POUT, 3, V4) + instr(59, POUT, OUT, 3)
@@ -67,12 +69,12 @@ def module(vertex, reads=2, binding=4, instance=False, taken=False, short=False,
         w += instr(54, VOID, HELPER, 0, FN) + instr(248, V[0])
         w += instr(65, PUF, V[1], UBO, K0, K1, K0) + instr(OP_LOAD, F32, V[2], V[1]) + instr(253) + instr(56)
     w += instr(54, VOID, MAIN, 0, FN) + instr(248, V[10])
-    # The array indices: 3 for the first read, then ids made by OpIAdd, so later reads index with a computed value.
+    # The array indices: first for the first read, then ids made by OpIAdd, so later reads index with a computed value.
     loads = []
     for k in range(reads):
-        idx = K3 if k == 0 else V[100 + k]
+        idx = KF if k == 0 else V[100 + k]
         if k:
-            w += instr(OP_IADD, I32, idx, K3, K1 if k == 1 else V[100 + k - 1])
+            w += instr(OP_IADD, I32, idx, K3, KF if k == 1 else V[100 + k - 1])
         w += instr(OP_ACCESS_CHAIN, PUF, V[20 + k], UBO, K0, idx, K1) + instr(OP_LOAD, F32, V[40 + k], V[20 + k])
         loads.append(V[40 + k])
     if short:
@@ -205,6 +207,14 @@ int main(int argc, char **argv) {
 
     def test_a_read_outside_the_entry_function_is_refused(self):
         self.assertIsNone(self.rewrite('fs-helper', module(vertex=False, helper=True), vertex=False))
+
+    def test_a_constant_index_past_one_block_is_refused(self):
+        # vec4 15 is the block's last; 16 belongs to the next instance in the merged range. A negative constant index
+        # is not valid SPIR-V (spirv-val refuses it), so it needs no case.
+        found, chains = self.rewrite('vs-k15', module(vertex=True, reads=1, first=15), vertex=True)
+        self.check_reads(found, chains, 1)
+        self.assertIsNone(self.rewrite('vs-k16', module(vertex=True, reads=1, first=16), vertex=True))
+        self.assertIsNone(self.rewrite('fs-k16', module(vertex=False, reads=2, first=16), vertex=False))
 
 
 if __name__ == '__main__':

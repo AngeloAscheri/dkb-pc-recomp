@@ -10,6 +10,11 @@
 // the fragment stage as a flat int at Location loc; the fragment stage reads it from there. The value is loaded at
 // the start of the entry function, so a block read in another function, or any other use of the variable (a whole
 // load, a pointer handed to a call), leaves the module as it is (NULL).
+//
+// A draw by itself binds at most 256 bytes of c4, so a read at vec4 index 16 or above is out of its range, and
+// robust buffer access returns zero for it. In the merged range the same index lands in the next instance's block.
+// A constant index of 16 or more therefore leaves the module as it is. A computed index cannot be bounded here, so
+// one past the block would read the next instance's data where the separate draw read zero.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,8 +78,11 @@ uint32_t *spirv_instance_c4(const uint32_t *w, uint64_t n, int vertex, uint32_t 
     uint32_t *set_of = malloc((size_t)bound * 4), *bind_of = malloc((size_t)bound * 4);
     uint32_t *ptr_sc = calloc(bound, 4), *ptr_to = calloc(bound, 4), *var_sc = calloc(bound, 4);
     uint8_t *chain = calloc(bound, 1);   // OpAccessChain results into the c4 variable
+    uint8_t *num = calloc(bound, 1);     // NUM_INT32: a 32-bit integer type; NUM_CONST: an OpConstant of one, in cval
+    uint32_t *cval = malloc((size_t)bound * 4);
     uint32_t *out = NULL;
-    if (!set_of || !bind_of || !ptr_sc || !ptr_to || !var_sc || !chain) goto done;
+    enum { NUM_INT32 = 1, NUM_CONST = 2 };
+    if (!set_of || !bind_of || !ptr_sc || !ptr_to || !var_sc || !chain || !num || !cval) goto done;
     memset(set_of, 0xff, (size_t)bound * 4), memset(bind_of, 0xff, (size_t)bound * 4);
     uint32_t i32 = 0, entry = 0;
     uint64_t ep_at = 0, first_dec = 0, fn_at = 0;
@@ -100,8 +108,11 @@ uint32_t *spirv_instance_c4(const uint32_t *w, uint64_t n, int vertex, uint32_t 
                 goto done;   // the stage reads the instance itself: the merged draw would change what it sees
         } else if (op == OP_MEMBER_DECORATE && len == 5 && a[2] == DEC_LOCATION && a[3] == loc) {
             goto done;
-        } else if (op == OP_TYPE_INT && len == 4 && a[1] == 32 && a[2] == 1) {
-            if (!i32) i32 = a[0];
+        } else if (op == OP_TYPE_INT && len == 4 && a[1] == 32) {
+            if (a[0] < bound) num[a[0]] |= NUM_INT32;
+            if (a[2] == 1 && !i32) i32 = a[0];
+        } else if (op == OP_CONSTANT && len == 4 && a[0] < bound && a[1] < bound && num[a[0]] & NUM_INT32) {
+            num[a[1]] |= NUM_CONST, cval[a[1]] = a[2];
         } else if (op == OP_TYPE_POINTER && len == 4 && a[0] < bound) {
             ptr_sc[a[0]] = a[1], ptr_to[a[0]] = a[2];
         } else if (op == OP_VARIABLE && len >= 4 && a[1] < bound) {
@@ -124,6 +135,8 @@ uint32_t *spirv_instance_c4(const uint32_t *w, uint64_t n, int vertex, uint32_t 
         if (op == OP_FUNCTION && len >= 3) in_entry = a[1] == entry;
         if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && a[2] == c4) {
             if (len < 6 || !in_entry || a[1] >= bound) goto done;   // a chain to the array alone is indexed later
+            // A constant index past the 16 vec4 of one block.
+            if (a[4] < bound && num[a[4]] & NUM_CONST && cval[a[4]] >= 16) goto done;
             chain[a[1]] = 1, chains++;
         } else if (pointer_use(op, a, len - 1, c4)) {
             goto done;
@@ -206,6 +219,6 @@ uint32_t *spirv_instance_c4(const uint32_t *w, uint64_t n, int vertex, uint32_t 
     if (n_chains) *n_chains = chains;
     out = b.o;
 done:
-    free(set_of), free(bind_of), free(ptr_sc), free(ptr_to), free(var_sc), free(chain);
+    free(set_of), free(bind_of), free(ptr_sc), free(ptr_to), free(var_sc), free(chain), free(num), free(cval);
     return out;
 }
