@@ -1850,15 +1850,19 @@ static void par_wake_workers(void);
 static int par_nworkers;
 
 // At a draw outside a pass: 1 when the pass it opens is sliced (the pass is then open, with secondary contents).
-// TOTK_REPLAY_THREADS (0: off), read once. Unset, it is 4 when the process may run on 8 or more logical processors and
-// 0 below that: in the layer -101 scene (RTX 5060 Ti, 1920x1080, 60 fps limit) 4 threads gave 57.0 and 57.2 fps and
-// 63 to 77 frames over 25 ms a minute, against 52.7 and 53.6 fps and 177 to 226 frames without (docs/dkb-lowend.md).
+// TOTK_REPLAY_THREADS (0: off), read once. Unset, it is 6 when the process may run on 12 or more logical processors, 4
+// on 8 to 11 and 0 below that: in the layer -101 scene (RTX 5060 Ti, 1920x1080, 60 fps limit) 4 threads gave 57.0 and
+// 57.2 fps and 63 to 77 frames over 25 ms a minute, against 52.7 and 53.6 fps and 177 to 226 frames without
+// (docs/dkb-lowend.md). On 16 (Ryzen 7 9800X3D, RTX 5090) the Hilltop Layer of Surf Hills (3.2.0, 28,500 draws a frame)
+// replayed in 12.4 ms a frame with 6 against 14.9 with 4 (45 to 47 fps against 42), the route's Lake Level in 5.9 to 6.0
+// against 6.5 to 7.0, and 8 threads gave no more than 6.
 // Not on AMD: secondary command buffers recorded on several threads were measured on NVIDIA only, and AMD's driver
 // already lost the device with the recorder thread (vk_rec.c rec_begin).
 static int par_threads(void) {
     if (par_mode < 0) {
         const char *e = cfg_get("TOTK_REPLAY_THREADS");
-        par_mode = e && *e ? atoi(e) : !vk_caps.amd && plat_cpu_usable() >= 8 ? 4 : 0;
+        uint32_t cpus = plat_cpu_usable();
+        par_mode = e && *e ? atoi(e) : vk_caps.amd ? 0 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
         if (par_mode < 0) par_mode = 0;
         if (par_mode) rt_log("vk: passes of %d or more draws are recorded in slices of up to %d draws into secondary command buffers "
                              "(TOTK_REPLAY_THREADS=%d%s: recorded by that many threads)", PAR_MIN_DRAWS, PAR_SLICE_DRAWS, par_mode,
