@@ -194,7 +194,7 @@ static int8_t lq_state[LQ_RULES];
 
 void gfx_spirv_set_lq_fold_platform(int nvidia) {
     const char *v = cfg_value("TOTK_FIX_LQ_FOLD");
-    int mode = !strcmp(v, "all") ? 2 : !strcmp(v, "0") || !*v ? 0 : 1;
+    int mode = !strcasecmp(v, "all") ? 2 : !strcmp(v, "0") || !*v ? 0 : 1;
     lq_platform = nvidia && !rt_game_version ? mode : 0;
 }
 
