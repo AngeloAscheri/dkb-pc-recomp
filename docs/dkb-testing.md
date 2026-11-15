@@ -215,6 +215,14 @@ display x 2/3 / ratio: `full` drew 1920x1080 at a 2880x1620 render resolution an
 sets that scale to 1.0 (set `render3d`), so the scene is the render resolution divided by the ratio, as on 1.0.0. A ratio
 keeps the upscaler: `scene_res = 1.5` at 3840x2160 draws the scene at 2560x1440 and DLSS outputs 3840x2160
 (`dlss: Quality 2560x1440 -> 3840x2160`), where `auto` outputs 2560x1440.
+The render-target pool is carved from the game's GSys heap, 518144 KiB (506 MiB) in
+`System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs`. A pool GSys cannot hold crashed the game before it showed
+anything (access violation reading 0xa0 in main+0x128d40 on 3.2.0): at 3840x2160, pools of 474 MiB ran and 514 MiB
+crashed, and so did a 5760x3240 output on `auto` (800 MiB). GSys now grows by what the pool adds to the stock
+200 MiB, as TotK's texture heap does (`resolution: HeapDef GSys ... KiB` and a `RomFS overlay` line in `dkb.log`),
+and the application pool by the same amount, so no other heap shrinks. On 3.2.0 at 3840x2160, `full` (802 MiB),
+`1.25` (514 MiB) and 5760x3240 on `auto` (800 MiB) run. When the table cannot be rewritten, `scene_res` keeps the
+pool within 474 MiB instead, raising the ratio as far as needed, and says so.
 
 5120x1440 (32:9) and 3840x2160 used to fail during render-resource creation because the game's
 render-target pool is a fixed 200 MiB; a patch grows it with the output size. Both now run on 1.0.0

@@ -372,9 +372,9 @@ static void added_init(void) {
 // The HeapDef table a bigger game resolution needs (resolution.c): its texture heap and that heap's parent grow. The
 // base is an overlay that replaces the table (a mod's heap sizes stay), else the RomFS original; the grown table is
 // written to <profile>/resolution/ and served in the base's place.
-#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
 static void heapdef_overlay(void) {
     if (!res_heap_extra_kib()) return;
+    const char *HEAPDEF = res_heapdef_path(), *name = strrchr(HEAPDEF, '/') + 1;
     uint64_t i = lower(HEAPDEF);
     if (i >= file_count || strcmp(entry_name(entry(i)), HEAPDEF)) {
         rt_log("RomFS: %s missing; the game keeps its own resolution", HEAPDEF);
@@ -395,7 +395,7 @@ static void heapdef_overlay(void) {
     if (!ok) return;
     char dir[2100], file[2200];
     need(snprintf(dir, sizeof dir, "%s/resolution", rt_config()->profile) < (int)sizeof dir, "resolution path");
-    need(snprintf(file, sizeof file, "%s/Product.Nin_NX_NVN.HeapDef.byml.zs", dir) < (int)sizeof file, "resolution path");
+    need(snprintf(file, sizeof file, "%s/%s", dir, name) < (int)sizeof file, "resolution path");
     plat_file_mkdir_p(dir);
     ok = plat_file_write(file, out, out_n);
     free(out);

@@ -377,6 +377,13 @@ area = "shaders"
 cmd = ["{python}", "tests/alpha_test_spirv_test.py", "--cc", "{cc}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
 
 [[test]]
+name = "dkb-wide"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/dkb_wide_test.py", "--cc", "{cc}", "--out", "{out}"]
+needs = ["cc"]
+
+[[test]]
 name = "aoc-romfs"
 tier = 1
 area = "os"
