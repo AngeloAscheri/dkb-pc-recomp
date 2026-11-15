@@ -2482,6 +2482,13 @@ static int ninflight, cap_inflight;
 static Batch *spare;                  // completed batches whose command buffer and fence are reused
 static int nspare, cap_spare;
 static uint64_t next_seq, done_seq;   // batches handed out / completed (all batches up to done_seq)
+// vk_upload_flush(1) waits for a batch's fence with cmd_lock let go, so the replay's own flushes (every split part) do
+// not wait behind another thread's GPU wait: pinned is the batch being waited on, whose fence retire keeps out of the
+// spare list until the waiter is done with it (pinned_done); wait_lock lets one thread wait at a time.
+static uint64_t pinned;               // cmd_lock: seq of the batch a waiter waits on, 0 none
+static int pinned_done;               // cmd_lock: retire met it: the waiter puts it in the spare list
+static Batch pinned_batch;
+static PlatMutex wait_lock = PLAT_MUTEX_INIT;
 static Dead *dead;
 static int ndead, cap_dead;
 static uint64_t tl_protected;         // newest submission being recorded or submitted; guards deferred destruction
@@ -2518,6 +2525,10 @@ static void retire(VkCtx *c, int wait_all) {
         }
         free_staging(c, b);
         done_seq = b->seq;
+        if (b->seq == pinned) {   // a waiter still waits on its fence (vk_upload_flush)
+            pinned_batch = *b, pinned_done = 1;
+            continue;
+        }
         if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
         spare[nspare++] = *b;
     }
@@ -2662,16 +2673,34 @@ uint64_t vk_upload_flush(int wait) {
     }
     if (c && wait) {
         uint64_t w0 = ninflight && done_seq < seq ? kern_now_ns() : 0;
+        // Without cmd_lock when this thread holds it once (a caller holding it around the flush keeps it for the wait).
+        int unlocked = cmd_lock.depth == 1;
+        if (unlocked && ninflight && done_seq < seq) {
+            plat_rmutex_unlock(&cmd_lock);
+            plat_mutex_lock(&wait_lock);
+            plat_rmutex_lock(&cmd_lock);
+        }
         while (ninflight && done_seq < seq) {
+            VkFence f = inflight[0].fence;
+            if (unlocked) pinned = inflight[0].seq, pinned_done = 0, plat_rmutex_unlock(&cmd_lock);
             // A lost device returns at once and its fence never signals: without this check the loop spins forever
             // (a guest thread at 100% of a core and an idle GPU, with no fault reported).
-            VkResult w = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            VkResult w = vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
+            if (unlocked) plat_rmutex_lock(&cmd_lock);
             if (w != VK_SUCCESS && w != VK_TIMEOUT) {
                 vk_device_fault_report(w);
                 rt_fatal("vk: upload wait failed (%d)", (int)w);
             }
             retire(c, 0);
+            if (unlocked) {
+                if (pinned_done) {
+                    if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
+                    spare[nspare++] = pinned_batch;
+                }
+                pinned = 0, pinned_done = 0;
+            }
         }
+        if (unlocked && w0) plat_mutex_unlock(&wait_lock);
         if (w0) plat_add64(&up_wait_ns, (int64_t)(kern_now_ns() - w0));
     }
     if (c) collect_locked(c);
