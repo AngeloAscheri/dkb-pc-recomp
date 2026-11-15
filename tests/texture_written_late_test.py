@@ -183,8 +183,7 @@ def source(root):
     parts += [typedef(memory, 'MRange'), statement(memory, 'static MRange *pend'), statement(memory, 'static int npend')]
     parts += [function(common, name) for name in ('plat_rmutex_lock', 'plat_rmutex_trylock', 'plat_rmutex_unlock',
                                                   'plat_rmutex_release', 'plat_rmutex_retake', 'plat_once')]
-    parts += ['#define HOLD_SITES 16
-#define lock() lock_at(0)', typedef(tex, 'HoldSite')] + [statement(tex, name) for name in (
+    parts += ['#define HOLD_SITES 16\n#define lock() lock_at(0)', typedef(tex, 'HoldSite')] + [statement(tex, name) for name in (
         'static int holds_on', 'static _Thread_local uint64_t hold_t0', 'static _Thread_local void *hold_ra',
         'static PlatMutex holds_lock', 'static HoldSite holds')]
     parts += [function(tex, name) for name in (
