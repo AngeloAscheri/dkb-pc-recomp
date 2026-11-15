@@ -753,14 +753,16 @@ static const char *write_crash_dump(EXCEPTION_POINTERS *ep) {
     job.ep = ep;
     HANDLE t = CreateThread(NULL, 1 << 20, dump_thread, &job, 0, NULL);
     if (!t) return NULL;
-    WaitForSingleObject(t, DUMP_WAIT_MS);   // a dump not written by then is given up; the report is already logged
+    // A dump not written by then is given up; the report is already logged. If MiniDumpWriteDump suspends this waiting
+    // thread, the timeout cannot fire and the process hangs, but only after the report is in the log.
+    WaitForSingleObject(t, DUMP_WAIT_MS);
     CloseHandle(t);
     if (!job.ok || !WideCharToMultiByte(CP_UTF8, 0, job.path, -1, path8, sizeof path8, NULL, NULL)) return NULL;
     return path8;
 }
 
 // The exception of the crash being reported, for plat_crash_dump (NULL for abort and invalid parameter).
-static EXCEPTION_POINTERS *volatile crash_ep;
+static _Thread_local EXCEPTION_POINTERS *crash_ep;   // per thread: two threads can crash at once
 
 // The report is logged first and the dump written after: MiniDumpWriteDump suspends the other threads and can block on
 // a lock one of them holds (a heap corruption inside HeapAlloc), and the report is what a player has to attach.

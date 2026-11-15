@@ -224,7 +224,13 @@ static uint64_t lifted_function(uintptr_t rip) {
 
 static void crash_handler(const PlatCrash *x) {
     static volatile int32_t busy;
-    if (plat_xchg32(&busy, 1)) plat_exit(71);
+    if (plat_xchg32(&busy, 1)) {   // a fault while the report is made: no report, but still a dump
+        plat_crash_dump();
+        plat_exit(71);
+    }
+    // A stack overflow leaves too little stack for the report (rt_vlogf alone takes 2 KB): dump first there, from the
+    // dump's own thread, while the report may still die.
+    const char *dump = x->code == 0xc00000fdu ? plat_crash_dump() : NULL;
     char d[160];
     uintptr_t rip = x->rip;
     // x->module names the DLL of a fault outside this executable (the last-chance filter: a driver, a Vulkan layer);
@@ -256,7 +262,7 @@ static void crash_handler(const PlatCrash *x) {
     // The dump comes last: it suspends the other threads and can hang on a lock one of them holds, and by now the
     // report is in the log. It holds game-derived memory (thread stacks): the line says so, since players copy this
     // log into issues.
-    const char *dump = plat_crash_dump();
+    if (!dump) dump = plat_crash_dump();
     if (dump) {
         rt_logf("  minidump: %s (keep it on this PC: send it only privately, when asked for)\n", dump);
         fflush(stderr);
