@@ -233,8 +233,9 @@ _Noreturn void plat_reexec(void);
 // last-chance filter), instead of ending the process without a report. The write-fault hook above runs first. On
 // Windows abort() (a failed assert, std::terminate) and an invalid parameter to a C runtime function go there too, with
 // the host frames in this executable: the C runtime ends the process for both with 0xc0000409 and no exception.
-// On Windows every report comes with a minidump (thread stacks and modules, no heap) in the logs folder beside the
-// executable; dump names it.
+// On Windows fn may then call plat_crash_dump for a minidump (thread stacks and modules, no heap) in the logs folder
+// beside the executable. It is a separate call so that fn logs its report first: writing the dump suspends the other
+// threads and can block on a lock one of them holds.
 typedef struct {
     const char *what;          // "access violation", "illegal instruction", ...
     uint32_t code;             // the Windows exception code or the signal number
@@ -244,9 +245,9 @@ typedef struct {
     int nframes;               // abort and invalid parameter: return addresses in this executable, innermost first
     uintptr_t frames[16];      // (rip is frames[0]); 0 for a fault, whose rip is exact
     const char *module;        // NULL: in this executable; else the file name of the module the fault is in
-    const char *dump;          // the minidump written for this crash, NULL when none could be written
 } PlatCrash;
 void plat_crash_hook(void (*fn)(const PlatCrash *c));
+const char *plat_crash_dump(void);   // from fn: writes the minidump, returns its UTF-8 path; NULL when none (always off Windows)
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure

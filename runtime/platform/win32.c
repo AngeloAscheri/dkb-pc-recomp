@@ -694,12 +694,13 @@ static void (*crash_fn)(const PlatCrash *c);
 // game-derived data: it stays on this machine like the logs, and is only ever sent privately, when asked for.
 typedef BOOL(WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
 static MiniDumpWriteDumpFn dump_write;   // MiniDumpWriteDump, or NULL when dbghelp.dll is missing
-#define DUMP_WAIT_MS 5000                // how long the crashing thread waits for its dump before it logs the report
+#define DUMP_WAIT_MS 5000                // how long the crashing thread waits for its dump before it exits
 #define DUMP_KEEP 5                      // crash dumps kept in logs\ (the newest), counting the next one
 typedef struct {
     DWORD thread_id;
     EXCEPTION_POINTERS *ep;    // NULL for abort and invalid parameter, which raise no exception
     wchar_t path[MAX_PATH];
+    wchar_t partial[MAX_PATH];   // path + ".partial": the dump is written here and renamed to path when complete
     BOOL ok;
 } DumpJob;
 // MINIDUMP_EXCEPTION_INFORMATION (dbghelp.h), declared here to keep the header out. dbghelp.h declares it under
@@ -718,12 +719,14 @@ static DWORD WINAPI dump_thread(void *arg) {
     DumpJob *j = arg;
     MiniDumpWriteDumpFn write = dump_write;
     if (!write) return 0;
-    HANDLE f = CreateFileW(j->path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE f = CreateFileW(j->partial, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return 0;
     DumpExceptionInfo ei = {j->thread_id, j->ep, FALSE};
     j->ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, DUMP_TYPE, j->ep ? &ei : NULL, NULL, NULL);
     CloseHandle(f);
-    if (!j->ok) DeleteFileW(j->path);
+    // A dump the crashing thread gave up waiting for keeps writing until exit: a .partial file never looks complete.
+    if (j->ok) j->ok = MoveFileExW(j->partial, j->path, MOVEFILE_REPLACE_EXISTING);
+    if (!j->ok) DeleteFileW(j->partial);
     return 0;
 }
 
@@ -744,15 +747,24 @@ static const char *write_crash_dump(EXCEPTION_POINTERS *ep) {
     _snwprintf(job.path, MAX_PATH, L"%ls\\logs\\crash-%lu-%llu.dmp", exe, GetCurrentProcessId(),
                (unsigned long long)GetTickCount64());
     job.path[MAX_PATH - 1] = 0;
+    _snwprintf(job.partial, MAX_PATH, L"%ls.partial", job.path);
+    job.partial[MAX_PATH - 1] = 0;
     job.thread_id = GetCurrentThreadId();
     job.ep = ep;
     HANDLE t = CreateThread(NULL, 1 << 20, dump_thread, &job, 0, NULL);
     if (!t) return NULL;
-    WaitForSingleObject(t, DUMP_WAIT_MS);   // a dump not written by then is given up: the report must still be logged
+    WaitForSingleObject(t, DUMP_WAIT_MS);   // a dump not written by then is given up; the report is already logged
     CloseHandle(t);
     if (!job.ok || !WideCharToMultiByte(CP_UTF8, 0, job.path, -1, path8, sizeof path8, NULL, NULL)) return NULL;
     return path8;
 }
+
+// The exception of the crash being reported, for plat_crash_dump (NULL for abort and invalid parameter).
+static EXCEPTION_POINTERS *volatile crash_ep;
+
+// The report is logged first and the dump written after: MiniDumpWriteDump suspends the other threads and can block on
+// a lock one of them holds (a heap corruption inside HeapAlloc), and the report is what a player has to attach.
+const char *plat_crash_dump(void) { return write_crash_dump(crash_ep); }
 
 static const char *exception_name(DWORD code) {
     return code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
@@ -790,7 +802,7 @@ static LONG WINAPI crash_unhandled(EXCEPTION_POINTERS *ep) {
     }
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
-    c.dump = write_crash_dump(ep);
+    crash_ep = ep;
     crash_fn(&c);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -807,7 +819,7 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     PlatCrash c = {what, (uint32_t)code, rip, rip - (uintptr_t)mi.lpBaseOfDll, -1, 0};
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
-    c.dump = write_crash_dump(ep);
+    crash_ep = ep;
     crash_fn(&c);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -827,7 +839,7 @@ __attribute__((noinline)) static void crash_from_runtime(const char *what, uint3
             if ((uintptr_t)f[i] - base < mi.SizeOfImage) c.frames[c.nframes++] = (uintptr_t)f[i];
         if (c.nframes) c.rip = c.frames[0], c.offset = c.rip - base;
     }
-    c.dump = write_crash_dump(NULL);
+    crash_ep = NULL;
     crash_fn(&c);
 }
 
@@ -839,7 +851,7 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
     crash_from_runtime("invalid parameter to a C runtime function", 0xc0000417u);   // STATUS_INVALID_CRUNTIME_PARAMETER
 }
 
-// Deletes the oldest crash-*.dmp in logs\ beside the executable until DUMP_KEEP - 1 are left, so the next crash's
+// Deletes the oldest crash-*.dmp in logs\ beside the executable until DUMP_KEEP - 1 are left (a leftover .partial counts), so the next crash's
 // dump makes DUMP_KEEP. Run at start, never during a crash.
 static void prune_crash_dumps(void) {
     wchar_t dir[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
@@ -847,7 +859,7 @@ static void prune_crash_dumps(void) {
     wchar_t *slash = n && n < MAX_PATH ? wcsrchr(dir, L'\\') : NULL;
     if (!slash) return;
     *slash = 0;
-    _snwprintf(pat, MAX_PATH, L"%ls\\logs\\crash-*.dmp", dir);
+    _snwprintf(pat, MAX_PATH, L"%ls\\logs\\crash-*.dmp*", dir);
     pat[MAX_PATH - 1] = 0;
     for (;;) {
         WIN32_FIND_DATAW fd;
