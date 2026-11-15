@@ -95,7 +95,7 @@ being worked on right now.
 
 - [#3](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/3) **Test on your GPU.** Everything so far was checked
   on one NVIDIA card. Runs on AMD, Intel and other NVIDIA cards, with logs, show what breaks there.
-- [#7](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/7) **Play past the tutorial** and report where it stops.
+- **Play as far as you can** and report where it stops, with the crash form.
 - [#9](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/9) **The GPU fault after the first guide movie**: seen
   on three NVIDIA drivers (617.14, 617.42, 621.01); runs on AMD and Intel would show whether it is NVIDIA's.
 

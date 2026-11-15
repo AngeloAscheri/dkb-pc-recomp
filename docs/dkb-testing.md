@@ -238,10 +238,11 @@ deltas).
 ## What to report
 
 Open an issue with the issue form, or comment on [#3](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/3)
-(GPU testing) or [#7](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/7) (playing further):
+(GPU testing):
 
-- the commit you built (`git rev-parse --short HEAD`);
-- GPU, driver version and Windows version;
+- the release you downloaded, or the commit you built (`git rev-parse --short HEAD`), and the game version (1.0.0 or
+  3.2.0);
+- GPU, driver version and operating system;
 - how far the game got and what you did just before it stopped;
 - the log, `logs\dkb.log` next to `dkb.exe` (`logs\totk.log` in builds before the rename), as an attachment. After a crash, copy it before you start the game
   again: the next run renames it to `dkb.1.log`.
