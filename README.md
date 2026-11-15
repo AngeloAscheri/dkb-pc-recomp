@@ -28,17 +28,15 @@ the Glacier layer, Snow World (Layer 500) and the Tempest layer. The current rel
 [latest release](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/latest) carries an installer that
 builds the game from your own dump: [docs/installer.md](docs/installer.md). What still fails:
 
-- Device lost on NVIDIA in the Snow World descent ([#196](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/196),
-  [#197](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/197), [#264](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/264)),
-  on RTX 5070, 5070 Ti, 5080 and 5090. It reproduces here on an RTX 5060 Ti. One light quad of the #9 family sets it
-  off, and on `bananza` de4f966 skips that quad: 0 faults in 7 runs that reached the spot. Retest asked. As in #9, the
-  cause on the driver side is still open.
+- Device lost on NVIDIA in the Snow World descent (#197, #264): fixed on `bananza` by de4f966, which skips one light
+  quad; two players confirmed it. The Glacier rock ride (#196) waits for a retest. The #9 light quads draw again
+  (e9165d3), so their particles are back (#62).
 - Device lost on AMD cards with AMD's Windows driver. On 0.3.0, `vk_recorder = 0` in `dkb.ini` stopped it for three
   players (#84, #155, #142), then #124 and #123, and it is the default on `bananza` since d161f88. Other AMD reports
   wait for a retest (#176, #193, #206, #267). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204); 25d1089 fences
   the command buffer the recorder writes, a retest is asked.
-- Guest crashes (#148, #136, #218, #229). One loader fault at `main+0x82fee0` hits three machines at the title screen
-  or on loads (#157, #173, #206) and is not reproduced here yet. #218 sent a save and an input recording that reach
+- Guest crashes (#148, #136, #218, #229). The write to address 0 at the title screen or on loads (#157, #173, #206)
+  is guarded on `bananza` (22f0a3a); retest asked. #218 sent a save and an input recording that reach
   `main+0x429480` on a layer change.
 - Intel Arc A770: a driver fault about 20 s in (#3).
 - Missing effects in the Tempest layer (falling golden hail, tornadoes: #221, #183).
@@ -47,8 +45,9 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
   [docs/dkb-lowend.md](docs/dkb-lowend.md).
 - A soft 3D picture: the game's dynamic resolution draws the scene at 2/3 of the output (1280x720 at 1080p, #210).
   On `bananza` (9190e6b), `scene_res = full` draws it at the output size.
+- Add-on content: the installer now unpacks DLC from a `.nup` (57eaed9), untested with a real DLC (#258).
 
-Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 14 November 2026.
+Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 15 November 2026.
 
 | Phase | | State |
 | --- | --- | --- |
