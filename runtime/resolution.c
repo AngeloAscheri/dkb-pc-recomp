@@ -210,7 +210,6 @@ static uint64_t pack(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
 
 void res_init(void) {
     if (!rt_game_version) {
-        if (dkb_wide_heap_extra_kib()) fs_init();   // romfs.c serves the grown HeapDef before dkb_wide_init asks
         dkb_wide_init();
         return;
     }

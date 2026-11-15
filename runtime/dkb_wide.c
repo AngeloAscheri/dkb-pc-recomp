@@ -72,17 +72,17 @@ static int dkb_output_size(unsigned *width, unsigned *height) {
 
 // What the render-target pool adds to the stock 200 MiB at the configured output and scene_res, in KiB: GSys grows by
 // it (resolution.c). Read once memory.c has read the settings, before dkb_wide_init, from the same settings.
+static int heap_extra_done;   // file scope so tests/dkb_wide_test.c can reset the memo
+static uint64_t heap_extra;
 uint64_t dkb_wide_heap_extra_kib(void) {
-    static int done;
-    static uint64_t extra;
-    if (done) return extra;
-    done = 1;
+    if (heap_extra_done) return heap_extra;
+    heap_extra_done = 1;
     unsigned width, height;
-    if (rt_patch_set("dkbwide") < 0 || !dkb_output_size(&width, &height)) return extra = 0;
+    if (rt_patch_set("dkbwide") < 0 || !dkb_output_size(&width, &height)) return heap_extra = 0;
     uint32_t pool = dkb_wide_pool_bytes(width, height);
     float ratio = dkb_scene_ratio();
     if (ratio && rt_patch_set("dkbscene") >= 0) pool = dkb_scene_pool(pool, ratio);
-    return extra = pool > DKB_POOL_BASE ? (uint64_t)(pool - DKB_POOL_BASE) >> 10 : 0;
+    return heap_extra = pool > DKB_POOL_BASE ? (uint64_t)(pool - DKB_POOL_BASE) >> 10 : 0;
 }
 
 static void dkb_wide_scene(uint8_t *page, float ratio) {
@@ -173,5 +173,8 @@ void dkb_wide_init(void) {
     rt_patch_switch(set, 1);
     rt_log("Bananza resolution: virtual display %ux%u, camera aspect %.6f, ultrawide %s",
            width, height, aspect, wide_enabled ? "on" : "off");
+    // RomFS setup runs once and picks the UI overlay from the output set above, so it follows that and precedes the scene:
+    // romfs.c serves the grown HeapDef from here on (res_heapdef_served), which dkb_wide_scene asks about.
+    if (dkb_wide_heap_extra_kib()) fs_init();
     if (scene) dkb_wide_scene(page, scene);
 }
