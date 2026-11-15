@@ -279,11 +279,12 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
 // fence wait is waiting for. Queue order is as before: the packet follows the part's last call, the end of every later
 // part and of the submission drains the ring first (rec_end_cb, rec_end), and an upload batch waits for a submit in
 // flight (rec_submit_wait). 0, the default: the replaying thread submits every part; ab: switches with the A/B blocks.
-// The recorder calls fn(arg) after every call queued before it (1); 0 without a recorder thread or during a capture,
-// when the caller calls it. vk_sync.c vk_sync_split_finish ends a held part with it, on the thread that recorded it.
+// The recorder calls fn(arg) after every call queued before it (1); 0 without a recorder thread, when the caller
+// calls it. During a capture it is fatal: ending a part on the submitting thread there would run ahead of the calls held. vk_sync.c vk_sync_split_finish ends a held part with it, on the thread that recorded it.
 typedef struct { void (*fn)(void *); void *arg; } A_Call;
 int rec_call(void (*fn)(void *), void *arg) {
-    if (!rec_thread || capturing) return 0;
+    if (!rec_thread) return 0;
+    if (capturing) rt_fatal("vk_rec: a part cannot be ended while a pass end is captured (a held-back pass end must spill first)");
     A_Call *a = put(R_Call, sizeof *a);
     *a = (A_Call){fn, arg};
     unpub = 0;

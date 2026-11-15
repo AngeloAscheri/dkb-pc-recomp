@@ -2306,6 +2306,8 @@ static int par_defer_ok(const VkExec *ex) {
 // The pass end is made in place, as without the deferral: the slices are waited for (a held earlier pass's as well,
 // vk_texture_hold_barrier, which lets a texture lock the walk holds go), and then their execution and the calls captured
 // so far go into the part, before the call that spilled.
+// It waits from inside a rec_* call with only the texture lock let go (vk_texture_hold_barrier), so a spill must never
+// happen under a lock a worker takes: the mirror lock, cmd_lock.
 static typeof(PDQ[0]) *pd_cur;   // the pass end par_defer is capturing
 static int pd_spilled;
 static void par_spill(void) {
