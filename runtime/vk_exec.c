@@ -2407,10 +2407,14 @@ static void par_settle_all(VkExec *ex) {
 // new batch when nothing is held (no slice is being recorded then).
 static void par_room(VkExec *ex) {
     static int depth;
-    if (!depth) {   // TOTK_PAR_DEFER_DEPTH: pass ends held at most (1 to PAR_DEFER_DEPTH)
+    // TOTK_PAR_DEFER_DEPTH: pass ends held at most (1 to PAR_DEFER_DEPTH), 2 by default. Within one run (TOTK_AB), the
+    // route's Lake Level took 7.8% less time a frame with the pass ends held at 2 and 6 to 8% at 4; the Hilltop Layer of
+    // Surf Hills (3.2.0, 28,500 draws a frame) 0.7% less at 2 but 9 to 10% more at 4, where the GPU got the frame's
+    // work too late for the replay's gain (its wait for the GPU went from 4.1 to 6.1 ms a frame).
+    if (!depth) {
         const char *e = cfg_get("TOTK_PAR_DEFER_DEPTH");
-        depth = e && *e ? atoi(e) : 0;
-        if (depth < 1 || depth > PAR_DEFER_DEPTH) depth = PAR_DEFER_DEPTH;
+        depth = e && *e ? atoi(e) : 2;
+        if (depth < 1 || depth > PAR_DEFER_DEPTH) depth = 2;
     }
     while (pd_n >= depth) par_settle_front(ex, 1);
     if (pd_n && (PC.nslices + PAR_PASS_SLICES > PAR_MAX_SLICES || PC.nops > PAR_MAX_OPS / 2)) par_settle_all(ex);
@@ -2553,6 +2557,9 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
             if (!state_op(ex, h->op, a)) rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if ((h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) && ex->in_pass) pass_draws++;
+        // A held part goes to the queue as soon as its slices are recorded, not only at the next sliced pass or split:
+        // the GPU waits for it meanwhile.
+        if (pd_n) par_settle_ready(ex);
         if (split_draws >= split_n) maybe_split(ex);
         h = nvn_op_next(h);
     }
