@@ -661,8 +661,21 @@ static int reset_targets_overlap(const uint64_t *pointers, uint32_t count) {
     return overlap;
 }
 
+// Whether a GPU write this command buffer recorded (note_written) overlaps [addr, addr + size).
+static int written_overlaps(VkExec *ex, uint64_t addr, uint64_t size) {
+    const CbRes *r = cb_res(ex);
+    for (int i = 0; i < r->nwritten; i++)
+        if (r->written[i].addr < addr + size && addr < r->written[i].addr + r->written[i].size) return 1;
+    return 0;
+}
+
 // The pointer list may have been written earlier in this submission. Read its GPU-visible contents after submitting
 // that prefix, then validate every target before recording a write. Null pointers have no record to reset.
+//
+// TOTK_RESET_CPU_LIST (default 1) reads the list from guest memory instead (guest addresses are host addresses) when
+// no GPU write recorded in this command buffer touches it. vk_exec_read_buffer submits the replay so far and waits for
+// the GPU: 1 to 6 ms of the replay thread per frame on Hill, whose list has about 5,455 entries. 2 reads both, logs
+// how many guest copies differ from the GPU's every 300 lists, and uses the GPU's; 0 always reads through the GPU.
 int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_bytes, int64_t first, int64_t count) {
     DrawCtx *const dc = DC_OF(ex);
     if (IS_HELPER(dc) && vk_spec_fail(VK_SPEC_WRITE)) return 0;   // reads a buffer back and rewrites it: both need the earlier parts
@@ -671,7 +684,29 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
     if (!nvn_indirect_reset_list(list_addr, descriptor_bytes, first, count, &list)) return 0;
     uint64_t *pointers = malloc(list.bytes);
     if (!pointers) rt_fatal("vk: out of memory reading an indirect-reset pointer list");
-    if (!vk_exec_read_buffer(ex, list.begin, list.bytes, pointers) ||
+    static int cpu_list = -1;
+    if (cpu_list < 0) cpu_list = cfg_int("TOTK_RESET_CPU_LIST");
+    VkMemSpan list_span;
+    const int guest_ok = cpu_list && vk_mem_resolve(list.begin, list.bytes, &list_span) &&
+                         !written_overlaps(ex, list.begin, list.bytes);
+    int have = 0;
+    if (guest_ok && cpu_list == 1) {
+        memcpy(pointers, (const void *)(uintptr_t)list.begin, list.bytes);
+        have = 1;
+    } else if (guest_ok && cpu_list == 2) {
+        static uint64_t n_cmp, n_diff;
+        uint64_t *guest = malloc(list.bytes);
+        if (!guest) rt_fatal("vk: out of memory comparing an indirect-reset pointer list");
+        memcpy(guest, (const void *)(uintptr_t)list.begin, list.bytes);
+        have = vk_exec_read_buffer(ex, list.begin, list.bytes, pointers);
+        n_cmp++, n_diff += have && memcmp(guest, pointers, list.bytes) != 0;
+        if (n_cmp % 300 == 0)
+            rt_log("vk: indirect-reset list: %llu of %llu guest copies differ from the GPU's (%u entries)",
+                   (unsigned long long)n_diff, (unsigned long long)n_cmp, list.count);
+        free(guest);
+        if (!have) { free(pointers); return 0; }
+    }
+    if ((!have && !vk_exec_read_buffer(ex, list.begin, list.bytes, pointers)) ||
         !nvn_indirect_reset_targets(&list, pointers, reset_mapped, NULL)) {
         free(pointers);
         return 0;
