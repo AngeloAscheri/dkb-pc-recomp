@@ -76,6 +76,12 @@ area = "gfx"
 cmd = ["{python}", "tests/dkb_wide_layout_test.py"]
 
 [[test]]
+name = "layout-neutral-runtime"
+tier = 0
+area = "runtime"
+cmd = ["{python}", "tests/layout_neutral_runtime_test.py"]
+
+[[test]]
 name = "installer-update"
 tier = 0
 area = "installer"
