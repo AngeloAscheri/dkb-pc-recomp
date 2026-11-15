@@ -1575,8 +1575,8 @@ static void mirror_mode(int discrete) {
     }
     vk_mirror_on = mode > 0;
     mirror_verify = mode == 2;
-    const char *sparse = cfg_get("TOTK_SPARSE_MIRROR_COPY");
-    mirror_sparse = vk_mirror_on && sparse && !strcmp(sparse, "1");
+    const char *sparse = cfg_get("TOTK_SPARSE_MIRROR_COPY");   // on unless 0 (sparse_ranges)
+    mirror_sparse = vk_mirror_on && !(sparse && !strcmp(sparse, "0"));
     if (mirror_sparse) sparse_cache_open();
     const char *g = cfg_get("TOTK_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
@@ -1643,8 +1643,12 @@ static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, ui
 #define MRANGE_LESS(x, y) ((x)->r != (y)->r ? (uintptr_t)(x)->r < (uintptr_t)(y)->r : (x)->off < (y)->off)
 MSORT_DEFINE(sort_ranges, MRange, MRANGE_LESS)   // by pool, then offset, without a call per comparison (msort.h)
 
-// Local experiment: one dispatch for a pool's many small write-back ranges. The usual transfer path
-// handles large pools, bulk copies, and any unsupported alignment or device capability.
+// One dispatch for a pool's many small write-back ranges (TOTK_SPARSE_MIRROR_COPY, on by default; 0 copies every range
+// with vkCmdCopyBuffer). A copy region costs the GPU about 0.7 us whatever its size: in the Hilltop Layer of Surf Hills
+// (3.2.0) 5,500 write-back ranges a frame of 870 bytes on average took 4.2 ms of an RTX 5090's GPU time as copy
+// regions and 0.4 ms as one workgroup each. The transfer path keeps bulk copies (ranges over 4 KiB on average, where it
+// is faster: the mirror uploads, 80 KiB a range, took 4.5 ms as copies and 11 to 15 as a dispatch), the uploads, and
+// any unsupported alignment or device capability.
 static struct {
     int tried;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -1792,7 +1796,7 @@ static void sparse_cache_close(void) {
 }
 
 static int sparse_ranges(VkCtx *c, uint64_t size, int count) {
-    if (count < 64 || size > 4u * 1024 * 1024 || size > c->props.limits.maxStorageBufferRange ||
+    if (count < 64 || size > c->props.limits.maxStorageBufferRange ||
         (uint32_t)count > c->props.limits.maxComputeWorkGroupCount[0]) return 0;
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
@@ -1800,7 +1804,7 @@ static int sparse_ranges(VkCtx *c, uint64_t size, int count) {
         if ((region->srcOffset | region->size) & 3) return 0;
         total += region->size;
     }
-    return total <= 128u * (uint64_t)count;
+    return total <= 4096u * (uint64_t)count;
 }
 
 static void sparse_dispatch(VkCommandBuffer cb, SparseBatch *batch, PoolRec *pool, uint64_t size, int count) {
