@@ -282,7 +282,8 @@ void vk_mem_pick(VkMemSpan *sp);
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
-void vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size);   // as vk_mem_gpu_wrote, but the bytes stay in the mirror
+int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size);    // as vk_mem_gpu_wrote, but whole pages stay in the mirror; 0: none did
+int vk_mem_kept_overlaps(uint64_t addr, uint64_t size);     // a kept GPU write lies in the range
 uint64_t vk_mem_mirror_gen(void);   // changes whenever a mirror is made or dropped, and with every submission
 int vk_mem_shadow_on(void);         // shadow storage is in use (TOTK_SHADOW)
 void vk_mem_threads(void);         // the workers of sliced passes bind mirrors too (vk_exec.c), from now on
@@ -302,7 +303,6 @@ void vk_usnap_view(uint64_t upto);
 const void *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy's bytes for the CPU; NULL: not copied or dropped
 int vk_usnap_covers(uint64_t addr, uint64_t n);   // a copy of this submission overlaps the range
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
-void vk_usnap_keep(uint64_t addr, uint64_t n);   // as vk_usnap_drop, for a write that never goes back to guest memory
 uint64_t vk_usnap_arena_bytes(void);                 // arenas created so far (all kept until shutdown)
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas

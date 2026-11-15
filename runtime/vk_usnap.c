@@ -319,7 +319,8 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             U.refused++;
             continue;
         }
-        if (wr_hits(lo, hi)) {
+        // A GPU write kept in the mirror (vk_mem_gpu_kept) never reaches guest memory, which stays stale there.
+        if (wr_hits(lo, hi) || vk_mem_kept_overlaps(lo, hi - lo)) {
             U.inflight++;
             continue;
         }
@@ -416,10 +417,6 @@ static void drop(uint64_t addr, uint64_t n, uint64_t fence) {
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) { drop(addr, n, U.fence); }
-
-// A GPU write that is not copied back to guest memory (vk_memory.c vk_mem_gpu_kept): guest memory stays stale for good,
-// so the range never leaves U.wr (wr_prune drops only writes whose fence completed) and no later submission snapshots it.
-void vk_usnap_keep(uint64_t addr, uint64_t n) { drop(addr, n, UINT64_MAX); }
 
 uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_ACQUIRE); }
 uint64_t vk_usnap_arena_bytes(void) { return __atomic_load_n(&arena_total, __ATOMIC_RELAXED); }

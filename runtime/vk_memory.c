@@ -2015,6 +2015,27 @@ static void mirror_retire(void *arg) {
     destroy_rec(vk_ctx(), arg);
 }
 
+// The CPU rewrote the page at offset off of the pool: it is no longer a kept GPU write (mirror_lock held).
+static void kept_cut(PoolRec *r, uint64_t off) {
+    const uint64_t page = 1ull << GEN_PAGE_SHIFT, end = off + page;
+    for (int a = 0, b = r->nkept; a < b;) {
+        int k = (a + b) / 2;
+        if (r->kept[k].hi <= off) { a = k + 1; continue; }
+        if (r->kept[k].lo >= end) { b = k; continue; }
+        struct KeptRange t = r->kept[k];
+        if (t.lo < off && end < t.hi) {   // split in two
+            if (r->nkept == r->ckept) grow((void **)&r->kept, &r->ckept, sizeof *r->kept);
+            memmove(r->kept + k + 2, r->kept + k + 1, (size_t)(r->nkept - k - 1) * sizeof *r->kept);
+            r->nkept++;
+            r->kept[k] = (struct KeptRange){t.lo, off};
+            r->kept[k + 1] = (struct KeptRange){end, t.hi};
+        } else if (t.lo < off) r->kept[k].hi = off;
+        else if (end < t.hi) r->kept[k].lo = end;
+        else memmove(r->kept + k, r->kept + k + 1, (size_t)(--r->nkept - k) * sizeof *r->kept);
+        return;   // the ranges are disjoint and the page is one page
+    }
+}
+
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
 static void mirror_sync(PoolRec *r) {
     int locked = mirror_lock_if_shared();
@@ -2043,8 +2064,10 @@ static void mirror_sync(PoolRec *r) {
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
-            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
+            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since) {
                 range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
+                if (r->nkept) kept_cut(r, x - lo);   // the CPU rewrote it: the mirror gets its bytes, no longer GPU-only
+            }
     }
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
@@ -2144,13 +2167,20 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
 // (mirror_sync) work on whole 4 KiB pages, so the bytes of the range that share a page with other data go back to guest
 // memory as usual, and a CPU write or flush there copies the page, GPU bytes included, back into the mirror. The pages
 // wholly inside the range are noted in the pool's kept list, which mirror_sync leaves out of its flush ranges.
-void vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
+// Returns whether it kept any page; 0 means every byte went the vk_mem_gpu_wrote way (no mirror, or no whole page), so
+// guest memory will hold the GPU's bytes and the caller treats the write as an ordinary one.
+int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
     vk_spec_event();
     PoolRec *r = sp->pool;
-    if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return;
+    if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return 0;
     const uint64_t page = 1ull << GEN_PAGE_SHIFT, a = r->import_lo + sp->offset, b = a + size;
     uint64_t pa = (a + page - 1) & ~(page - 1), pb = b & ~(page - 1);
-    if (pa >= pb) return vk_mem_gpu_wrote(sp, size);   // no whole page
+    if (pa >= pb) return vk_mem_gpu_wrote(sp, size), 0;   // no whole page
+    // As in vk_mem_gpu_wrote, a range this thread already kept in this submission is in the list.
+    static _Thread_local struct { const PoolRec *r; uint64_t off, size; uint32_t sub; } seen[128];
+    __typeof__(seen[0]) *k = &seen[((uintptr_t)r >> 6 ^ sp->offset >> 4) & 127];
+    uint32_t sub = __atomic_load_n(&msub, __ATOMIC_RELAXED);
+    if (k->r == r && k->sub == sub && k->off == sp->offset && k->size >= size) return 1;
     if (a < pa) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = sp->offset}, pa - a);
     if (pb < b) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = pb - r->import_lo}, b - pb);
     uint64_t lo = pa - r->import_lo, hi = pb - r->import_lo;
@@ -2177,6 +2207,27 @@ void vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
     }
     r->kept[i] = (struct KeptRange){lo, hi};
     mirror_unlock(locked);
+    *k = (__typeof__(*k)){r, sp->offset, size, sub};
+    return 1;
+}
+
+// Whether a kept GPU write (vk_mem_gpu_kept) lies in [addr, addr+size): guest memory there is stale, so
+// vk_usnap.c vk_usnap_begin does not copy it into a uniform snapshot.
+int vk_mem_kept_overlaps(uint64_t addr, uint64_t size) {
+    VkMemSpan sp;
+    if (!size || !vk_mem_resolve(addr, size, &sp) || !sp.pool) return 0;
+    PoolRec *r = sp.pool;
+    if (ms_get(r) != MS_ON) return 0;
+    uint64_t lo = addr - r->import_lo, hi = lo + size;
+    int locked = mirror_lock_if_shared(), hit = 0;
+    for (int a = 0, b = r->nkept; a < b && !hit;) {
+        int k = (a + b) / 2;
+        if (r->kept[k].hi <= lo) a = k + 1;
+        else if (r->kept[k].lo >= hi) b = k;
+        else hit = 1;
+    }
+    mirror_unlock(locked);
+    return hit;
 }
 
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
@@ -2285,6 +2336,19 @@ static int page_dirty(uint64_t a, uint32_t mgen) {
     return mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
 }
 
+static int kept_page(PoolRec *r, uint64_t off) {   // completion thread: takes mirror_lock whatever the replay's mode
+    plat_mutex_lock(&mirror_lock);
+    int hit = 0;
+    for (int a = 0, b = r->nkept; a < b && !hit;) {
+        int k = (a + b) / 2;
+        if (r->kept[k].hi <= off) a = k + 1;
+        else if (r->kept[k].lo > off) b = k;
+        else hit = 1;
+    }
+    plat_mutex_unlock(&mirror_lock);
+    return hit;
+}
+
 static void verify_cb(void *arg) {   // completion thread
     VJob *j = arg;
     static volatile int32_t logged;
@@ -2302,6 +2366,7 @@ static void verify_cb(void *arg) {   // completion thread
             const uint8_t *m = j->map + s->dst + o, *g = (const uint8_t *)(uintptr_t)a;
             pages++;
             if (!memcmp(m, g, 1ull << GEN_PAGE_SHIFT)) continue;
+            if (kept_page(r, s->off + o)) { skipped++; continue; }   // a kept GPU write: guest memory is stale on purpose
             if (page_dirty(a, s->mgen)) { skipped++; continue; }
             bad++;
             if (plat_inc32(&logged) <= VERIFY_LOG) {
