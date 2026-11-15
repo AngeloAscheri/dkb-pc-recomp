@@ -1,4 +1,4 @@
-// Selected-controller fullscreen hold: deterministic time, no SDL, game data or display changes.
+// Default menu chord and opt-in fullscreen hold: deterministic time, no SDL, game data or display changes.
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

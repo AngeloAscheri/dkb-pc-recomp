@@ -31,7 +31,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "Keyboard and mouse remain available.",
     [UI_MENU_PAD_FULLSCREEN_HOLD] = "Fullscreen hold shortcut",
     [UI_MENU_PAD_FULLSCREEN_HOLD_DESC] = "Off: Plus + Minus opens or closes settings.\n\nOn: hold Plus + Minus for 0.5 seconds to toggle fullscreen instead.\n\nGuide/Home and keyboard F1 remain available in either mode.",
-    [UI_MENU_SHORTCUT_SETTINGS_COMBO_DESC] = "Press both displayed Plus and Minus bindings together to open or close settings.\n\nThis is the original settings shortcut and follows the current bindings.\n\nKeyboard equivalent: F1.",
+    [UI_MENU_SHORTCUT_SETTINGS_COMBO_DESC] = "Press both displayed Plus and Minus bindings together to open or close settings.\n\nThis shortcut follows the current button bindings.\n\nKeyboard equivalent: F1.",
     [UI_MENU_SHORTCUTS] = "Shortcuts",
     [UI_MENU_SHORTCUT_READONLY] = "Read-only shortcuts",
     [UI_MENU_SHORTCUT_SETTINGS] = "Open settings menu",

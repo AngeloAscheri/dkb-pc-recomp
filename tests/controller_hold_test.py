@@ -1,4 +1,4 @@
-"""Compile the real fullscreen hold gate at O0/O2 without SDL or game files.
+"""Compile the real menu chord and fullscreen hold gates at O0/O2 without SDL or game files.
 
 Usage: python tests/controller_hold_test.py --cc <clang>
 """

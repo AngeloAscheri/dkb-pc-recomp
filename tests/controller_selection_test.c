@@ -23,7 +23,7 @@ int main(void) {
 
     d[2] = device(3, "xbox");
     assert(input_pad_choose(&s, d, 3, "switch", 2) == 3 && s.automatic);
-    assert(input_pad_choose(&s, d, 3, "switch", 2) == 3);   // retry a pending open without losing the arrival
+    assert(input_pad_choose(&s, d, 3, "switch", 2) == 3);   // retain the requested arrival until selected
     assert(input_pad_choose(&s, d, 3, "switch", 3) == 3);
     assert(input_pad_choose(&s, d, 2, "switch", 0) == 1 && s.automatic);   // disconnect falls back
 

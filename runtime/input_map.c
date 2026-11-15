@@ -336,7 +336,7 @@ void input_pad_stick(int32_t x, int32_t y, float dead, int32_t out[2]) {
     out[1] = (int32_t)lrint(fmax(-1, fmin(1, fy * k)) * STICK_MAX);
 }
 
-// Once-per-hold latch for the existing overlay chord; a partial release does not leak the other button.
+// Once-per-hold latch for the menu and overlay chords; a partial release does not leak the other button.
 static int chord(int *held, uint64_t *buttons, uint64_t combo) {
     uint64_t raw = *buttons & combo;
     int edge = 0;
@@ -381,7 +381,8 @@ uint32_t input_pad_choose(InputPadSelection *s, const InputPadDevice *devices, i
                 s->automatic = 1;
             }
         }
-        if (s->pending) wanted = s->pending;   // retry a takeover whose SDL open has not succeeded yet
+        // Retain the requested takeover until selected or disconnected; input.c caches actual failed opens.
+        if (s->pending) wanted = s->pending;
         else if (pad_list_has(devices, count, current)) wanted = current;
         else {
             if (count) wanted = devices[0].id;

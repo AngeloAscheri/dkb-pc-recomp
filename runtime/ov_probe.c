@@ -748,8 +748,46 @@ static void probe_swkbd(void) {
            "minimum length, the Win32 window with OK and Cancel)\n", n - bad, n, def);
 }
 
-// ---- the selected physical gamepad's timed Start/Back gate (no wall-clock waits)
+// ---- the menu's input gate: Minus+Plus is consumed, a menu that is open leaves the game a neutral pad
 static void probe_menu_gate(void) {
+    const uint64_t minus = 1ull << 11, plus = 1ull << 10, a = 1ull;
+    int held = 0;
+    int32_t st[4] = {100, -200, 300, -400};
+    uint64_t b = minus | a;   // Minus alone, a frame before Plus: reaches the guest unchanged
+    int t1 = input_menu_gate(&held, 0, &b, st);
+    CHECK(!t1 && b == (minus | a) && st[0] == 100 && st[3] == -400 && !held, "Minus alone changed: toggle %d buttons %#llx", t1,
+          (unsigned long long)b);
+    b = minus | plus | a;     // both down: the guest sees neither, the menu toggles once
+    int t2 = input_menu_gate(&held, 0, &b, st);
+    CHECK(t2 == 1 && b == a && held, "Minus+Plus: toggle %d buttons %#llx", t2, (unsigned long long)b);
+    b = minus | plus;         // still held with the menu open: no second toggle, a neutral pad
+    int t3 = input_menu_gate(&held, 1, &b, st);
+    CHECK(!t3 && b == 0 && st[0] == 0 && st[1] == 0 && st[2] == 0 && st[3] == 0, "menu open: toggle %d buttons %#llx", t3,
+          (unsigned long long)b);
+    b = a | plus; st[0] = 5;  // the menu is open and the pad is neutral whatever is pressed
+    input_menu_gate(&held, 1, &b, st);
+    CHECK(b == 0 && st[0] == 0, "an open menu left buttons %#llx", (unsigned long long)b);
+    b = 0;                    // released, then pressed again toggles again
+    input_menu_gate(&held, 0, &b, st);
+    b = minus | plus;
+    CHECK(input_menu_gate(&held, 0, &b, st) == 1, "the second hold did not toggle");
+    // Plus released first while Minus is still down: Minus must not leak; a new Minus press after both are up passes
+    held = 0;
+    b = minus | plus;
+    input_menu_gate(&held, 0, &b, st);
+    b = minus;
+    int t4 = input_menu_gate(&held, 0, &b, st);
+    CHECK(!t4 && b == 0 && held, "Minus left down after Plus leaked: buttons %#llx", (unsigned long long)b);
+    b = 0;
+    input_menu_gate(&held, 0, &b, st);
+    b = minus | a;
+    int t5 = input_menu_gate(&held, 0, &b, st);
+    CHECK(!t5 && b == (minus | a) && !held, "Minus after the release did not pass: buttons %#llx", (unsigned long long)b);
+    printf("menu gate: Minus alone passes, Minus+Plus is consumed and toggles once per hold, an open menu gives a neutral pad\n");
+}
+
+// ---- the selected physical gamepad's timed Start/Back gate (no wall-clock waits)
+static void probe_fullscreen_hold(void) {
     const uint64_t minus = 1ull << 11, plus = 1ull << 10, a = 1ull;
     InputHoldGate gate = {0};
     uint64_t b = 0;
@@ -876,6 +914,7 @@ static void probe_main(Cpu *c) {
     probe_swkbd();
     probe_menu_text();
     probe_menu_gate();
+    probe_fullscreen_hold();
     probe_fonts();
 }
 

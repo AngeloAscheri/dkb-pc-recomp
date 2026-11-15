@@ -26,6 +26,7 @@ typedef struct {
     int timing, consumed, fired;
 } InputHoldGate;
 int input_hold_gate(InputHoldGate *gate, uint32_t device, uint64_t now_ns, uint64_t *buttons);
+// Default mapped Plus+Minus chord: toggle once until both are released; an open menu leaves neutral game input.
 int input_menu_gate(int *held, int menu_open, uint64_t *buttons, int32_t sticks[4]);
 int input_overlay_gate(int *held, uint64_t *buttons);   // L3+R3: 1 in the poll both go down
 // The gamepad alone, for the menu: Switch button bits and the left stick (up +y). 0 without a connected gamepad.
