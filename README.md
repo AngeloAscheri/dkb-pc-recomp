@@ -48,7 +48,7 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
 - Add-on content: the installer unpacks DLC from a `.nup` (57eaed9); a player confirmed the DLC and the 3.2.0
   update load (#183). Loose RomFS mods load from a `mods` folder beside `dkb.exe` (7779dda).
 
-Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 15 November 2026.
+RecompLauncher on Linux and macOS: [docs/recomp-launcher.md](docs/recomp-launcher.md). Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 15 November 2026.
 
 | Phase | | State |
 | --- | --- | --- |
