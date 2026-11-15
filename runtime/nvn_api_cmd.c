@@ -76,22 +76,25 @@ static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) {
     memcpy(p, &h, sizeof h);
 }
 
+// The recording buffer is a copy block (copy_block below) with the copy's prefix in front, so EndRecording can hand
+// it over as the copy (take_recording). rec_buffer: one with room for at least cap bytes after the prefix, and the
+// room in *room.
+static uint8_t *rec_buffer(size_t cap, size_t *room);
+static void rec_buffer_free(uint8_t *seg);
+
 static void cmd_reserve(cmd_t *o, size_t need) {
     if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0;
-    if (!cap) cap = 64 << 10;
+    if (!cap) cap = 48 << 10;
     while (used + need + OP_RESERVE > cap) cap *= 2;
-    uint8_t *b = realloc(o->seg, cap);
-    // A block this size fails only without commit (the fatal report states it) or when seg is no block of ours: a
-    // command buffer object the game overwrote or copied shows a wrong magic or more used than its old size.
-    if (!b)
-        rt_fatal("nvn: command recording buffer of %zu bytes (command buffer %p, magic %#x, buffer %p of %zu bytes, %zu "
-                 "used, %zu asked)", cap, (void *)o, o->magic, (void *)o->seg, o->seg ? (size_t)(o->end - o->seg) : 0,
-                 used, need);
+    size_t room;
+    uint8_t *b = rec_buffer(cap, &room);
+    if (used) memcpy(b, o->seg, used);
+    rec_buffer_free(o->seg);
     o->seg = b;
     o->cur = b + used;
-    o->end = b + cap;
+    o->end = b + room;
 }
 
 // Space for one record (header included); the header's op is filled by the caller.
@@ -168,14 +171,15 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefix;   // deferred: 0 unknown, 1 none, 2 some
+// deferred: 0 unknown, 1 none, 2 some. block: the size of the block the prefix starts (copy_block).
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, block; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 
-// The blocks of copies of 64 KiB and more (the prefix included) come in power-of-two sizes and go back to a cache when
-// released, up to BLK_CACHE bytes, instead of to the heap. The CRT hands blocks of about 512 KiB and more to
-// VirtualAlloc and VirtualFree, so every copy wrote into new pages and took a demand-zero fault on each: in the Hilltop
-// Layer of Surf Hills (3.2.0), where the game records about 28,500 draws a frame, the copies came to 185 KiB on
-// average and the game took 470,000 page faults a second.
+// The blocks of copies and recording buffers of 64 KiB and more (the prefix included) come in power-of-two sizes and
+// go back to a cache when released, up to BLK_CACHE bytes, instead of to the heap. The CRT hands blocks of about
+// 512 KiB and more to VirtualAlloc and VirtualFree, so every copy wrote into new pages and took a demand-zero fault on
+// each: in the Hilltop Layer of Surf Hills (3.2.0), where the game records about 28,500 draws a frame, the copies came
+// to 185 KiB on average and the game took 470,000 page faults a second.
 #define BLK_MIN_SHIFT 16
 #define BLK_CLASSES 12               // 64 KiB to 128 MiB; larger copies use the heap
 #define BLK_CACHE (256ull << 20)     // bytes kept in the cache at most
@@ -191,26 +195,29 @@ static int blk_class(size_t total) {   // -1: from the heap
     return c < BLK_CLASSES ? c : -1;
 }
 
+// A block of at least total bytes; its prefix's block field holds its size, and the other fields are left to the caller.
 static copy_prefix *copy_block(size_t total) {
     int c = blk_class(total);
     void *p = NULL;
     if (c >= 0) {
+        total = (size_t)1 << (BLK_MIN_SHIFT + c);
         plat_mutex_lock(&blk_lock);
-        if (blk_n[c]) p = blk_free[c][--blk_n[c]], blk_cached -= (size_t)1 << (BLK_MIN_SHIFT + c);
+        if (blk_n[c]) p = blk_free[c][--blk_n[c]], blk_cached -= total;
         plat_mutex_unlock(&blk_lock);
-        if (!p) p = malloc((size_t)1 << (BLK_MIN_SHIFT + c));
+        if (!p) p = malloc(total);
     } else {
         p = malloc(total);
     }
     if (!p) rt_fatal("nvn: command copy allocation (%zu bytes)", total);
+    ((copy_prefix *)p)->block = total;
     return p;
 }
 
 static void copy_block_free(copy_prefix *pf) {
-    size_t size = (size_t)1 << BLK_MIN_SHIFT;
-    int c = blk_class(sizeof *pf + pf->bytes);
-    if (c >= 0) {
-        size <<= c;
+    if (!pf) return;
+    size_t size = (size_t)pf->block;
+    int c = blk_class(size);
+    if (c >= 0 && size == (size_t)1 << (BLK_MIN_SHIFT + c)) {
         plat_mutex_lock(&blk_lock);
         if (blk_cached + size <= BLK_CACHE) {
             if (blk_n[c] == blk_cap[c]) {
@@ -225,6 +232,16 @@ static void copy_block_free(copy_prefix *pf) {
         plat_mutex_unlock(&blk_lock);
     }
     free(pf);
+}
+
+static uint8_t *rec_buffer(size_t cap, size_t *room) {
+    copy_prefix *b = copy_block(sizeof *b + cap);
+    *room = (size_t)b->block - sizeof *b;
+    return (uint8_t *)(b + 1);
+}
+
+static void rec_buffer_free(uint8_t *seg) {
+    if (seg) copy_block_free((copy_prefix *)seg - 1);
 }
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -288,13 +305,17 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
     return bytes;
 }
 
-// The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
-// into one host block (copy_block: its exact size, or a cached block of the next power of two from 64 KiB). One
-// allocation and one copy: growing the copy record by record cost the game's main thread about 1 ms a frame in
-// reallocations and small copies (1.4.3, field).
-static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
-    uint8_t *out = (uint8_t *)copy_block(sizeof(copy_prefix) + n);
-    memcpy(out + sizeof(copy_prefix), p, n);
+// The recording [seg, cur), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), checked
+// record by record, as a copy. One of RECORDING_HANDOVER bytes or more is its recording buffer itself, a copy_block
+// with the prefix in front, and the command buffer takes a block of the same size from the cache for its next
+// recording; a smaller one is copied into a block of its own, as a handed-over buffer of 64 KiB or more would stay
+// allocated for as long as the game keeps the handle. Growing the copy record by record cost the game's main thread
+// about 1 ms a frame in reallocations and small copies (1.4.3, field); copying every recording at its end took about
+// two fifths of the main thread's running time in the Hilltop Layer of Surf Hills (3.2.0, 185 KiB a copy on average).
+#define RECORDING_HANDOVER (32u << 10)
+static uint8_t *take_recording(cmd_t *o) {
+    const uint8_t *p = o->seg;
+    size_t n = (size_t)(o->cur - o->seg);
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
@@ -307,8 +328,19 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){COPY_MAGIC, n, 0, 0};
-    return out + sizeof(copy_prefix);
+    copy_prefix *pf;
+    if (n >= RECORDING_HANDOVER) {
+        pf = (copy_prefix *)o->seg - 1;
+        copy_prefix *next = copy_block((size_t)pf->block);
+        o->seg = o->cur = (uint8_t *)(next + 1);
+        o->end = (uint8_t *)next + next->block;
+    } else {
+        pf = copy_block(sizeof *pf + n);
+        memcpy(pf + 1, p, n);
+    }
+    uint64_t block = pf->block;
+    *pf = (copy_prefix){COPY_MAGIC, n, 0, 0, 0, block};
+    return (uint8_t *)(pf + 1);
 }
 
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
@@ -392,7 +424,7 @@ NVN_API(nvnCommandBufferInitialize) {
 // void nvnCommandBufferFinalize(NVNcommandBuffer *cmd): handles outlive their recorder
 NVN_API(nvnCommandBufferFinalize) {
     cmd_t *o = cmd_of(c);
-    free(o->seg);
+    rec_buffer_free(o->seg);
     o->seg = o->cur = o->end = NULL;
     o->magic = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
@@ -447,7 +479,7 @@ NVN_API(nvnCommandBufferBeginRecording) {
     cmd_t *o = cmd_of(c);
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
     o->recording = 1;
-    o->cur = o->seg;   // the previous recording was copied at EndRecording
+    o->cur = o->seg;   // the previous recording was copied or handed over at EndRecording (take_recording)
     o->rec_start = o->cmd_used;
     put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
     o->hw_used -= 8;   // BEGIN and END have no hardware equivalent
@@ -463,7 +495,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     put_hdr(cmd_alloc(o, 8), OP_END, 8);
     o->hw_used -= 8;
     o->recording = 0;
-    uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
+    uint8_t *copy = take_recording(o);
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
@@ -1123,7 +1155,9 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
             size_t sz = sizeof *pf + pf->bytes;
             copy_prefix *cl = copy_block(sz);
+            uint64_t block = cl->block;
             memcpy(cl, pf, sz);
+            cl->block = block;
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
             zombie_add(cl);
