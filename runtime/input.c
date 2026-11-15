@@ -901,6 +901,9 @@ int input_sony_pad_present(void) {
     if (sony) rt_log("input: PlayStation pad at start: \"%s\" (after %d ms)", seen, waited);
     else if (n) rt_log("input: no PlayStation pad at start (\"%s\"): Switch prompts", seen);
     else rt_log("input: no gamepad listed within %d ms of start: Switch prompts", waited);
+    // The probe runs on whichever thread opens the RomFS first, and SDL ties its device-notification window to the
+    // thread that initialised the subsystem: release it so start() initialises it again on the input thread.
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     return sony;
 }
 
