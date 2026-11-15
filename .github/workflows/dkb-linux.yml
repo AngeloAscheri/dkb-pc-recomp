@@ -9,11 +9,9 @@ name: DKB Linux (compile gate + self-contained AppImage)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [appimage-totkrecompstyle]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   gate:
