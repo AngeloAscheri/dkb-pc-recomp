@@ -533,8 +533,9 @@ class Check(Step):
             host = json.loads(result.stdout)
         except ValueError:
             raise InstallError('check.host_probe_failed', code=result.returncode) from None
-        # Without AVX2 the game builds for x86-64-v2 from source; the release's prebuilt runtime is v3 only
-        if not host['x86_64_v3'] and (not host['x86_64_v2'] or prebuilt_runtime(ctx.layout)):
+        # Without AVX2 the game builds for x86-64-v2 (tools/build_game.py then compiles runtime/ instead of the
+        # release's v3 library)
+        if not host['x86_64_v3'] and not host['x86_64_v2']:
             raise InstallError('check.cpu_no_avx2')
         if not host['loader']:
             raise InstallError('check.vulkan_missing')

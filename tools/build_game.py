@@ -893,10 +893,13 @@ def main():
         for lib in ('opus', 'vpx', 'zstd'):
             LINK_LIBS[LINK_LIBS.index(f'-l{lib}')] = f'-l:lib{lib}.a'
     if X86:
-        march = host_march() if args.march == 'auto' else 'x86-64-' + args.march
+        # The prebuilt library CI makes is the v3 one whatever CPU builds it
+        march = ('x86-64-v3' if args.make_runtime_lib else host_march()) if args.march == 'auto' else 'x86-64-' + args.march
         print(f'-march={march}' + (' (this CPU lacks x86-64-v3)' if args.march == 'auto' and march.endswith('v2') else ''))
-        if march.endswith('v2') and args.runtime_lib:
-            sys.exit('a prebuilt runtime library is built for x86-64-v3: build without --runtime-lib for v2')
+        if march.endswith('v2') and args.runtime_lib and not args.make_runtime_lib:
+            # The release's prebuilt library is x86-64-v3; runtime/ ships beside it, so compile it at v2 instead
+            print(f'ignoring {args.runtime_lib}: it is built for x86-64-v3, compiling runtime/ for v2')
+            args.runtime_lib = None
         GEN_FLAGS.append('-march=' + march)
         RT_FLAGS.append('-march=' + march)
     if args.sysroot and not WIN:
