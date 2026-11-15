@@ -3202,6 +3202,7 @@ static void lb_stop(void) {
 // Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept).
 static void lb_warm_worker(void *arg) {
     (void)arg;
+    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);   // an hour-long run must leave the PC usable
     for (;;) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
         if (i >= LB.n) return;
@@ -3243,7 +3244,7 @@ static void lb_warm_worker(void *arg) {
     }
 }
 
-// Preparation: every variant of <dir>/shader-prepared.bin on every core at normal priority.
+// Preparation: every variant of <dir>/shader-prepared.bin on every core but one (from 4 cores up) at below-normal priority.
 static void lb_warm_prepared(const char *dir) {
     char path[PLAT_PATH_MAX * 2 + 32];
     snprintf(path, sizeof path, "%s/shader-prepared.bin", dir);
@@ -3279,6 +3280,8 @@ static void lb_warm_prepared(const char *dir) {
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
     int cpus = (int)plat_cpu_usable(), k = 0;
+    if (cpus >= 4) cpus--;
+    rt_log("vk_pipeline: stage library preparation on %d threads at below-normal priority", cpus);
     PlatThread *t[64];
     for (int i = 0; i < cpus && i < 64; i++)
         if ((t[k] = plat_thread_new(lb_warm_worker, NULL, "lib warm"))) k++;
