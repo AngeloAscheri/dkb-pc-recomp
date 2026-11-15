@@ -152,7 +152,7 @@ typedef struct {
     uint32_t aspect, level0, levels, layer0, layers, swz;
 } ViewKey;
 _Static_assert(sizeof(ViewKey) == 40, "ViewKey is hashed as bytes: no padding");
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; VkBuffer buf; } Range;   // note_written: buf the one the GPU wrote, or none
 typedef struct {
     Chunk *chunks;
     int nchunks, cchunks;
@@ -494,7 +494,7 @@ static const char *const RS_CLS_NAME[7] = {"storage table", "uniform ranges", "t
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    for (int i = 0; i < r->nwritten; i++) vk_gpu_written_into(r->written[i].addr, r->written[i].size, r->written[i].buf);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -581,7 +581,9 @@ static uint32_t written_hash(uint64_t addr, uint64_t size) {
 
 // Each distinct range once per command buffer, in first-write order. A scene with thousands of written ranges and tens
 // of thousands of draws binding them spent most of the replay searching this list, so the search goes through a table.
-static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
+// buf is the buffer the GPU writes the range through (a pool's VRAM mirror or its imported buffer, vk_memory.c
+// vk_gpu_written_into); a range written through two keeps none.
+static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf) {
     DrawCtx *const dc = DC_OF(ex);
     if (IS_HELPER(dc) && vk_spec_fail(VK_SPEC_WRITE)) return;   // the order of GPU writes is the replay thread's to keep
     CbRes *r = cb_res(ex);
@@ -599,11 +601,14 @@ static void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
     }
     uint32_t mask = r->written_slots - 1, at = written_hash(addr, size) & mask;
     for (; r->written_slot[at]; at = (at + 1) & mask) {
-        const Range *w = &r->written[r->written_slot[at] - 1];
-        if (w->addr == addr && w->size == size) return;
+        Range *w = &r->written[r->written_slot[at] - 1];
+        if (w->addr == addr && w->size == size) {
+            if (w->buf != buf) w->buf = VK_NULL_HANDLE;
+            return;
+        }
     }
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
-    r->written[r->nwritten++] = (Range){addr, size};
+    r->written[r->nwritten++] = (Range){addr, size, buf};
     r->written_slot[at] = (uint32_t)r->nwritten;
     vk_mem_gpu_pending(addr, size);
 }
@@ -691,7 +696,7 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
         vk_mem_gpu_wrote(&span, sizeof record);
         vk_usnap_drop(addr, sizeof record);
         vk_mem_count(span.cls, VK_MUSE_GPU_WRITE, sizeof record);
-        note_written(ex, addr, sizeof record);
+        note_written(ex, addr, sizeof record, span.buffer);
     }
     if (nregions) {
         vkCmdCopyBuffer(ex->cb, source, dst, nregions, regions);
@@ -1754,7 +1759,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        how, guarded, &bi)) {
             if (written && bi.buffer != VK_NULL_HANDLE) {
-                note_written(ex, b->addr - lead, bi.range);
+                note_written(ex, b->addr - lead, bi.range, bi.buffer);
                 const uint8_t *ctl, *code;
                 uint32_t len;
                 uint64_t o;
@@ -4063,7 +4068,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     vk_usnap_drop(u->dst, u->size);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
-    note_written(ex, u->dst, u->size);
+    note_written(ex, u->dst, u->size, sp.buffer);
     upd_note(ex, u);
 }
 
