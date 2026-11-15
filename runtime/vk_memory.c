@@ -87,6 +87,14 @@ static void mirror_retire(void *arg);    // completion thread: destroys a finali
 static void grow(void **arr, int *cap, size_t elem);
 
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;
+// Shared acquires try first and time a contended wait (TOTK_TRACE=perf, perf_lock_wait): a pool imported or mapped on
+// another thread holds the lock exclusively across driver calls, and every draw resolves its buffers under it.
+static void pool_lock_shared(void) {
+    if (plat_mutex_trylock_shared(&pool_lock)) return;
+    uint64_t t0 = kern_now_ns();
+    plat_mutex_lock_shared(&pool_lock);
+    if (rt_trace & RT_TRACE_PERF) perf_lock_wait(PERF_LOCK_POOL, kern_now_ns() - t0);
+}
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
@@ -352,7 +360,7 @@ int vk_pool_init(pool_t *p) {
     // Reinitializing the same object retires its old backing before installing the new mapping. In particular,
     // descriptors at a reused address must not inherit registrations from a previous storage lifetime.
     int reinit = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     for (int i = 0; i < pool_index.n; i++) if (pool_index.e[i].key == p) { reinit = 1; break; }
     plat_mutex_unlock_shared(&pool_lock);
     if (reinit) vk_pool_fini(p);
@@ -524,20 +532,59 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
 
 // Per-thread copies of resolved import and physical pools that overlap no other index entry (so pidx_find picks them for
 // any range inside), valid while pool_gen is unchanged: the replay resolves a few dozen pools thousands of times per
-// frame (16 vertex streams and every buffer binding of each draw). Direct-mapped by the 4 KiB page of the address, so
-// a hit is one compare however many pools a frame touches. TOTK_RESOLVE_CHECK=1 compares every hit with the locked
-// lookup and stops on a difference.
+// frame (16 vertex streams and every buffer binding of each draw). A thread keeps up to RPOOL_N of them sorted by
+// address (rpool, all of one pool_gen, emptied when it moves), and a byte map from the 64 KiB block of an address to
+// the copy that held it last (rmap): a hit is one compare, and a block the map does not answer is found by a binary
+// search of the copies before pool_lock is taken. With a table of 512 copies indexed by the 4 KiB page, as before, 40%
+// of the resolves in Bananza's Lake Level (3.2.0) missed: a pool filled one slot per page it was read at, the vertex
+// data of a frame is spread over more pages than the table held, and each miss took pool_lock shared, an atomic write
+// to one cache line for every thread of a sliced pass. Now 2.4% miss, from 20 KiB per thread (the old table took 36).
+// TOTK_RESOLVE_CHECK=1 compares every hit with the locked lookup and stops on a difference.
 static int rec_class(const PoolRec *r) {
     if (r->kind != POOL_IMPORT) return VK_MCLS_DEVICE;
     return r->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? VK_MCLS_HOST_NOACC
          : r->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? VK_MCLS_HOST_CACHED : VK_MCLS_HOST_UNC;
 }
 
-typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; void *pool; } ResolveHit;
-#define RHIT_SLOTS 512
-static _Thread_local ResolveHit rhit[RHIT_SLOTS];
+typedef struct { uint64_t lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; void *pool; } ResolveHit;
+#define RPOOL_N 255   // rmap holds an index
+#define RMAP_BLOCKS 4096
+static _Thread_local ResolveHit rpool[RPOOL_N];
+static _Thread_local int rpool_n;
+static _Thread_local uint64_t rpool_gen;
+static _Thread_local uint8_t rmap[RMAP_BLOCKS];   // the rpool index that held an address of the block last
 
-static ResolveHit *rhit_slot(uint64_t addr) { return &rhit[(addr >> 12 ^ addr >> 21) & (RHIT_SLOTS - 1)]; }
+static uint8_t *rmap_slot(uint64_t addr) { return &rmap[(addr >> 16 ^ addr >> 28) & (RMAP_BLOCKS - 1)]; }
+
+// The copy holding [addr, end) at pool_gen g, NULL for none.
+static const ResolveHit *rhit_find(uint64_t g, uint64_t addr, uint64_t end) {
+    if (rpool_gen != g) return NULL;
+    uint8_t *m = rmap_slot(addr);
+    const ResolveHit *h = &rpool[*m];
+    if (*m < rpool_n && addr >= h->lo && end <= h->hi) return h;
+    int lo = 0, hi = rpool_n;   // the last copy with lo <= addr
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (rpool[mid].lo <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    if (!lo || !(addr >= rpool[lo - 1].lo && end <= rpool[lo - 1].hi)) return NULL;
+    *m = (uint8_t)(lo - 1);
+    return &rpool[lo - 1];
+}
+
+// A copy for a pool's index entry [lo, hi) at pool_gen g, kept in order: the entry overlaps no other one.
+static ResolveHit *rhit_add(uint64_t g, uint64_t lo, uint64_t hi) {
+    if (rpool_gen != g || rpool_n == RPOOL_N) rpool_gen = g, rpool_n = 0;
+    int k = 0;
+    while (k < rpool_n && rpool[k].lo < lo) k++;
+    if (k == rpool_n || rpool[k].lo != lo) {
+        memmove(&rpool[k + 1], &rpool[k], sizeof *rpool * (size_t)(rpool_n - k));
+        rpool_n++;
+    }
+    rpool[k].lo = lo, rpool[k].hi = hi;
+    return &rpool[k];
+}
 
 static int resolve_check_on(void) {
     static int on = -1;
@@ -556,7 +603,7 @@ int vk_mem_inspect(uint64_t addr, uint64_t size, VkMemInspect *out) {
     if (!addr || !size || addr > UINT64_MAX - size) return 0;
     int ok = 0;
     VkMemInspect result = {0};
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     // Match bind_range's one-byte resolver candidate, then check the whole request against that same backing.
     const pidx_ent *e = pidx_find(&pool_index, addr, 1);
     const PoolRec *r = e ? e->buf : NULL;
@@ -620,7 +667,7 @@ int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
     memset(out, 0, sizeof *out);
     if (!addr || !size || addr > UINT64_MAX - size) return 0;
     int ok = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     const pidx_ent *e = pidx_find(&pool_index, addr, size);
     const PoolRec *r = e ? e->buf : NULL;
     if (r && r->kind == POOL_IMPORT) {
@@ -650,8 +697,8 @@ int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
-    const ResolveHit *h = rhit_slot(addr);
-    if (end >= addr && h->gen == g && addr >= h->lo && end <= h->hi) {
+    const ResolveHit *h = end >= addr ? rhit_find(g, addr, end) : NULL;
+    if (h) {
         out->buffer = h->buf;
         out->offset = addr - h->base;
         out->avail = h->end - addr;
@@ -673,7 +720,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
 static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     memset(out, 0, sizeof *out);
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
     int ok = 0;
@@ -681,9 +728,9 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
-            ResolveHit *h = rhit_slot(addr);
-            h->gen = __atomic_load_n(&pool_gen, __ATOMIC_RELAXED);   // stable: changed only under the exclusive lock
-            h->lo = e->lo, h->hi = e->hi, h->buf = r->buf, h->cls = rec_class(r);
+            // pool_gen is stable here: it changes only under the exclusive lock.
+            ResolveHit *h = rhit_add(__atomic_load_n(&pool_gen, __ATOMIC_RELAXED), e->lo, e->hi);
+            h->buf = r->buf, h->cls = rec_class(r);
             if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL, h->pool = r;
             else h->base = r->lo, h->end = r->lo + r->size, h->alloc = r->alloc, h->pool = NULL;
         }
@@ -797,7 +844,7 @@ void vk_mem_census(uint64_t frame) {
     Group g[64];
     int ng = 0;
     uint64_t total[4] = {0}, count[4] = {0}, used_n = 0, used_bytes = 0, prev_hi = 0, near_n = 0, gap_bytes = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
         if (r->kind == POOL_IMPORT && r->used) {
@@ -1304,7 +1351,7 @@ void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
 
 void vk_gpu_written(uint64_t addr, uint64_t size) {
     if (shadow_on && size) {
-        plat_mutex_lock_shared(&pool_lock);
+        pool_lock_shared();
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
         PoolRec *r = e ? e->buf : NULL;
         plat_mutex_lock(&shadow_lock);
@@ -1339,7 +1386,7 @@ void vk_mem_dirty_submit(void) {
     uint32_t prev = dirty_sub;   // the submit whose replay noted the bindings
     dirty_sub = prev + 1 ? prev + 1 : 1;
     uint64_t eager[DC_N] = {0}, lazy[DC_N] = {0}, ln[DC_N] = {0}, lb[DC_N] = {0}, untracked = 0, queries = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     if (dcap < pool_index.n) {
         dcap = pool_index.n * 2;
         dlist = realloc(dlist, (size_t)dcap * sizeof *dlist);
@@ -1505,7 +1552,10 @@ static PlatMutex mirror_lock = PLAT_MUTEX_INIT;
 static int mem_workers;   // vk_mem_threads: the workers of sliced passes (vk_exec.c) bind mirrors too
 static int mirror_lock_if_shared(void) {
     if (!vk_spec_count() && !__atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE)) return 0;
+    if (plat_mutex_trylock(&mirror_lock)) return 1;
+    uint64_t t0 = kern_now_ns();   // contended: TOTK_TRACE=perf counts the long waits (perf_lock_wait)
     plat_mutex_lock(&mirror_lock);
+    if (rt_trace & RT_TRACE_PERF) perf_lock_wait(PERF_LOCK_MIRROR, kern_now_ns() - t0);
     return 1;
 }
 static void mirror_unlock(int locked) {
@@ -1862,7 +1912,7 @@ static void mirror_create(PoolRec *r) {
     // and gives its part up; it never sees a refusal that turns into a mirror.
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return ms_set(r, MS_REFUSED);
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     int i = pidx_upper(&pool_index, r->lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
     int alone = i >= 0 && (i == 0 || pool_index.maxhi[i - 1] <= pool_index.e[i].lo) &&
@@ -2060,7 +2110,7 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     if (!vk_mirror_on || !size || !p->mem) return;
     plat_inc64(&m_flush_calls);
     plat_add64(&m_flush_bytes, (int64_t)size);
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)p->mem, 0);
     PoolRec *r = e && e->key == p ? e->buf : NULL;
     if (r && ms_get(r) == MS_ON) {
@@ -2104,7 +2154,7 @@ void vk_mem_mirror_begin(void) {
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
     int have = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     plat_mutex_lock(&gen_lock);
     ww_ep++;
     uint64_t b0 = ww_bytes;
@@ -2204,7 +2254,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
     VJob *j = calloc(1, sizeof *j);
     if (!j) rt_fatal("vk: out of memory");
     uint64_t left = VERIFY_BYTES, dst = 0;
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     for (int tries = 0; nm && left && j->n < VERIFY_SAMPLES && tries <= nm; tries++) {
         if (ver_i >= nm) ver_i = 0, ver_off = 0;
         PoolRec *r = mlist[ver_i];
@@ -2443,6 +2493,13 @@ static int ninflight, cap_inflight;
 static Batch *spare;                  // completed batches whose command buffer and fence are reused
 static int nspare, cap_spare;
 static uint64_t next_seq, done_seq;   // batches handed out / completed (all batches up to done_seq)
+// vk_upload_flush(1) waits for a batch's fence with cmd_lock let go, so the replay's own flushes (every split part) do
+// not wait behind another thread's GPU wait: pinned is the batch being waited on, whose fence retire keeps out of the
+// spare list until the waiter is done with it (pinned_done); wait_lock lets one thread wait at a time.
+static uint64_t pinned;               // cmd_lock: seq of the batch a waiter waits on, 0 none
+static int pinned_done;               // cmd_lock: retire met it: the waiter puts it in the spare list
+static Batch pinned_batch;
+static PlatMutex wait_lock = PLAT_MUTEX_INIT;
 static Dead *dead;
 static int ndead, cap_dead;
 static uint64_t tl_protected;         // newest submission being recorded or submitted; guards deferred destruction
@@ -2479,6 +2536,10 @@ static void retire(VkCtx *c, int wait_all) {
         }
         free_staging(c, b);
         done_seq = b->seq;
+        if (b->seq == pinned) {   // a waiter still waits on its fence (vk_upload_flush)
+            pinned_batch = *b, pinned_done = 1;
+            continue;
+        }
         if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
         spare[nspare++] = *b;
     }
@@ -2623,16 +2684,34 @@ uint64_t vk_upload_flush(int wait) {
     }
     if (c && wait) {
         uint64_t w0 = ninflight && done_seq < seq ? kern_now_ns() : 0;
+        // Without cmd_lock when this thread holds it once (a caller holding it around the flush keeps it for the wait).
+        int unlocked = cmd_lock.depth == 1;
+        if (unlocked && ninflight && done_seq < seq) {
+            plat_rmutex_unlock(&cmd_lock);
+            plat_mutex_lock(&wait_lock);
+            plat_rmutex_lock(&cmd_lock);
+        }
         while (ninflight && done_seq < seq) {
+            VkFence f = inflight[0].fence;
+            if (unlocked) pinned = inflight[0].seq, pinned_done = 0, plat_rmutex_unlock(&cmd_lock);
             // A lost device returns at once and its fence never signals: without this check the loop spins forever
             // (a guest thread at 100% of a core and an idle GPU, with no fault reported).
-            VkResult w = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            VkResult w = vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
+            if (unlocked) plat_rmutex_lock(&cmd_lock);
             if (w != VK_SUCCESS && w != VK_TIMEOUT) {
                 vk_device_fault_report(w);
                 rt_fatal("vk: upload wait failed (%d)", (int)w);
             }
             retire(c, 0);
+            if (unlocked) {
+                if (pinned_done) {
+                    if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
+                    spare[nspare++] = pinned_batch;
+                }
+                pinned = 0, pinned_done = 0;
+            }
         }
+        if (unlocked && w0) plat_mutex_unlock(&wait_lock);
         if (w0) plat_add64(&up_wait_ns, (int64_t)(kern_now_ns() - w0));
     }
     if (c) collect_locked(c);
@@ -2694,7 +2773,7 @@ void vk_mem_collect(void) {
 
 void vk_mem_stats(VkMemStats *s) {
     memset(s, 0, sizeof *s);
-    plat_mutex_lock_shared(&pool_lock);
+    pool_lock_shared();
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
         if (r->kind == POOL_IMPORT) s->imported_pools++;

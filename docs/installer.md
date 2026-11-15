@@ -87,12 +87,27 @@ The Bananza steps are:
    shaders. Then `dkb.exe --warm-shaders` builds the driver's pipeline libraries; if that fails or the driver crashes
    (seen in `nvgpucomp64.dll` on NVIDIA 621.01) the installer warns and goes on, records `libraries: false` and does not
    retry, since the libraries only speed up the first draws. A translation failure fails the step.
-7. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
+7. Generate backgrounds and both centered/edge HUD variants for all six ultrawide presets, including 3440x1440.
+   `tools/dkb_wide_layout.py` checks packed resource bounds and expected layout geometry in the owned temporary
+   `build/` folder before copying overlays beside `romfs-index.bin`. Each overlay's manifest is published last.
+   Missing or changed overlays are repaired on resume without relifting or compiling the game; changes to either
+   layout tool also invalidate this step. Python 3.14+ uses `compression.zstd`; older development Python needs
+   `zstandard` from `tools/requirements-installer.txt`. If generation fails (including an unrecognized resource layout),
+   setup warns with the generator log path and continues without publishing new overlays; existing overlays remain
+   unchanged. The next setup run retries generation. Installer path/ownership failures and cancellation still stop setup.
+   The verified game version selects the layout rules: 3.2.0 removes one confirmation
+   dialog background pane and stores its title effects in `static.Product.200`. Overlay preparation preserves the
+   player's resolution and HUD settings.
+8. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
    remove only owned staging/build directories. Logs remain in the temporary folder. Setup does not start the game.
 
 The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `.id`, `exefs/`, packed `romfs/`,
-`romfs-index.bin`, `totk.ini`, `dkb-install.json` and the `shader-cache/` folder of step 6. The inherited `totk.ini` name is
-intentional: the runtime reads it. Saves and further shader caches are created beside the executable when it runs. Source dumps stay untouched.
+`romfs-index.bin`, `dkb.ini`, `dkb-install.json`, the `shader-cache/` folder of step 6, and twelve
+`romfs-patches-<width>x<height>[-hud-edges]/` folders. An existing `totk.ini` is migrated to `dkb.ini`.
+Saves and further shader caches are created beside the executable when it runs. Source dumps stay untouched.
+
+Setup owns those twelve preset overlay folders and overwrites matching hand-made overlays when generation succeeds.
+Keep custom overlays in a separate folder and select it with `DKB_ROMFS_PATCHES` to avoid that overwrite.
 
 Only an empty destination or a Bananza install with matching ownership metadata is accepted. Temporary work has its
 own ownership marker; an unrelated nonempty temporary directory is refused. OS-held locks prevent simultaneous
