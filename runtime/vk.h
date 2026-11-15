@@ -294,7 +294,8 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
 void vk_usnap_quiet(int on);   // the calling thread's finds are not counted while on (slices of a parallel pass)
-// The number of drops made so far, and, on a recording thread, the drops its lookups follow: those up to upto (0 all).
+// The number of drops made so far, and, on a recording thread, the drops its lookups follow: those numbered below upto
+// (vk_usnap_drops() + 1 at a pass's start), 0 all.
 uint64_t vk_usnap_drops(void);
 void vk_usnap_view(uint64_t upto);
 const void *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy's bytes for the CPU; NULL: not copied or dropped
