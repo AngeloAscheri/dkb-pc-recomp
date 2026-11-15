@@ -3179,12 +3179,23 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
         // 0: Bananza. TOTK_FIX_VS_FAULT=all runs the skip on every vendor, to A/B the AMD device loss against it.
         int nv = vk_ctx()->props.vendorID == 0x10de;
         on = !rt_game_version && cfg_bool("TOTK_FIX_VS_FAULT") && (nv || !strcasecmp(cfg_value("TOTK_FIX_VS_FAULT"), "all"));
-        if (on && !nv) rt_log("vk: TOTK_FIX_VS_FAULT=all: the light quad skip (#9) also runs on this non-NVIDIA GPU");
+        if (on && !nv) rt_log("vk: TOTK_FIX_VS_FAULT=all: the light quad skip (#196, #197) also runs on this non-NVIDIA GPU");
     }
     if (!on || !vs || !fs) return 0;
     const uint64_t vs_origin = stage_origin(dc, ex->prog, NVN_STAGE_VS);
-    if (vs_origin == 0xcae0ef8e9fe9147full || vs_origin == 0xba1dd1e7ae8abb33ull) {
-        warn_once(W_FAULT_SKIP2, "the light quads of NVN 2 vertex stages cae0ef8e9fe9147f and ba1dd1e7ae8abb33 are skipped (#9, #196, #197)");
+    if (vs_origin == 0xba1dd1e7ae8abb33ull) {
+        warn_once(W_FAULT_SKIP2, "the light quads of NVN 2 vertex stage ba1dd1e7ae8abb33 are skipped (#196, #197)");
+        return 1;
+    }
+    // The #9 part (cae0ef8e9fe9147f and the c0+0x530 family) is off unless TOTK_FIX_VS_FAULT=9: on current builds the
+    // #9 route (new game, first guide movie, mining tunnel, 600 s) ran twice without a fault here with those quads
+    // drawn (RTX 5060 Ti), and a player's runs drew them past the first guide movie and later layers on Turing, Ada
+    // and Blackwell (#62). Skipping them hid the particles they draw.
+    static int nine = -1;
+    if (nine < 0) nine = !strcasecmp(cfg_value("TOTK_FIX_VS_FAULT"), "9");
+    if (!nine) return 0;
+    if (vs_origin == 0xcae0ef8e9fe9147full) {
+        warn_once(W_FAULT_SKIP2, "the light quads of NVN 2 vertex stage cae0ef8e9fe9147f are skipped (#9)");
         return 1;
     }
     const GfxShaderRes *r;
