@@ -1647,6 +1647,7 @@ uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
 // back, since a write-back is itself a CPU write to storage another hit may share; the hits then go back oldest render
 // first, so where two descriptors share storage the newer render wins.
 static int wb_copies(Tex **hit, int k);
+static int wb_all_queueable(Tex **hit, int k);
 static void wb_land(void);
 
 void vk_texture_write_back(uint64_t addr, uint64_t size) {
@@ -1789,10 +1790,11 @@ void vk_texture_write_back_async(uint64_t addr, uint64_t size) {
             Tex *x = hit[j];
             hit[j] = hit[j - 1], hit[j - 1] = x;
         }
+    int queue = wb_all_queueable(hit, k);   // else every hit goes back now, in order (wb_all_queueable)
     for (int i = 0; i < k; i++) {
-        if (wb_pending(hit[i])) { wb_async_dup++; continue; }
-        if (wb_queue(hit[i])) { wb_async_n++; continue; }
-        write_back(hit[i]);   // not copyable this way (ASTC, packed depth-stencil): as before
+        if (queue && wb_pending(hit[i])) { wb_async_dup++; continue; }
+        if (queue && wb_queue(hit[i])) { wb_async_n++; continue; }
+        write_back(hit[i]);
         perf_count(PERF_CNT_WB);
     }
     if (nwbp > first) {
@@ -1892,6 +1894,22 @@ void vk_texture_wb_poll(void) {
 // GPU-dirty. A texture the copy cannot take (ASTC, packed depth-stencil) is written back here as before. 0: every
 // texture as before, under the lock. 1 when copies were queued: the caller unlocks, then calls wb_land.
 static int wb_unlocked = -1;
+// Whether wb_queue can copy e through the GPU: not an ASTC image, and an aspect the copy can read (a packed
+// depth-stencil one cannot).
+static int wb_queueable(const Tex *e) {
+    VkImageAspectFlags aspect;
+    return !e->f.astc_bw && read_aspect(e, &aspect);
+}
+
+// Hits sorted oldest render first share storage: one written back now and a newer one queued would let the queued
+// copy's poll take the first write for a CPU write, keep those bytes and drop the newer render (vk_texture_wb_poll). So
+// when any hit cannot be queued, all go back in order, as before.
+static int wb_all_queueable(Tex **hit, int k) {
+    for (int i = 0; i < k; i++)
+        if (!wb_queueable(hit[i])) return 0;
+    return 1;
+}
+
 static int wb_copies(Tex **hit, int k) {
     if (wb_unlocked < 0) {
         wb_unlocked = rt_knob("WB_UNLOCKED", "1");
@@ -1899,7 +1917,7 @@ static int wb_copies(Tex **hit, int k) {
                wb_unlocked == 2 ? "without the texture lock in the B blocks" : wb_unlocked ? "without the texture lock" : "under the texture lock",
                wb_unlocked == 2 ? "ab" : wb_unlocked ? "1" : "0");
     }
-    int on = RT_KNOB_ON(wb_unlocked), first = nwbp;
+    int on = RT_KNOB_ON(wb_unlocked) && wb_all_queueable(hit, k), first = nwbp;
     for (int i = 0; i < k; i++) {
         int before = nwbp;
         if (on && wb_queue(hit[i])) {
