@@ -2305,7 +2305,9 @@ static int par_defer_ok(const VkExec *ex) {
 // vk_rec.c, inside the pass end par_defer captures: a call it cannot hold (one without a packet, or a full capture).
 // The pass end is made in place, as without the deferral: the slices are waited for (a held earlier pass's as well,
 // vk_texture_hold_barrier, which lets a texture lock the walk holds go), and then their execution and the calls captured
-// so far go into the part, before the call that spilled.
+// so far go into the part, before the call that spilled. The spill waits for the workers from inside a vk_rec.c call
+// and lets go of the texture lock only, so a call that can spill must not be made under any other lock a worker
+// takes while it records a slice (a pool's mirror lock, vk_memory.c cmd_lock): the workers would never finish.
 static typeof(PDQ[0]) *pd_cur;   // the pass end par_defer is capturing
 static int pd_spilled;
 static void par_spill(void) {

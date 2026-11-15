@@ -234,9 +234,11 @@ static int tex_frozen;   // tex_lock
 static void hold_barrier(void) {   // tex_lock held
     if (!vk_exec_held_pending()) return;
     tex_frozen++;
+    uint64_t t0 = holds_on > 0 ? kern_now_ns() : 0;
     uint32_t depth = plat_rmutex_release(&tex_lock);
     vk_exec_held_wait();
     plat_rmutex_retake(&tex_lock, depth);
+    if (holds_on > 0) hold_t0 += kern_now_ns() - t0;   // TOTK_LOCK_HOLDS: the wait was not a hold
     tex_frozen--;
 }
 

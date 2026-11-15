@@ -283,7 +283,10 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
 // when the caller calls it. vk_sync.c vk_sync_split_finish ends a held part with it, on the thread that recorded it.
 typedef struct { void (*fn)(void *); void *arg; } A_Call;
 int rec_call(void (*fn)(void *), void *arg) {
-    if (!rec_thread || capturing) return 0;
+    if (!rec_thread) return 0;
+    // A captured packet runs when the capture is replayed, after the caller has gone on; vk_sync_split_finish, the
+    // one caller, runs between captures, so a call here while capturing is a bug, not something to make in place.
+    if (capturing) rt_fatal("vk_rec: rec_call inside a capture");
     A_Call *a = put(R_Call, sizeof *a);
     *a = (A_Call){fn, arg};
     unpub = 0;
