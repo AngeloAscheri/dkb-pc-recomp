@@ -1624,11 +1624,13 @@ static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, ui
 // that vk_mem_mirror_end moves into wbl: every slice of a submission is recorded before its end, so the lists are not
 // written then. With eight threads adding to wbl under mirror_lock, a profile had 7% of the slices' time waiting for
 // the lock in vk_mem_gpu_wrote.
-typedef struct WbLocal { MRange *a; int n, cap; struct WbLocal *next; } WbLocal;
+// The kept GPU writes of the submission (vk_mem_gpu_kept), as whole pages, go into a second list of each thread's
+// (k), which vk_mem_mirror_end merges into the pools' kept lists (kept_take).
+typedef struct WbLocal { MRange *a; int n, cap; MRange *k; int nk, ck; struct WbLocal *next; } WbLocal;
 static WbLocal *wb_locals;   // every thread's, added under mirror_lock and kept until exit
 static _Thread_local WbLocal *wb_mine;
 
-static void wb_local_add(PoolRec *r, uint64_t off, uint64_t size) {
+static WbLocal *wb_local(void) {
     if (!wb_mine) {
         WbLocal *w = calloc(1, sizeof *w);
         if (!w) rt_fatal("vk: out of memory");
@@ -1638,7 +1640,12 @@ static void wb_local_add(PoolRec *r, uint64_t off, uint64_t size) {
         plat_mutex_unlock(&mirror_lock);
         wb_mine = w;
     }
-    range_add(&wb_mine->a, &wb_mine->n, &wb_mine->cap, r, off, size);
+    return wb_mine;
+}
+
+static void wb_local_add(PoolRec *r, uint64_t off, uint64_t size) {
+    WbLocal *w = wb_local();
+    range_add(&w->a, &w->n, &w->cap, r, off, size);
 }
 
 static void wb_locals_take(void) {   // replay thread, no slice being recorded
@@ -2016,25 +2023,35 @@ static void mirror_retire(void *arg) {
     destroy_rec(vk_ctx(), arg);
 }
 
-// The CPU rewrote the page at offset off of the pool: it is no longer a kept GPU write (mirror_lock held).
-static void kept_cut(PoolRec *r, uint64_t off) {
-    const uint64_t page = 1ull << GEN_PAGE_SHIFT, end = off + page;
-    for (int a = 0, b = r->nkept; a < b;) {
-        int k = (a + b) / 2;
-        if (r->kept[k].hi <= off) { a = k + 1; continue; }
-        if (r->kept[k].lo >= end) { b = k; continue; }
-        struct KeptRange t = r->kept[k];
-        if (t.lo < off && end < t.hi) {   // split in two
-            if (r->nkept == r->ckept) grow((void **)&r->kept, &r->ckept, sizeof *r->kept);
-            memmove(r->kept + k + 2, r->kept + k + 1, (size_t)(r->nkept - k - 1) * sizeof *r->kept);
-            r->nkept++;
-            r->kept[k] = (struct KeptRange){t.lo, off};
-            r->kept[k + 1] = (struct KeptRange){end, t.hi};
-        } else if (t.lo < off) r->kept[k].hi = off;
-        else if (end < t.hi) r->kept[k].lo = end;
-        else memmove(r->kept + k, r->kept + k + 1, (size_t)(--r->nkept - k) * sizeof *r->kept);
-        return;   // the ranges are disjoint and the page is one page
+// The CPU rewrote the pages of the n runs at run (offsets from import_lo, ascending and disjoint, as mirror_sync queues
+// them): they are no longer kept GPU writes (mirror_lock held). One merge of the two sorted lists into a scratch array
+// that then becomes the pool's list. Cutting page by page, each cut a binary search and, when it split or emptied a
+// range, a memmove of the list's tail, held mirror_lock through a sync of the 450 MiB arena in the Hilltop Layer of
+// Surf Hills (3.2.0), where the CPU rewrites the terrain records' pages every frame: the slice workers waited 3.9 ms a
+// frame for the lock (up to 1.9 ms at a time) and the replay took 2.4 ms longer.
+static void kept_cut(PoolRec *r, const MRange *run, int n) {
+    static struct KeptRange *out;   // mirror_lock (or the replay thread alone): the next list, swapped with r->kept
+    static int cout;
+    while (cout < r->nkept + n) grow((void **)&out, &cout, sizeof *out);   // a run splits at most one range
+    struct KeptRange *in = r->kept;
+    int i = 0, o = 0;
+    for (int j = 0; j < n && i < r->nkept; j++) {
+        uint64_t a = run[j].off, b = a + run[j].size;
+        while (i < r->nkept && in[i].hi <= a) out[o++] = in[i++];
+        while (i < r->nkept && in[i].lo < b) {
+            if (in[i].lo < a) out[o++] = (struct KeptRange){in[i].lo, a};
+            if (in[i].hi > b) {   // what is left above the run may meet the next one
+                in[i].lo = b;
+                break;
+            }
+            i++;
+        }
     }
+    while (i < r->nkept) out[o++] = in[i++];
+    r->kept = out, out = in;
+    int c = r->ckept;
+    r->ckept = cout, cout = c;
+    r->nkept = o;
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
@@ -2057,6 +2074,7 @@ static void mirror_sync(PoolRec *r) {
         mrep.sync_queries += snap_regions(r0, r1, mepoch);
     }
     uint32_t since = r->mgen;
+    int p0 = npend > 0 && pend[npend - 1].r == r ? npend - 1 : npend;   // range_add may extend the last entry
     for (uint64_t k = r0; k <= r1; k++) {
         if (reg_max[k] <= since) continue;
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
@@ -2065,11 +2083,11 @@ static void mirror_sync(PoolRec *r) {
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
-            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since) {
+            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
                 range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
-                if (r->nkept) kept_cut(r, x - lo);   // the CPU rewrote it: the mirror gets its bytes, no longer GPU-only
-            }
     }
+    // The pages the CPU rewrote get the guest's bytes in the mirror: they are no longer GPU-only.
+    if (r->nkept && npend > p0) kept_cut(r, pend + p0, npend - p0);
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
     else plat_mutex_unlock_shared(&gen_lock);
@@ -2168,6 +2186,11 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
 // (mirror_sync) work on whole 4 KiB pages, so the bytes of the range that share a page with other data go back to guest
 // memory as usual, and a CPU write or flush there copies the page, GPU bytes included, back into the mirror. The pages
 // wholly inside the range are noted in the pool's kept list, which mirror_sync leaves out of its flush ranges.
+// The thread notes them in a list of its own, without mirror_lock, and vk_mem_mirror_end merges every thread's into
+// the pools' lists (kept_take). Nothing reads a pool's list for this submission's writes before that: the first bind of
+// a pool in a submission syncs it (vk_mem_use), so its sync and flush ranges come before any write the GPU keeps there,
+// and the uniform snapshot asks at the start of the next submission (vk_mem_kept_overlaps). An insertion under
+// mirror_lock per range, a memmove of the list's tail each, made the slice workers wait for the lock.
 // Returns whether it kept any page; 0 means every byte went the vk_mem_gpu_wrote way (no mirror, or no whole page), so
 // guest memory will hold the GPU's bytes and the caller treats the write as an ordinary one.
 int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
@@ -2184,32 +2207,51 @@ int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
     if (k->r == r && k->sub == sub && k->off == sp->offset && k->size >= size) return 1;
     if (a < pa) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = sp->offset}, pa - a);
     if (pb < b) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = pb - r->import_lo}, b - pb);
-    uint64_t lo = pa - r->import_lo, hi = pb - r->import_lo;
-    int locked = mirror_lock_if_shared();
-    int n = r->nkept, i = 0;
-    while (i < n) {   // first range ending at or above lo
-        int m = (i + n) / 2;
-        if (r->kept[m].hi < lo) i = m + 1;
-        else n = m;
-    }
-    int j = i;
-    while (j < r->nkept && r->kept[j].lo <= hi) {   // overlapping or touching: merge
-        if (r->kept[j].lo < lo) lo = r->kept[j].lo;
-        if (r->kept[j].hi > hi) hi = r->kept[j].hi;
-        j++;
-    }
-    if (j == i) {
-        if (r->nkept == r->ckept) grow((void **)&r->kept, &r->ckept, sizeof *r->kept);
-        memmove(r->kept + i + 1, r->kept + i, (size_t)(r->nkept - i) * sizeof *r->kept);
-        r->nkept++;
-    } else if (j > i + 1) {
-        memmove(r->kept + i + 1, r->kept + j, (size_t)(r->nkept - j) * sizeof *r->kept);
-        r->nkept -= j - i - 1;
-    }
-    r->kept[i] = (struct KeptRange){lo, hi};
-    mirror_unlock(locked);
+    WbLocal *w = wb_local();
+    range_add(&w->k, &w->nk, &w->ck, r, pa - r->import_lo, pb - pa);
     *k = (__typeof__(*k)){r, sp->offset, size, sub};
     return 1;
+}
+
+// One pool's kept ranges of the submission (sorted by offset) merged into its list, overlapping or touching ranges
+// joined (mirror_lock held).
+static void kept_merge(PoolRec *r, const MRange *add, int n) {
+    static struct KeptRange *out;   // the next list, swapped with r->kept
+    static int cout;
+    while (cout < r->nkept + n) grow((void **)&out, &cout, sizeof *out);
+    int i = 0, j = 0, o = 0;
+    while (i < r->nkept || j < n) {
+        struct KeptRange x;
+        if (j >= n || (i < r->nkept && r->kept[i].lo <= add[j].off)) x = r->kept[i++];
+        else x = (struct KeptRange){add[j].off, add[j].off + add[j].size}, j++;
+        if (o && x.lo <= out[o - 1].hi) {
+            if (x.hi > out[o - 1].hi) out[o - 1].hi = x.hi;
+        } else out[o++] = x;
+    }
+    struct KeptRange *old = r->kept;
+    int c = r->ckept;
+    r->kept = out, r->ckept = cout, r->nkept = o;
+    out = old, cout = c;
+}
+
+// vk_mem_mirror_end, no slice being recorded: every thread's kept ranges of the submission into the pools' lists.
+static void kept_take(void) {
+    static MRange *all, *sbuf;
+    static int call;
+    static size_t scap;
+    int n = 0;
+    plat_mutex_lock(&mirror_lock);
+    for (WbLocal *w = wb_locals; w; w = w->next) {
+        while (call < n + w->nk) grow((void **)&all, &call, sizeof *all);
+        if (w->nk) memcpy(all + n, w->k, sizeof *all * (size_t)w->nk);
+        n += w->nk, w->nk = 0;
+    }
+    sort_ranges(all, (size_t)n, &sbuf, &scap);
+    for (int i = 0, j; i < n; i = j) {
+        for (j = i + 1; j < n && all[j].r == all[i].r; j++) {}
+        kept_merge(all[i].r, all + i, j - i);
+    }
+    plat_mutex_unlock(&mirror_lock);
 }
 
 // Whether a kept GPU write (vk_mem_gpu_kept) lies in [addr, addr+size): guest memory there is stale, so
@@ -2429,7 +2471,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
-    if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take();
+    if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take(), kept_take();
     if (nwbl) {
         VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_COPY_BIT;
         VkAccessFlags2 reads = VK_ACCESS_2_TRANSFER_READ_BIT, writes = VK_ACCESS_2_TRANSFER_WRITE_BIT;
