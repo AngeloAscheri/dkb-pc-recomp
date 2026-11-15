@@ -2204,10 +2204,10 @@ static void par_flush(VkExec *ex) {
         }
         if (par_mode > 0)
             rt_log("perf: sliced passes on the submitting thread: collecting %.1f ms, own slices %.1f ms, waiting for workers "
-                   "%.1f ms (longest %.0f us, %llu over 200 us), executing %.1f ms; %llu pass ends held back, settled in %.1f ms, %llu waits for held slices in %.1f ms, %llu spilled; draws of unsliced passes: under "
-                   "64 %llu, 64-255 %llu, 256-1023 %llu, 1024 and more %llu", par_t_collect / 1e6, par_t_own / 1e6,
-                   par_t_wait / 1e6, par_wait_max / 1e3, (unsigned long long)par_wait_long, par_t_exec / 1e6,
-                   (unsigned long long)par_deferred, par_t_settle / 1e6,
+                   "%.1f ms (longest %.0f us, %llu over 200 us), executing %.1f ms; %llu pass ends held back, settled in %.1f ms, "
+                   "%llu waits for held slices in %.1f ms, %llu spilled; draws of unsliced passes: under 64 %llu, 64-255 %llu, 256-1023 %llu, "
+                   "1024 and more %llu", par_t_collect / 1e6, par_t_own / 1e6, par_t_wait / 1e6, par_wait_max / 1e3,
+                   (unsigned long long)par_wait_long, par_t_exec / 1e6, (unsigned long long)par_deferred, par_t_settle / 1e6,
                    (unsigned long long)par_barriers, par_t_barrier / 1e6, (unsigned long long)par_spills,
                    (unsigned long long)par_unsliced[0], (unsigned long long)par_unsliced[1],
                    (unsigned long long)par_unsliced[2], (unsigned long long)par_unsliced[3]);
@@ -2309,9 +2309,9 @@ static int par_defer_ok(const VkExec *ex) {
 // vk_rec.c, inside the pass end par_defer captures: a call it cannot hold (one without a packet, or a full capture).
 // The pass end is made in place, as without the deferral: the slices are waited for (a held earlier pass's as well,
 // vk_texture_hold_barrier, which lets a texture lock the walk holds go), and then their execution and the calls captured
-// so far go into the part, before the call that spilled.
-// It waits from inside a rec_* call with only the texture lock let go (vk_texture_hold_barrier), so a spill must never
-// happen under a lock a worker takes: the mirror lock, cmd_lock.
+// so far go into the part, before the call that spilled. The spill waits for the workers from inside a vk_rec.c call
+// and lets go of the texture lock only, so a call that can spill must not be made under any other lock a worker
+// takes while it records a slice (a pool's mirror lock, vk_memory.c cmd_lock): the workers would never finish.
 static typeof(PDQ[0]) *pd_cur;   // the pass end par_defer is capturing
 static int pd_spilled;
 static void par_spill(void) {
