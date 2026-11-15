@@ -170,6 +170,62 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
 // copies per page), and the recording threads waited on it.
 typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefix;   // deferred: 0 unknown, 1 none, 2 some
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
+
+// The blocks of copies of 64 KiB and more (the prefix included) come in power-of-two sizes and go back to a cache when
+// released, up to BLK_CACHE bytes, instead of to the heap. The CRT hands blocks of about 512 KiB and more to
+// VirtualAlloc and VirtualFree, so every copy wrote into new pages and took a demand-zero fault on each: in the Hilltop
+// Layer of Surf Hills (3.2.0), where the game records about 28,500 draws a frame, the copies came to 185 KiB on
+// average and the game took 470,000 page faults a second.
+#define BLK_MIN_SHIFT 16
+#define BLK_CLASSES 12               // 64 KiB to 128 MiB; larger copies use the heap
+#define BLK_CACHE (256ull << 20)     // bytes kept in the cache at most
+static PlatMutex blk_lock = PLAT_MUTEX_INIT;
+static void **blk_free[BLK_CLASSES];
+static uint32_t blk_n[BLK_CLASSES], blk_cap[BLK_CLASSES];
+static uint64_t blk_cached;
+
+static int blk_class(size_t total) {   // -1: from the heap
+    if (total < (1u << BLK_MIN_SHIFT)) return -1;
+    int c = 0;
+    while (((size_t)1 << (BLK_MIN_SHIFT + c)) < total) c++;
+    return c < BLK_CLASSES ? c : -1;
+}
+
+static copy_prefix *copy_block(size_t total) {
+    int c = blk_class(total);
+    void *p = NULL;
+    if (c >= 0) {
+        plat_mutex_lock(&blk_lock);
+        if (blk_n[c]) p = blk_free[c][--blk_n[c]], blk_cached -= (size_t)1 << (BLK_MIN_SHIFT + c);
+        plat_mutex_unlock(&blk_lock);
+        if (!p) p = malloc((size_t)1 << (BLK_MIN_SHIFT + c));
+    } else {
+        p = malloc(total);
+    }
+    if (!p) rt_fatal("nvn: command copy allocation (%zu bytes)", total);
+    return p;
+}
+
+static void copy_block_free(copy_prefix *pf) {
+    size_t size = (size_t)1 << BLK_MIN_SHIFT;
+    int c = blk_class(sizeof *pf + pf->bytes);
+    if (c >= 0) {
+        size <<= c;
+        plat_mutex_lock(&blk_lock);
+        if (blk_cached + size <= BLK_CACHE) {
+            if (blk_n[c] == blk_cap[c]) {
+                uint32_t cap = blk_cap[c] ? blk_cap[c] * 2 : 16;
+                void **v = realloc(blk_free[c], sizeof *v * cap);
+                if (!v) rt_fatal("nvn: out of memory (command copy cache)");
+                blk_free[c] = v, blk_cap[c] = cap;
+            }
+            blk_free[c][blk_n[c]++] = pf, blk_cached += size;
+            pf = NULL;
+        }
+        plat_mutex_unlock(&blk_lock);
+    }
+    free(pf);
+}
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
@@ -193,7 +249,7 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
 static void zombie_sweep(uint64_t replayed) {   // copy_lock held
     for (uint32_t i = 0; i < nzombies;) {
         if (zombies[i]->used_at <= replayed) {
-            free(zombies[i]);
+            copy_block_free(zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
             i++;
@@ -233,11 +289,11 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
 }
 
 // The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
-// into one host block of its exact size. One allocation and one copy: growing the copy record by record cost the
-// game's main thread about 1 ms a frame in reallocations and small copies (1.4.3, field).
+// into one host block (copy_block: its exact size, or a cached block of the next power of two from 64 KiB). One
+// allocation and one copy: growing the copy record by record cost the game's main thread about 1 ms a frame in
+// reallocations and small copies (1.4.3, field).
 static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
-    uint8_t *out = malloc(sizeof(copy_prefix) + n);
-    if (!out) rt_fatal("nvn: command copy allocation");
+    uint8_t *out = (uint8_t *)copy_block(sizeof(copy_prefix) + n);
     memcpy(out + sizeof(copy_prefix), p, n);
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
@@ -301,7 +357,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_bytes -= pf->bytes;
             pf->magic = 0;
             if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
-            else free(pf);
+            else copy_block_free(pf);
             b->v[i] = b->v[--b->n];
         }
         if (!b->n) {
@@ -1066,8 +1122,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         out[i] = handle;
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
             size_t sz = sizeof *pf + pf->bytes;
-            copy_prefix *cl = malloc(sz);
-            if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
+            copy_prefix *cl = copy_block(sz);
             memcpy(cl, pf, sz);
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
