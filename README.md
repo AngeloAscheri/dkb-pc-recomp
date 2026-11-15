@@ -28,16 +28,18 @@ the Glacier layer, Snow World (Layer 500) and the Tempest layer. The current rel
 [latest release](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/latest) carries an installer that
 builds the game from your own dump: [docs/installer.md](docs/installer.md). What still fails:
 
-- Device lost on NVIDIA in the Glacier rock ride ([#196](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/196))
-  and in Layer 500 ([#197](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/197)): one bug, with the same draw in
-  flight in both, reported on RTX 5070 Ti, 5080 and 5090. Fast-linked pipelines and the pipeline cache are ruled out;
-  recorded crashing runs replay here on an RTX 5060 Ti without the fault.
+- Device lost on NVIDIA in the Snow World descent ([#196](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/196),
+  [#197](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/197), [#264](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/264)),
+  on RTX 5070, 5070 Ti, 5080 and 5090. It reproduces here on an RTX 5060 Ti. One light quad of the #9 family sets it
+  off, and on `bananza` de4f966 skips that quad: 0 faults in 7 runs that reached the spot. Retest asked. As in #9, the
+  cause on the driver side is still open.
 - Device lost on AMD cards with AMD's Windows driver. On 0.3.0, `vk_recorder = 0` in `dkb.ini` stopped it for three
   players (#84, #155, #142), then #124 and #123, and it is the default on `bananza` since d161f88. Other AMD reports
-  wait for a retest (#176, #193, #206). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204); 25d1089 fences
+  wait for a retest (#176, #193, #206, #267). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204); 25d1089 fences
   the command buffer the recorder writes, a retest is asked.
 - Guest crashes (#148, #136, #218, #229). One loader fault at `main+0x82fee0` hits three machines at the title screen
-  or on loads (#157, #173, #206) and is not reproduced here yet.
+  or on loads (#157, #173, #206) and is not reproduced here yet. #218 sent a save and an input recording that reach
+  `main+0x429480` on a layer change.
 - Intel Arc A770: a driver fault about 20 s in (#3).
 - Missing effects in the Tempest layer (falling golden hail, tornadoes: #221, #183).
 - Heavy scenes below 60 fps (#141, #156, #194, #207). On `bananza` (70c1b4a) new defaults raise our heavy test scene
