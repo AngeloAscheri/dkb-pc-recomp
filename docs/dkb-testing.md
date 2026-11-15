@@ -239,6 +239,16 @@ the committed `recomp/patches-dkb458752.txt` (it prints every loose, sibling and
 review), and run `python tools/port_patches.py --self-check` (the 1.0.0 table mapped onto itself must have no
 deltas).
 
+## Mods
+
+Loose replacement files go in a `mods` folder next to `dkb.exe`; no manifest is needed. A file's path below `mods`
+is its RomFS path (`mods/Sound/Resource/Foo.bwav` replaces `Sound/Resource/Foo.bwav`), so the folders mirror the RomFS
+root. A path the RomFS has is replaced, one it lacks is added. Compressed files (`.zs` and the like) must keep the
+game's own format. The files are not checked against anything: a mod that breaks the game is the mod's problem. The
+log shows `RomFS mods: N files from ... (R replace, A add)`. `TOTK_ROMFS_MODS` (`romfs_mods` in `totk.ini`) names
+another folder, and `TOTK_ROMFS_MODS=0` turns mods off. A folder with a `manifest.tsv` is still read as a checked
+overlay.
+
 ## What to report
 
 Open an issue with the issue form, or comment on [#3](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/3)

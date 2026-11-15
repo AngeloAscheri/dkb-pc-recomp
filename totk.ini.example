@@ -274,7 +274,8 @@
 # bind_Y = pad:north, key:mouse_l
 
 [files]
-# Folder with RomFS mod files that replace or add game files. Default: none.
+# Folder with RomFS mod files that replace or add game files (docs/dkb-testing.md, "Mods"). Default: the mods folder next
+# to dkb.exe; 0 turns mods off.
 # romfs_mods =
 
 [diagnostics]
