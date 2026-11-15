@@ -334,9 +334,12 @@ class Emitter:
             # The guard's edge leaves before the instruction runs, but the flow keeps it as an edge of that instruction
             # (state after it): safe only when the instruction changes no flags, makes no call and does not escape.
             g = insns[(a - entry) // 4]
-            if a in self.patched or g.kind != 'op' or flags.effect(g.code or '')[1] or regs.ESCAPE.search(g.code or ''):
+            # A bl is allowed: the check runs before the call, so the branch skips it with x30 untouched and the
+            # registers still in their locals (the call spills them only after the check passes).
+            if a in self.patched or g.kind not in ('op', 'bl') or (g.kind == 'op' and (
+                    flags.effect(g.code or '')[1] or regs.ESCAPE.search(g.code or ''))):
                 raise patches.PatchError(f'{a:#x}: a guard needs an unpatched op that writes no flags and does not '
-                                         f'escape, not a {g.kind}: {g.code}')
+                                         f'escape, or a bl, not a {g.kind}: {g.code}')
             labels.add(t)
         # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
         # flags would not survive; such functions keep NZCV in c->nzcv.
