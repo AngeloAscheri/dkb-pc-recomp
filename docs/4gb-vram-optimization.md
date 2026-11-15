@@ -1,100 +1,94 @@
-# 4GB VRAM & Laptop Optimization Guide
+# 4 GB VRAM and laptop guide
 
-Tuning and telemetry for running Donkey Kong Bananza PC Recomp on budget discrete GPUs and gaming laptops with 4GB of VRAM (e.g., NVIDIA GeForce RTX 3050 Ti Laptop, GTX 1650/1050 Ti, 4GB desktop GPUs) paired with 6 to 8-core CPUs.
+Settings for running Donkey Kong Bananza on GPUs with 4 GB of VRAM and gaming laptops (for example an RTX 3050 Ti
+Laptop, GTX 1650 or GTX 1050 Ti) with 6 to 8-core CPUs. The settings go in `dkb.ini` next to `dkb.exe`;
+`totk.ini.example` describes every key and its default.
 
----
+## The 4 GB VRAM limit
 
-## The 4GB VRAM Bottleneck
+On a 4 GB card, Windows (the desktop compositor) and background programs often take 400 to 800 MB of VRAM, which leaves
+the game about 3.2 to 3.5 GB.
 
-On systems with 4GB of VRAM, Windows Desktop Window Manager (DWM) and background applications typically consume 400–800 MB of VRAM, leaving only ~3.2 to 3.5 GB of usable video memory for the game.
+One run on an Intel Core i7-11800H with an RTX 3050 Ti Laptop GPU (reported by the author of this guide; build and
+driver not recorded):
 
-During initial telemetry on an 11th Gen Intel Core i7-11800H and RTX 3050 Ti Laptop GPU:
-* **Initial VRAM usage:** ~2.2 GB (stable 59.7 FPS).
-* **VRAM creep over 10–12 minutes:** Without texture eviction, resident textures accumulated past **3.48 GB**, hitting the engine's internal budget ceiling (`2929 of 3041 MiB in use`).
-* **Symptom:** Emergency GPU pool releases caused severe 1.6-second freezes (`replay: 1648.2 ms`), progressively degrading gameplay framerate from 60 FPS down to 27 FPS.
+- VRAM in use at the start was about 2.2 GB, at a steady 59.7 fps.
+- Over 10 to 12 minutes the resident textures grew past 3.48 GB, up to the budget the log reports
+  (`2929 of 3041 MiB in use`).
+- From then on, pools were released under pressure, with freezes of about 1.6 s (`replay: 1648.2 ms` in the perf
+  trace), and the frame rate fell from 60 to 27 fps.
 
----
+If you see the same, please open an issue with your `dkb.log` and say which build you ran (`dkb.exe --version`).
 
-## Recommended `totk.ini` Configuration for 4GB VRAM
-
-Add or uncomment the following settings in your configuration file (`totk.ini` / `dkb.ini`):
+## Suggested settings
 
 ```ini
-[frame rate]
 fps_limit = 60
-realtime = 1
-cloth_realtime = 1
-highfps_fix = 1
 
-[performance]
-# Virtual core preemption: forces guest threads to yield when waiting, preventing thread starvation
-async_preempt = 1
+# Release cached textures earlier (the default is 90, in percent of VRAM)
+tex_vram_pressure = 75
 
-# Replay threading & smaller submission batches (eliminates 35-86ms replay queue freezes)
-replay_async = 1
+# Record big render passes on several threads (Automatic is 4 from 8 logical processors, not on AMD)
 replay_threads = 6
+
+# Submit the GPU work in smaller parts, so the GPU starts sooner (defaults: 64 draws, 1000 us)
 split_draws = 16
 split_us = 100
-timer_1ms = 1
 
-# Pipeline compilation hitch prevention
-pipe_skip = fullscreen
-lib_prebuild = 1
-lib_prebuild_threads = 6
-pipe_prebuild = 1
-prewarm_xlate = 8
-
-# Memory management & texture eviction for 4GB VRAM
-astc = gpu
-memory = auto
-tex_alias = 1
-tex_vram_pressure = 75
-vk_subgroup_pin = 1
-
-[display]
-# Tear-free low-latency presentation on high-refresh (144Hz+) panels
+# Presentation
 vk_present = mailbox
 window_mode = borderless
-fullscreen = 0
 assume_focus = 1
 perf_overlay = fps
-gpu_index = 0
 
-# Native docked raster upscaled with FSR
+# Output and upscaling
 output_res = 1920x1080
 upscaler = fsr
 sharpness = 40
-frame_gen = off
-
-[diagnostics]
-nx2_read_nowait = 1
 ```
 
----
+Everything else can stay at its default. In particular:
 
-## Key Tuning Insights
+- `realtime` and `cloth_realtime` are still experimental on Bananza. Try them only on their own, and turn them off if
+  something behaves oddly.
+- `nx2_read_nowait` is opt-in on purpose: its background write-back can overwrite CPU writes made after the invalidate
+  returns. Leave it off.
+- `async_preempt` is already on by default, and `pipe_skip` is already `fullscreen`.
 
-### 1. Stale Texture Eviction (`tex_vram_pressure = 75`)
-* **What it does:** Instructs the Vulkan texture allocator to release out-of-view, cached textures whenever VRAM utilization crosses 75% of total capacity.
-* **Impact:** Caps total VRAM utilization around 2.3–2.6 GB, preventing GPU memory thrashing over the PCIe bus and eliminating long-session framerate degradation.
+## What the settings do
 
-### 2. Draw Batch Slicing (`split_draws = 16`, `split_us = 100`)
-* **What it does:** Cuts NVN draw submission slices down from the default (64 draws / 300 µs) to 16 draws / 100 µs.
-* **Impact:** Large geometry passes (2,000+ draws) are smoothly distributed across CPU replay worker threads instead of stalling on single-threaded fallback execution (`TOTK_REPLAY_PAR=0`).
+### Texture release (`tex_vram_pressure = 75`)
 
-### 3. Presentation on 144Hz Displays (`vk_present = mailbox`)
-* **What it does:** Uses Vulkan mailbox presentation (triple-buffered fast sync) instead of standard FIFO VSync.
-* **Impact:** On 144Hz laptop screens, standard FIFO VSync causes micro-stutter when targeting 60 FPS due to non-integer refresh intervals (144 / 60 = 2.4). Mailbox delivers tear-free, perfectly paced 60 FPS frames.
+When VRAM use passes this share of the card's memory, the texture cache releases cached textures that were not used
+recently. The default is 90. A lower value keeps more VRAM free, so it may stop the freezes above, at the cost of
+uploading some textures again later. This has not been measured on 4 GB cards yet.
 
-### 4. Avoiding the Handheld 480p Downscale Bug
-* **Finding:** Setting `output_res = 1280x720` forces Bananza into handheld rendering mode, which aggressively drops the internal 3D raster to **854x480 (standard definition)**. Applying AMD FSR with high sharpness to a 480p image results in extreme ringing, crushed contrast, and washed-out colors.
-* **Fix:** Keep `output_res = 1920x1080`. The engine will render at its native 1600x900 docked size and scale cleanly to 1080p via FSR.
+### Smaller GPU submissions (`split_draws`, `split_us`)
 
-### 5. External Frame Generation Compatibility
-* Setting `assume_focus = 1` and `window_mode = borderless` ensures external capture tools (such as Lossless Scaling or MFG Super Motion) can hook the borderless swapchain and double the stable 60 FPS base to **120 FPS** on 144Hz panels with zero focus-loss stutter.
+The replay hands its Vulkan command buffer to the GPU in parts: a new part starts after this many draws between
+passes, once the current part is at least this long. Smaller parts let the GPU start earlier, and they cost a little
+more CPU. This does not spread draws across threads; recording big passes on several threads is `replay_threads`.
 
----
+### Mailbox presentation (`vk_present = mailbox`)
 
-## Hardware Caveats on Laptops
-* **AC Power Required:** Running on battery power engages NVIDIA Battery Boost and hardware power caps (typically halving TGP from 75W to 35W and capping CPU power to 15W–25W), making locked 60 FPS impossible regardless of configuration.
-* **Thermal Pacing:** Ensure the laptop is elevated or cooling profiles are set to *Performance* or *Turbo* to avoid the 86°C GPU thermal throttling threshold.
+Mailbox presents without tearing and without waiting for the next refresh. On a 144 Hz laptop screen, FIFO vsync at
+60 fps can stutter, because 144 / 60 = 2.4 refreshes per frame. Mailbox avoids that.
+
+### Output resolution and the 3D picture
+
+The game draws its 3D scene at 2/3 of the output size (1280x720 at a 1920x1080 output), and the upscaler brings it
+to the output. A lower output lowers the 3D scene too: `output_res = 1280x720` draws it at about 854x480, and FSR with
+a high `sharpness` on so small an image rings and washes out. For a 4 GB card, `output_res = 1920x1080` with
+`upscaler = fsr` is the better trade. `scene_res = full` draws the 3D scene at the full output size, which costs more
+VRAM: leave it at `auto` on 4 GB cards.
+
+### External frame generation
+
+With `assume_focus = 1` and `window_mode = borderless`, external frame-generation tools (such as Lossless Scaling) can
+capture the window without the game pausing when it loses focus.
+
+## Laptop notes
+
+- **Plug the laptop in.** On battery, NVIDIA Battery Boost and the power limits (often about half the GPU's power and
+  15 to 25 W for the CPU) make a steady 60 fps out of reach, whatever the settings.
+- **Cooling.** Use a performance or turbo cooling profile, and keep the vents clear, so the GPU does not throttle.
