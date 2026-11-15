@@ -289,7 +289,7 @@ static int first_above(uint64_t a) {
 }
 
 static _Thread_local int find_quiet;
-static _Thread_local uint64_t find_upto;   // vk_usnap_view: only drops up to this number count; 0 every drop
+static _Thread_local uint64_t find_upto;   // vk_usnap_view: only drops numbered below it count; 0 every drop
 
 void vk_usnap_quiet(int on) { find_quiet = on; }
 
@@ -306,7 +306,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
     uint64_t d = __atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE);
-    if ((d && (!find_upto || d <= find_upto)) || addr < r->lo || addr + n > r->hi) return 0;
+    if ((d && (!find_upto || d < find_upto)) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};

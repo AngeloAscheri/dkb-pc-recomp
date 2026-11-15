@@ -64,6 +64,7 @@ static int par_settle_ready(VkExec *ex);   // the held pass ends whose slices ar
 static uint64_t par_t_collect, par_t_own, par_t_wait, par_t_exec;   // ns on the submitting thread (TOTK_TRACE=perf)
 // Pass ends held back (par_defer): the held passes oldest first, as slice ranges with their captured pass end.
 #define PAR_DEFER_DEPTH 4
+#define PAR_CAP_ROOM 4096   // capture words a pass end may take (vk_rec.c CAP_WORDS): the end, its query, BC copies
 static int par_defer_mode = -1;
 static struct { int s0, s1; uint64_t sig; uint32_t cap_lo, cap_hi; } PDQ[PAR_DEFER_DEPTH];
 static int pd_head, pd_n;
@@ -75,6 +76,7 @@ static volatile uint8_t pdone[1024];   // PAR_MAX_SLICES: each slice of the batc
 static uint16_t pss0[1024];
 static int pw_prefix;
 static uint64_t par_deferred, par_t_settle, par_pass_seq;
+static uint64_t par_spills;   // pass ends par_spill made in place
 static uint64_t par_barriers, par_t_barrier;   // the walk's waits for held slices (vk_exec_held_wait) and their ns
 static int par_no_defer;   // the submission's last collection: nothing is left to overlap
 static int par_unmerged;   // slices recorded whose contexts' frame counters wait for an idle moment
@@ -2050,7 +2052,7 @@ static void par_record(int i, ParPool *pp, VkExec *w, struct DrawCtx *dc) {
     w->views = NULL, w->nviews = 0, w->cap_views = 0;   // the slice's own; merged into the primary's after
     vk_exec_draw_rebase(w);   // the context's memos and bindings were made from another slice's copy of the state
     vk_exec_draw_slice_view(dc, PC.supd[i]);
-    vk_usnap_view(par_usd[PC.supd[i]] ? par_usd[PC.supd[i]] : UINT64_MAX);
+    vk_usnap_view(par_usd[PC.supd[i]] + 1);   // the drops made before the pass began
     par_slice = 1, par_hazard = 0;
     vk_mem_count_quiet(1), vk_usnap_quiet(1);
     for (int k = PC.start[i], end = PC.end[i]; k < end; k++) par_op(w, PC.ops[k]->op, nvn_op_payload(PC.ops[k]));
@@ -2188,10 +2190,10 @@ static void par_flush(VkExec *ex) {
         }
         if (par_mode > 0)
             rt_log("perf: sliced passes on the submitting thread: collecting %.1f ms, own slices %.1f ms, waiting for workers "
-                   "%.1f ms, executing %.1f ms; %llu pass ends held back, settled in %.1f ms, %llu waits for held slices in %.1f ms; draws of unsliced passes: under "
+                   "%.1f ms, executing %.1f ms; %llu pass ends held back, settled in %.1f ms, %llu waits for held slices in %.1f ms, %llu spilled; draws of unsliced passes: under "
                    "64 %llu, 64-255 %llu, 256-1023 %llu, 1024 and more %llu", par_t_collect / 1e6, par_t_own / 1e6,
                    par_t_wait / 1e6, par_t_exec / 1e6, (unsigned long long)par_deferred, par_t_settle / 1e6,
-                   (unsigned long long)par_barriers, par_t_barrier / 1e6,
+                   (unsigned long long)par_barriers, par_t_barrier / 1e6, (unsigned long long)par_spills,
                    (unsigned long long)par_unsliced[0], (unsigned long long)par_unsliced[1],
                    (unsigned long long)par_unsliced[2], (unsigned long long)par_unsliced[3]);
         if (par_mode > 0) {
@@ -2204,7 +2206,7 @@ static void par_flush(VkExec *ex) {
                    r[1][1] ? r[1][2] / 1e3 / (double)r[1][1] : 0.0);
         }
         par_t_collect = par_t_own = par_t_wait = par_t_exec = par_t_settle = 0, par_deferred = 0;
-        par_barriers = par_t_barrier = 0;
+        par_barriers = par_t_barrier = 0, par_spills = 0;
         memset(par_unsliced, 0, sizeof par_unsliced);
         par_restarts = 0;
         memset(par_end_op, 0, sizeof par_end_op), memset(par_no, 0, sizeof par_no);
@@ -2282,18 +2284,50 @@ static int par_defer_ok(const VkExec *ex) {
     // the replay thread of the TOTK_REPLAY_PAR check keeps everything in one command buffer. par_room left a place in
     // PDQ before the pass was collected.
     return RT_KNOB_ON(par_defer_mode) && !par_no_defer && PC.nslices > PC.s0 && par_nworkers && ex == &X && !par_no_split &&
-           split_n > 0 && !vk_dump_armed && pd_n < PAR_DEFER_DEPTH && rec_owns(ex->cb);
+           split_n > 0 && !vk_dump_armed && pd_n < PAR_DEFER_DEPTH && rec_owns(ex->cb) && rec_capture_room(PAR_CAP_ROOM);
+}
+
+// vk_rec.c, inside the pass end par_defer captures: a call it cannot hold (one without a packet, or a full capture).
+// The pass end is made in place, as without the deferral: the slices are waited for (a held earlier pass's as well,
+// vk_texture_hold_barrier, which lets a texture lock the walk holds go), and then their execution and the calls captured
+// so far go into the part, before the call that spilled.
+static typeof(PDQ[0]) *pd_cur;   // the pass end par_defer is capturing
+static int pd_spilled;
+static void par_spill(void) {
+    typeof(PDQ[0]) *d = pd_cur;
+    d->cap_hi = rec_capture_end();
+    vk_texture_hold_barrier();
+    uint64_t t0 = kern_now_ns();
+    par_wait_range(d->s0, d->s1, t0);
+    ParDone *done;
+    VkCommandBuffer *cbs;
+    int hazard = par_outputs(&X, d->s0, d->s1, 1, &done, &cbs);
+    rec_drain();
+    if (d->s1 > d->s0) vkCmdExecuteCommands(X.cb, (uint32_t)(d->s1 - d->s0), cbs);
+    rec_capture_play(X.cb, d->cap_lo, d->cap_hi);
+    free(cbs);
+    vk_completion_add(X.fence, par_done, done);
+    par_hazards(hazard, d->sig);
+    pd_spilled = 1, par_spills++;
 }
 
 static void par_defer(VkExec *ex) {
     __atomic_store_n(&pw_active, 0, __ATOMIC_RELEASE);   // every slice is published: idle workers sleep once none is left
     typeof(PDQ[0]) *d = &PDQ[(pd_head + pd_n++) % PAR_DEFER_DEPTH];
     d->s0 = PC.s0, d->s1 = PC.nslices, d->sig = PC.sig;
+    rec_capture_spill(par_spill);
+    pd_cur = d, pd_spilled = 0;
     d->cap_lo = rec_capture_begin();
     ex->recorded++;   // the part holds the pass's vkCmdExecuteCommands
     vk_exec_draw_new_cb(ex);
     ex->dirty = VK_EXEC_DIRTY_ALL;
     vk_exec_pass_end(ex);
+    pd_cur = NULL;
+    if (pd_spilled) {   // made in place (par_spill): nothing is held, and the walk goes on in this part
+        pd_n--;
+        split_draws += PC.draws;
+        return;
+    }
     d->cap_hi = rec_capture_end();
     ex->cb = vk_sync_split_defer();
     part_start = ex->recorded;

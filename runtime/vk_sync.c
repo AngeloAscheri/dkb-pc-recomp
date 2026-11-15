@@ -506,15 +506,25 @@ VkCommandBuffer vk_sync_split_defer(void) {
 // same command pool, and this thread is its only producer. The uploads and mirror copies asked for since the held split
 // (by the slices and by the replay of the parts after it) go to the queue ahead of the part: they are first uses in
 // this submission, which the part did not make.
+// The held part's last calls: the tail, the end timestamp, vkEndCommandBuffer. On the recorder thread, which recorded
+// the rest of the part: the AMD driver of issue #5 did not cope with a part ended by another thread than the one that
+// recorded it (vk_rec.c rec_end_cb), and the submitting thread waits meanwhile.
+typedef struct { void (*tail)(VkCommandBuffer cb, void *arg); void *arg; typeof(held[0]) *h; } HeldEnd;
+static void held_end(void *p) {
+    HeldEnd *e = p;
+    e->tail(e->h->cb, e->arg);
+    ts_close(e->h->cb, e->h->ts, e->h->fence, &e->h->note);
+    vkEndCommandBuffer(e->h->cb);
+}
+
 void vk_sync_split_finish(void (*tail)(VkCommandBuffer cb, void *arg), void *arg) {
     if (!held_n) return;
     typeof(held[0]) h = held[held_head];
     held_head = (held_head + 1) % HELD_MAX, held_n--;
     VkCtx *c = vk_ctx();
-    rec_drain();
-    tail(h.cb, arg);
-    ts_close(h.cb, h.ts, h.fence, &h.note);
-    vkEndCommandBuffer(h.cb);
+    HeldEnd e = {tail, arg, &h};
+    if (rec_call(held_end, &e)) rec_drain();   // after the calls queued before it, then the wait for the end
+    else rec_drain(), held_end(&e);
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, h.fence);
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},

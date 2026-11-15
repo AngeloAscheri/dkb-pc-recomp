@@ -43,6 +43,12 @@ uint32_t rec_capture_begin(void);
 uint32_t rec_capture_end(void);
 void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi);
 void rec_capture_reset(void);
+// Room for words more in the capture; the function that makes a capture's calls at once when one cannot be held (a call
+// without a packet, a full capture): it must end the capture.
+int rec_capture_room(uint32_t words);
+void rec_capture_spill(void (*fn)(void));
+// The recorder thread calls fn(arg) in order with the calls queued before it (1); 0: none, the caller calls it.
+int rec_call(void (*fn)(void *), void *arg);
 int rec_owns(VkCommandBuffer cb);     // the recorder records cb's calls (the producer's view)
 
 // Extension commands called through device function pointers.
