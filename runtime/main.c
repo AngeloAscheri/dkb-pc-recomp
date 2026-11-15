@@ -520,6 +520,9 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);
+    // Build the host-to-guest function table now, not in the crash handler: its malloc there faults again after heap
+    // damage, and the report then stops before the lifted function and the guest frames (#148).
+    lifted_function(0);
     parse_trace();
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait

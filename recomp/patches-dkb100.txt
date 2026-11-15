@@ -123,6 +123,10 @@ guard poolguard main 410df0 410d4c ptr x9 f9401927 st32 x29 -2c ffffffff
 guard poolguard main 41075c 410d4c vcall x9 b940028a
 guard poolguard main 410ee0 41164c ptr x20 aa1403e0
 guard poolguard main 410794 410e54 ptr x10 f875794a
+# #218 crash 2: f_7000108020 caches up to 256 ids in nodes taken from a free list (owner+0x76b38+0x18, count +0x28). When the
+# free list is empty its own code takes a null node and loads its payload at +0x10 (108510). The guard continues the
+# loop instead (108468): the id is not cached and may come back on a later pass.
+guard poolguard main 108510 108468 ptr x8 f9400909
 
 # Text box per-character transform setter main+0x84cd40 (issues 157, 206, 173). The layout animation reader
 # main+0x82fee0 calls it for each entry of an FLCT section (per-character transform) with x1 = 0 or 1; it stores
