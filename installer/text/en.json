@@ -226,6 +226,7 @@
  "step.dkb_translator": "Preparing the shader translator",
  "step.dkb_shaders": "Translating the game's shaders (once, a few minutes)",
  "step.dkb_wide": "Preparing ultrawide backgrounds and HUD layouts",
+ "warn.dkb_wide_failed": "Ultrawide layout generation failed (exit code {code}); setup will continue without installing new overlays. Existing overlays are unchanged. Details: {log}. Rerun setup to retry.",
  "step.dkb_verify": "Checking the completed installation",
  "phase.check.dkb_base": "Checking the ExeFS checksums",
  "phase.check.dkb_hash": "Checking the RomFS source files",

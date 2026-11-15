@@ -780,10 +780,19 @@ class WideLayouts(Step):
         plain_outputs(ctx)
         staged = ctx.temp / 'build' / 'wide-overlays'
         owned_dir(ctx, staged)
-        run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_wide_layout.py',
-                                '--version', ctx.info['game'],
-                                '--romfs', ctx.dest / 'romfs', '--out', staged,
-                                '--installer-workspace', ctx.temp, '--presets', *WIDE_SIZES])
+        try:
+            run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_wide_layout.py',
+                                    '--version', ctx.info['game'],
+                                    '--romfs', ctx.dest / 'romfs', '--out', staged,
+                                    '--installer-workspace', ctx.temp, '--presets', *WIDE_SIZES])
+        except InstallError as error:
+            if error.id != 'dkb.tool_failed':   # path/ownership failures still stop setup
+                raise
+            ctx.reporter.warning('warn.dkb_wide_failed', code=error.params.get('code'),
+                                 log=str(error.params.get('log')))
+            # These assets are optional for 16:9 play. Publish nothing on failure, retain any installed overlays,
+            # and leave outputs unrecorded so the next setup run can retry generation.
+            return {'prepared': False}
         plain_outputs(ctx)
         # Every preset has been validated. Publish each manifest last, so an interrupted copy is detected by
         # the runtime's resource hashes and the next install repairs it without recompiling the game.

@@ -261,12 +261,63 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         generator = self.root / 'tools/dkb_wide_layout.py'
         generator.write_text(generator.read_text() + '\nraise SystemExit(1)\n')
         code, events = self.run_install()
-        self.assertEqual(code, 1, events)
+        self.assertEqual(code, 0, events)
+        self.assertIn('warn.dkb_wide_failed', [e.get('id') for e in events if e['type'] == 'warning'])
+        record = b.statefile.load(self.dest, b.STATE)['steps']['dkb_wide']
+        self.assertFalse(record['prepared'])
+        self.assertNotIn('outputs', record)
         self.assertEqual({name: b.tree_key(self.dest / name) for name in b.WIDE_FOLDERS}, before)
         generator.write_text(generator.read_text().replace('raise SystemExit(1)', '# repaired'))
         self.calls.clear()
         self.assertEqual(self.run_install()[0], 0)
         self.assertEqual([step for step, _ in self.calls], ['dkb_wide'])
+
+    def test_failed_wide_generation_finishes_fresh_16x9_install_without_overlays(self):
+        template = self.root / 'dkb.ini.example'
+        template.write_text('[display]\nultrawide = 0\noutput_res = 1920x1080\n')
+        self.layout = b.replace(self.layout, ini_example=template)
+        generator = self.root / 'tools/dkb_wide_layout.py'
+        generator.write_text(generator.read_text() + '\nprint("synthetic unsupported layout")\nraise SystemExit(3)\n')
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        warning = next(e for e in events if e.get('id') == 'warn.dkb_wide_failed')
+        self.assertEqual(warning['params']['code'], 3)
+        self.assertIn('synthetic unsupported layout', Path(warning['params']['log']).read_text())
+        self.assertFalse(any((self.dest / name).exists() for name in b.WIDE_FOLDERS))
+        self.assertIn('dkb_verify', [step for step, _ in self.calls])
+        self.assertTrue(b.statefile.load(self.dest, b.STATE)['steps']['dkb_verify']['selftest'])
+        self.assertIn('output_res = 1920x1080', (self.dest / 'dkb.ini').read_text())
+        workspace = next(self.temp.glob('dkb-*'))
+        self.assertFalse((workspace / 'build').exists())
+
+    def test_failed_wide_generation_retries_with_unchanged_inputs(self):
+        def fail(ctx, step, command):
+            if step == 'dkb_wide':
+                raise b.InstallError('dkb.tool_failed', code=1, log='synthetic-wide.log')
+        self.assertEqual(self.run_install(fail)[0], 0)
+        self.calls.clear()
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual([step for step, _ in self.calls], ['dkb_wide'])
+        self.assertTrue(all((self.dest / name / 'manifest.tsv').is_file() for name in b.WIDE_FOLDERS))
+
+    def test_wide_generation_path_failure_still_stops_setup(self):
+        def reject(ctx, step, command):
+            if step == 'dkb_wide':
+                raise b.InstallError('dkb.path_link', path='synthetic redirect')
+        code, events = self.run_install(reject)
+        self.assertEqual(code, 1, events)
+        self.assertNotIn('warn.dkb_wide_failed', [e.get('id') for e in events])
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.path_link')
+        self.assertNotIn('dkb_verify', [step for step, _ in self.calls])
+
+    def test_wide_generation_cancellation_still_cancels_setup(self):
+        def cancel(ctx, step, command):
+            if step == 'dkb_wide':
+                raise KeyboardInterrupt
+        code, events = self.run_install(cancel)
+        self.assertEqual(code, 3, events)
+        self.assertNotIn('warn.dkb_wide_failed', [e.get('id') for e in events])
+        self.assertNotIn('dkb_verify', [step for step, _ in self.calls])
 
     def test_real_layout_generator_publishes_validated_centered_and_edge_resources(self):
         self.check_real_layout_generator('dkb100')

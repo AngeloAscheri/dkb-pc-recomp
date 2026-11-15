@@ -172,6 +172,7 @@ when the window and game have different aspect ratios.
 The installer prepares matching background overlays and both HUD variants for every wide preset automatically.
 Rerun setup to add them to an older installation or repair missing/changed overlays; this does not change your
 resolution or HUD choice. Select **Centered** under HUD position for the central 16:9 HUD and restart.
+If generation fails, setup warns and finishes without new overlays; see the named log and rerun setup to retry.
 
 For a manual build, use the game's patch table and generate matching overlays from your own packed
 RomFS (Python 3.14+ has built-in zstd; older Python needs `zstandard`). For 3440x1440, generate both HUD variants:

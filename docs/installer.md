@@ -92,8 +92,10 @@ The Bananza steps are:
    `build/` folder before copying overlays beside `romfs-index.bin`. Each overlay's manifest is published last.
    Missing or changed overlays are repaired on resume without relifting or compiling the game; changes to either
    layout tool also invalidate this step. Python 3.14+ uses `compression.zstd`; older development Python needs
-   `zstandard` from `tools/requirements-installer.txt`. An unrecognized resource layout stops this step instead of
-   installing guessed patches. The verified game version selects the layout rules: 3.2.0 removes one confirmation
+   `zstandard` from `tools/requirements-installer.txt`. If generation fails (including an unrecognized resource layout),
+   setup warns with the generator log path and continues without publishing new overlays; existing overlays remain
+   unchanged. The next setup run retries generation. Installer path/ownership failures and cancellation still stop setup.
+   The verified game version selects the layout rules: 3.2.0 removes one confirmation
    dialog background pane and stores its title effects in `static.Product.200`. Overlay preparation preserves the
    player's resolution and HUD settings.
 8. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
@@ -103,6 +105,9 @@ The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `
 `romfs-index.bin`, `dkb.ini`, `dkb-install.json`, the `shader-cache/` folder of step 6, and twelve
 `romfs-patches-<width>x<height>[-hud-edges]/` folders. An existing `totk.ini` is migrated to `dkb.ini`.
 Saves and further shader caches are created beside the executable when it runs. Source dumps stay untouched.
+
+Setup owns those twelve preset overlay folders and overwrites matching hand-made overlays when generation succeeds.
+Keep custom overlays in a separate folder and select it with `DKB_ROMFS_PATCHES` to avoid that overwrite.
 
 Only an empty destination or a Bananza install with matching ownership metadata is accepted. Temporary work has its
 own ownership marker; an unrelated nonempty temporary directory is refused. OS-held locks prevent simultaneous
