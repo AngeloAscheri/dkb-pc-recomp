@@ -589,12 +589,13 @@ static int feature(VkCommandBuffer cb, uint64_t fence, uint32_t w, uint32_t h, u
 // dispatch the replay sees with DLSS on (the title screen), and released with that submission's fence (grave). A
 // failure here is logged and leaves DLSS to try again at the game's upscaler as before. The replay thread only
 // (vk_exec_draw.c op_dispatch, before the dispatch's binds). 1 when NGX may have recorded into cb: the caller forgets
-// the bound state.
+// the bound state. The upscaler setting is live, so while another upscaler is chosen the warm-up waits for a later
+// dispatch: a switch to dlss from the menu still gets it, unless the game's upscale made a feature first.
 int vk_dlss_warm(VkCommandBuffer cb, uint64_t fence) {
     static int done;
-    if (done) return 0;
+    if (done || !vk_dlss_wanted() || strcmp(cfg_value("TOTK_UPSCALER"), "dlss")) return 0;
     done = 1;
-    if (!vk_dlss_wanted() || strcmp(cfg_value("TOTK_UPSCALER"), "dlss")) return 0;
+    if (F.h) return 0;   // the game's upscale got there first
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
