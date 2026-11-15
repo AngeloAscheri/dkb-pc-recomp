@@ -401,12 +401,12 @@ int vk_usnap_covers(uint64_t addr, uint64_t n) {
     return i < U.nreg && U.reg[i].lo < addr + n;
 }
 
-void vk_usnap_drop(uint64_t addr, uint64_t n) {
+static void drop(uint64_t addr, uint64_t n, uint64_t fence) {
     if (!U.mode || !n) return;
     plat_mutex_lock(&drop_lock);
     U.wr_added++;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
-    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
+    U.wr[U.nwr++] = (Wrote){addr, addr + n, fence};
     if (U.on)
         for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
             if (!U.reg[i].dropped)
@@ -414,6 +414,12 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
                     gen_bump();
     plat_mutex_unlock(&drop_lock);
 }
+
+void vk_usnap_drop(uint64_t addr, uint64_t n) { drop(addr, n, U.fence); }
+
+// A GPU write that is not copied back to guest memory (vk_memory.c vk_mem_gpu_kept): guest memory stays stale for good,
+// so the range never leaves U.wr (wr_prune drops only writes whose fence completed) and no later submission snapshots it.
+void vk_usnap_keep(uint64_t addr, uint64_t n) { drop(addr, n, UINT64_MAX); }
 
 uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_ACQUIRE); }
 uint64_t vk_usnap_arena_bytes(void) { return __atomic_load_n(&arena_total, __ATOMIC_RELAXED); }

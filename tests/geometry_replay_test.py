@@ -94,7 +94,7 @@ _Alignas(256) static uint64_t pointer_words[4];
 _Alignas(256) static uint32_t output_words[64];
 static uint32_t twin_pass;
 static CbRes callback_resources;
-static unsigned uses,gpu_writes,drops,pending_writes,counts,barriers,passes;
+static unsigned uses,gpu_writes,kept_writes,drops,pending_writes,counts,barriers,passes;
 void rt_log(const char *fmt, ...) { (void)fmt; }   // gs_storage_writeback's line
 static uint64_t expected_count_bytes=sizeof output_words;
 static uint64_t pending_addr,pending_size;
@@ -117,6 +117,8 @@ int vk_mem_resolve(uint64_t addr,uint64_t bytes,VkMemSpan *out) {
 }
 void vk_mem_use(VkMemSpan *span) {uses++;span->buffer=(VkBuffer)(uintptr_t)22;span->offset+=256;}
 void vk_mem_gpu_wrote(const VkMemSpan *span,uint64_t bytes) {CHECK((uintptr_t)span->buffer==22 && bytes,"write uses selected backing");gpu_writes++;}
+void vk_mem_gpu_kept(const VkMemSpan *span,uint64_t bytes) {CHECK((uintptr_t)span->buffer==22 && bytes,"kept write uses selected backing");kept_writes++;}
+void vk_usnap_keep(uint64_t addr,uint64_t bytes) {CHECK(addr==(uintptr_t)output_words && bytes==sizeof output_words,"kept write drops exact output snapshot");drops++;}
 void vk_usnap_drop(uint64_t addr,uint64_t bytes) {CHECK(addr==(uintptr_t)output_words && bytes==sizeof output_words,"write drops exact output snapshot");drops++;}
 void vk_mem_gpu_pending(uint64_t addr,uint64_t bytes) {pending_writes++;pending_addr=addr;pending_size=bytes;}
 int vk_sync_noting(void) {return 0;}
@@ -250,7 +252,7 @@ int main(int argc,char **argv) {
     pointer_words[0]+=16;CHECK(!bind_sig(&ex,&info),"GS pointer contents invalidate resource signature without a bind op");pointer_words[0]-=16;
     LIM.ubo_max=65536;LIM.sbo_max=sizeof output_words;LIM.sbo_align=16;LIM.ubo_align=16;
     VkDescriptorBufferInfo out=ssbo_info(&ex,NVN_STAGE_GS,&buffer,1);
-    CHECK((uintptr_t)out.buffer==22 && out.offset==256 && out.range==sizeof output_words && uses==1 && gpu_writes==0 &&
+    CHECK((uintptr_t)out.buffer==22 && out.offset==256 && out.range==sizeof output_words && uses==1 && gpu_writes==0 && kept_writes==1 &&
           drops==1 && counts==1 && last_use==VK_MUSE_SSBO,"GS storage resolves user-c3 pointer, stays in VRAM and drops snapshots");
     CHECK(callback_resources.nwritten==1 && pending_writes==1 && pending_addr==(uintptr_t)output_words &&
           pending_size==sizeof output_words,"GS write range is retained for fence completion");

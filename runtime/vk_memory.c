@@ -64,6 +64,8 @@ typedef struct PoolRec {
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
     uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
+    struct KeptRange { uint64_t lo, hi; } *kept;   // mirror_lock: whole pages of GPU writes kept in the mirror (vk_mem_gpu_kept),
+    int nkept, ckept;                  // as offsets from import_lo, sorted and disjoint; mirror_sync leaves them out of a flush
     uint64_t fl_lo, fl_hi;             // flush_lock: nvnMemoryPoolFlushMappedRange bytes not copied yet (fl_hi 0: none)
     // Shadow storage (POOL_IMPORT in shadow mode, "shadow storage" below): buf is a host-visible copy of the guest pages.
     VmaAllocation salloc;
@@ -351,6 +353,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
+    free(r->kept);
     free(r);
 }
 
@@ -2053,7 +2056,21 @@ static void mirror_sync(PoolRec *r) {
         plat_mutex_unlock(&flush_lock);
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
-        if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+        // Pages wholly inside a kept GPU write hold the GPU's bytes, not the guest's: a flush range that merely spans them
+        // (the pool's flushes are one bounding box) must not copy the stale guest bytes over them. A real CPU write to
+        // such a page still comes in through its page generation above.
+        uint64_t x = a - lo, e = b - lo;
+        int k = 0, n = r->nkept;
+        while (k < n) {   // first kept range ending above x
+            int m = (k + n) / 2;
+            if (r->kept[m].hi <= x) k = m + 1;
+            else n = m;
+        }
+        for (; x < e && k < r->nkept && r->kept[k].lo < e; k++) {
+            if (r->kept[k].lo > x) range_add(&pend, &npend, &cpend, r, x, r->kept[k].lo - x);
+            if (r->kept[k].hi > x) x = r->kept[k].hi;
+        }
+        if (x < e) range_add(&pend, &npend, &cpend, r, x, e - x);
     }
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;
@@ -2121,6 +2138,45 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
         mirror_unlock(locked);
     }
     *k = (__typeof__(*k)){r, sp->offset, size, sub};
+}
+
+// A GPU write that stays in the mirror (the geometry stage's storage, vk_exec_draw.c gs_storage_writeback). Re-uploads
+// (mirror_sync) work on whole 4 KiB pages, so the bytes of the range that share a page with other data go back to guest
+// memory as usual, and a CPU write or flush there copies the page, GPU bytes included, back into the mirror. The pages
+// wholly inside the range are noted in the pool's kept list, which mirror_sync leaves out of its flush ranges.
+void vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
+    vk_spec_event();
+    PoolRec *r = sp->pool;
+    if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return;
+    const uint64_t page = 1ull << GEN_PAGE_SHIFT, a = r->import_lo + sp->offset, b = a + size;
+    uint64_t pa = (a + page - 1) & ~(page - 1), pb = b & ~(page - 1);
+    if (pa >= pb) return vk_mem_gpu_wrote(sp, size);   // no whole page
+    if (a < pa) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = sp->offset}, pa - a);
+    if (pb < b) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = pb - r->import_lo}, b - pb);
+    uint64_t lo = pa - r->import_lo, hi = pb - r->import_lo;
+    int locked = mirror_lock_if_shared();
+    int n = r->nkept, i = 0;
+    while (i < n) {   // first range ending at or above lo
+        int m = (i + n) / 2;
+        if (r->kept[m].hi < lo) i = m + 1;
+        else n = m;
+    }
+    int j = i;
+    while (j < r->nkept && r->kept[j].lo <= hi) {   // overlapping or touching: merge
+        if (r->kept[j].lo < lo) lo = r->kept[j].lo;
+        if (r->kept[j].hi > hi) hi = r->kept[j].hi;
+        j++;
+    }
+    if (j == i) {
+        if (r->nkept == r->ckept) grow((void **)&r->kept, &r->ckept, sizeof *r->kept);
+        memmove(r->kept + i + 1, r->kept + i, (size_t)(r->nkept - i) * sizeof *r->kept);
+        r->nkept++;
+    } else if (j > i + 1) {
+        memmove(r->kept + i + 1, r->kept + j, (size_t)(r->nkept - j) * sizeof *r->kept);
+        r->nkept -= j - i - 1;
+    }
+    r->kept[i] = (struct KeptRange){lo, hi};
+    mirror_unlock(locked);
 }
 
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
