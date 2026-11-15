@@ -138,8 +138,16 @@ static void shortcut_rows(const InputMap &m, int layout) {
     opt_text(UI_MENU_SHORTCUT_READONLY);
     const char *guide[] = {shortcut_label(PAD_COUNT, type)};
     opt_shortcut_row("##shortcut_settings", UI_MENU_SHORTCUT_SETTINGS, UI_MENU_SHORTCUT_SETTINGS_DESC, "F1", guide, 1);
-    const char *fullscreen[] = {shortcut_label(PAD_START, type), shortcut_label(PAD_BACK, type)};
-    opt_shortcut_row("##shortcut_fullscreen", UI_MENU_SHORTCUT_FULLSCREEN, UI_MENU_SHORTCUT_FULLSCREEN_DESC, "F11  |  Hold 0.5 s", fullscreen, 2);
+    if (cfg_bool("TOTK_PAD_FULLSCREEN_HOLD")) {
+        const char *fullscreen[] = {shortcut_label(PAD_START, type), shortcut_label(PAD_BACK, type)};
+        opt_shortcut_row("##shortcut_fullscreen", UI_MENU_SHORTCUT_FULLSCREEN, UI_MENU_SHORTCUT_FULLSCREEN_DESC, "F11  |  Hold 0.5 s", fullscreen, 2);
+    } else {
+        uint8_t plus[INPUT_PAD_BINDING_MAX], minus[INPUT_PAD_BINDING_MAX];
+        int p = input_map_pads_of(&m, B_PLUS, layout, plus, INPUT_PAD_BINDING_MAX);
+        int b = input_map_pads_of(&m, B_MINUS, layout, minus, INPUT_PAD_BINDING_MAX);
+        const char *combo[] = {shortcut_label(p ? plus[0] : PAD_NONE, type), shortcut_label(b ? minus[0] : PAD_NONE, type)};
+        opt_shortcut_row("##shortcut_settings_combo", UI_MENU_SHORTCUT_SETTINGS, UI_MENU_SHORTCUT_SETTINGS_COMBO_DESC, "F1", combo, 2);
+    }
     uint8_t left[INPUT_PAD_BINDING_MAX], right[INPUT_PAD_BINDING_MAX];
     int l = input_map_pads_of(&m, B_STICK_L, layout, left, INPUT_PAD_BINDING_MAX);
     int r = input_map_pads_of(&m, B_STICK_R, layout, right, INPUT_PAD_BINDING_MAX);

@@ -1,4 +1,4 @@
-// Identity caching must avoid USB opens on routine polls, preserve keys, and retry failed opens.
+// Identity caching avoids repeated successful and failed opens until a device disconnects.
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -92,17 +92,38 @@ int main(void) {
     connected[0] = 0; connected[1] = 1; connected[2] = 2; count = 3;
     list = scan(3); free(list);
     int attempts = pads[0].opens;
-    list = scan(3); free(list);
-    assert(pads[0].opens == attempts + 1);   // a failed open cannot poison the identity cache
+    for (int i = 0; i < 120; i++) {
+        list = scan(3); free(list);
+        assert(!open_pad_locked(pads[0].id));   // active selection cannot bypass the cached failure
+    }
+    assert(pads[0].opens == attempts);
     pads[0].failed = 0;
+    list = scan(3); free(list);
+    assert(!open_pad_locked(pads[0].id) && pads[0].opens == attempts);
+    connected[0] = 1; connected[1] = 2; count = 2;
+    list = scan(2); free(list);
+    pads[0].id = 302;
+    connected[0] = 0; connected[1] = 1; connected[2] = 2; count = 3;
     list = scan(3); assert(!strcmp(list[0].key, serial_key)); free(list);
+    assert(pads[0].opens == attempts + 1);
     attempts = pads[0].opens;
     list = scan(3); free(list);
+    assert(pads[0].opens == attempts);
+    // A failure when taking the active reference is remembered too.
+    pads[0].failed = 1;
+    assert(!open_pad_locked(pads[0].id));
+    attempts = pads[0].opens;
+    for (int i = 0; i < 120; i++) assert(!open_pad_locked(pads[0].id));
     assert(pads[0].opens == attempts);
     assert(pads[0].references == 0 && pads[1].references == 0 && pads[2].references == 0);
     count = 0;
     list = scan(0); assert(!list);
+    assert(!device_cache && !device_cache_count);
+    pads[0].failed = 0; pads[0].id = 303; connected[0] = 0; count = 1;
+    list = scan(1); assert(!strcmp(list[0].key, serial_key)); free(list);
+    SDL_Gamepad *active = open_pad_locked(pads[0].id);
+    assert(active); SDL_CloseGamepad(active);
     free(device_cache);
-    puts("controller devices: cached polls never reopen; duplicate keys, reconnect and failed-open retry passed");
+    puts("controller devices: successful and failed opens cached, selection respects failures, reconnect retries passed");
     return 0;
 }

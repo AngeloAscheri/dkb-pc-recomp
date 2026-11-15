@@ -401,8 +401,8 @@ static uint64_t device_hash(const char *s) {
 
 // Retain identities and fallback ordinals for connected instance IDs. Opening an idle
 // controller can perform slow USB handshakes, so polling must not reopen a known device.
-// A failed open is not a complete identity: retry it so a saved serial can still match.
-typedef struct { InputPadDevice device; int identified; } CachedPadDevice;
+// Failed opens are retained too, until that instance disappears from the device list.
+typedef struct { InputPadDevice device; int open_failed; } CachedPadDevice;
 static CachedPadDevice *device_cache;
 static int device_cache_count;
 
@@ -411,6 +411,11 @@ static int devices_locked(InputPadDevice **devices) {
     *devices = NULL;
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    if (!n) {
+        free(device_cache); device_cache = NULL; device_cache_count = 0;
+        SDL_free(ids);
+        return 0;
+    }
     InputPadDevice *out = n > 0 ? calloc((size_t)n, sizeof *out) : NULL;
     if (!out) { SDL_free(ids); return 0; }
     CachedPadDevice *cache = calloc((size_t)n, sizeof *cache);
@@ -421,16 +426,16 @@ static int devices_locked(InputPadDevice **devices) {
         snprintf(base, sizeof base, "%s:%016llx", guid, (unsigned long long)device_hash(name));
         out[i].id = ids[i];
         for (int j = 0; j < device_cache_count; j++)
-            if (device_cache[j].identified && device_cache[j].device.id == ids[i] &&
+            if (device_cache[j].device.id == ids[i] &&
                 !strncmp(device_cache[j].device.key, base, strlen(base))) {
                 snprintf(out[i].key, sizeof out[i].key, "%s", device_cache[j].device.key);
-                if (cache) cache[i].identified = 1;
+                if (cache) cache[i].open_failed = device_cache[j].open_failed;
                 break;
             }
         if (out[i].key[0]) continue;
         SDL_Gamepad *ref = SDL_OpenGamepad(ids[i]);
         const char *serial = ref ? SDL_GetGamepadSerial(ref) : NULL;
-        if (cache) cache[i].identified = ref != NULL;
+        if (cache) cache[i].open_failed = ref == NULL;
         if (serial && *serial)
             snprintf(out[i].key, sizeof out[i].key, "%s:s%016llx", base, (unsigned long long)device_hash(serial));
         else
@@ -465,6 +470,17 @@ static int devices_locked(InputPadDevice **devices) {
     SDL_free(ids);
     *devices = out;
     return n;
+}
+
+// Under input lock. Selection must not bypass a failed identity open on every scan.
+static SDL_Gamepad *open_pad_locked(uint32_t id) {
+    CachedPadDevice *cached = NULL;
+    for (int i = 0; i < device_cache_count; i++)
+        if (device_cache[i].device.id == id) { cached = &device_cache[i]; break; }
+    if (cached && cached->open_failed) return NULL;
+    SDL_Gamepad *opened = SDL_OpenGamepad(id);
+    if (cached && !opened) cached->open_failed = 1;
+    return opened;
 }
 
 int input_pad_devices(InputPadDevice **devices) {
@@ -503,7 +519,7 @@ static void scan_pads(void) {
     if (!n && current) { free(devices); return; }   // do not interpret a failed snapshot as a topology change
     uint32_t wanted = input_pad_choose(&pad_selection, devices, n, preferred, current);
     if (current && current == wanted) { free(devices); return; }
-    SDL_Gamepad *next = wanted ? SDL_OpenGamepad(wanted) : NULL;
+    SDL_Gamepad *next = wanted ? open_pad_locked(wanted) : NULL;
     if (!next && current) {   // a failed arrival must not discard a still-working controller
         pad_selection.automatic = 1;
         free(devices);
@@ -511,7 +527,7 @@ static void scan_pads(void) {
     }
     if (!next)
         for (int i = 0; i < n && !next; i++)
-            if (devices[i].id != wanted) next = SDL_OpenGamepad(devices[i].id);
+            if (devices[i].id != wanted) next = open_pad_locked(devices[i].id);
     if (next && SDL_GetGamepadID(next) != wanted) pad_selection.automatic = 1;
     free(devices);
     if (pad) {
@@ -656,7 +672,12 @@ static int pad_physical(uint8_t pd[PAD_COUNT]) {
     SDL_JoystickID id = SDL_GetGamepadID(pad);
     if (pad_fullscreen_gate.device != id) pad_fullscreen_pending = 0;
     uint64_t shortcut = (pd[PAD_START] ? 1ull << B_PLUS : 0) | (pd[PAD_BACK] ? 1ull << B_MINUS : 0);
-    pad_fullscreen_pending |= input_hold_gate(&pad_fullscreen_gate, id, plat_now_ns(), &shortcut);
+    if (cfg_bool("TOTK_PAD_FULLSCREEN_HOLD"))
+        pad_fullscreen_pending |= input_hold_gate(&pad_fullscreen_gate, id, plat_now_ns(), &shortcut);
+    else {
+        pad_fullscreen_gate = (InputHoldGate){0};
+        pad_fullscreen_pending = 0;
+    }
     // Consume physical buttons before remapping: the fixed shortcut neither depends on
     // the player's bindings nor swallows another controller's or the keyboard's inputs.
     if (!(shortcut & (1ull << B_PLUS))) pd[PAD_START] = 0;
@@ -726,18 +747,23 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     }
     script_apply(&b, sl, sr);
     rec_apply(b, sl, sr);
-    int toggle = pad_fullscreen_take();
+    int fullscreen = pad_fullscreen_take();
+    static int combo_held;
     int32_t st[4] = {sl[0], sl[1], sr[0], sr[1]};
-    if (menu_is_open()) {
-        b = 0;
-        st[0] = st[1] = st[2] = st[3] = 0;
+    // Keep the original merged Minus+Plus settings shortcut unless fullscreen is opted in.
+    int toggle = 0;
+    if (!cfg_bool("TOTK_PAD_FULLSCREEN_HOLD"))
+        toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st);
+    else {
+        combo_held = 0;
+        if (menu_is_open()) { b = 0; st[0] = st[1] = st[2] = st[3] = 0; }
     }
     static int overlay_held;   // L3+R3 step the performance overlay (F10)
     int overlay = input_overlay_gate(&overlay_held, &b);
     sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
     plat_mutex_unlock(&lock);
-    if (toggle) gfx_window_toggle_fullscreen();
-    if (guide_toggle) menu_toggle();
+    if (fullscreen) gfx_window_toggle_fullscreen();
+    if (toggle || guide_toggle) menu_toggle();
     if (overlay) menu_perf_cycle();
     stick_bits(&b, sl[0], sl[1], B_SL_LEFT);
     stick_bits(&b, sr[0], sr[1], B_SR_LEFT);

@@ -20,6 +20,25 @@ static void sample(uint32_t device, uint64_t now, uint64_t buttons, int fires, u
 
 int main(void) {
     const uint64_t both = start | back, a = 1ull << B_A;
+    // Default mode restores the original immediate menu chord, including its release latch.
+    int held = 0;
+    int32_t sticks[4] = {1, 2, 3, 4};
+    uint64_t buttons = start | a;
+    assert(!input_menu_gate(&held, 0, &buttons, sticks) && buttons == (start | a));
+    buttons = both | a;
+    assert(input_menu_gate(&held, 0, &buttons, sticks) && buttons == a);
+    buttons = both | a;
+    assert(!input_menu_gate(&held, 1, &buttons, sticks) && !buttons);
+    for (int i = 0; i < 4; i++) assert(!sticks[i]);
+    buttons = start;
+    assert(!input_menu_gate(&held, 0, &buttons, sticks) && !buttons);
+    buttons = both;
+    assert(!input_menu_gate(&held, 0, &buttons, sticks) && !buttons);
+    buttons = 0;
+    assert(!input_menu_gate(&held, 0, &buttons, sticks));
+    buttons = both;
+    assert(input_menu_gate(&held, 1, &buttons, sticks) && !buttons);
+
     sample(1, 0, 0, 0, 0);
     sample(1, 1, start | a, 0, start | a);
     sample(1, 2, back, 0, back);
@@ -55,6 +74,6 @@ int main(void) {
     sample(3, 16000000000ull, 0, 0, 0);
     sample(3, 17000000000ull, both, 0, 0);
     sample(3, 17500000000ull, both, 1, 0);
-    puts("controller hold: timing, release, isolation and reconnect passed");
+    puts("controller shortcuts: original menu chord and opt-in fullscreen timing, release, isolation and reconnect passed");
     return 0;
 }

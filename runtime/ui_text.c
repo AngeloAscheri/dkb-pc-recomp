@@ -29,6 +29,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
         "Newly connected controllers take over automatically. If the active controller disconnects, another available controller takes over.\n\n"
         "Manual choices apply immediately and are saved for startup. Auto starts with the first available controller. Later connections can still take over.\n\n"
         "Keyboard and mouse remain available.",
+    [UI_MENU_PAD_FULLSCREEN_HOLD] = "Fullscreen hold shortcut",
+    [UI_MENU_PAD_FULLSCREEN_HOLD_DESC] = "Off: Plus + Minus opens or closes settings, as before.\n\nOn: hold the physical Start + Back buttons for 0.5 seconds to toggle fullscreen instead.\n\nGuide/Home and keyboard F1 remain available in either mode.",
+    [UI_MENU_SHORTCUT_SETTINGS_COMBO_DESC] = "Press both displayed Plus and Minus bindings together to open or close settings.\n\nThis is the original settings shortcut and follows the current bindings.\n\nKeyboard equivalent: F1.",
     [UI_MENU_SHORTCUTS] = "Shortcuts",
     [UI_MENU_SHORTCUT_READONLY] = "Read-only shortcuts",
     [UI_MENU_SHORTCUT_SETTINGS] = "Open settings menu",

@@ -226,6 +226,9 @@
 # Saved manual choices apply at startup, with first-available fallback. New connections take over automatically.
 # Disconnecting the active controller falls back to another device. Automatic changes do not overwrite this preference.
 # pad_device = auto
+# Default: Plus + Minus opens settings. Opt in to a physical Start + Back fullscreen hold instead (0.5 s).
+# Guide/Home and keyboard F1 still open settings in either mode.
+# pad_fullscreen_hold = 0
 # Gamepad motion controls (0 = off) and vibration (0 = off).
 # motion = 1
 # rumble = 1

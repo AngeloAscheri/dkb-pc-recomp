@@ -396,6 +396,15 @@ uint32_t input_pad_choose(InputPadSelection *s, const InputPadDevice *devices, i
     return wanted;
 }
 
+int input_menu_gate(int *held, int menu_open, uint64_t *buttons, int32_t sticks[4]) {
+    int edge = chord(held, buttons, 1ull << B_MINUS | 1ull << B_PLUS);
+    if (menu_open) {
+        *buttons = 0;
+        sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0;
+    }
+    return edge;
+}
+
 int input_hold_gate(InputHoldGate *gate, uint32_t device, uint64_t now_ns, uint64_t *buttons) {
     const uint64_t combo = 1ull << B_MINUS | 1ull << B_PLUS;
     uint64_t raw = *buttons & combo;

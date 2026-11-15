@@ -22,7 +22,8 @@ an unrelated setting does not count as a new connection. Devices already connect
 if several arrive between polls, the last enumerated new device is chosen. Discovery may take about one second.
 
 Identities are cached per connected SDL instance ID: routine scans do not repeatedly initialize USB/Bluetooth
-controllers. A new/reconnected device can still cause a brief initialization hitch.
+controllers. Failed opens are also remembered until that device disconnects; reconnecting allows a fresh attempt.
+A new/reconnected device can still cause a brief initialization hitch.
 
 The selection is saved as `pad_device` in `totk.ini` (`dkb.ini` in Bananza). Set it to `auto` to reset it, or use
 `TOTK_PAD_DEVICE` / `DKB_PAD_DEVICE` to override it. The other values are opaque device keys written by the menu.
@@ -78,13 +79,18 @@ Without the folder (an install made by an older setup, or one where the setup co
 
 | Key | Gamepad | Action |
 |---|---|---|
-| F1 or Esc | Guide / Home button | open or close the settings menu; the game gets no input while it is open |
+| F1 or Esc | Guide / Home button, or Minus + Plus together (default) | open or close the settings menu; the game gets no input while it is open |
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
-| F11 | Hold Start + Back (Plus + Minus) for 0.5 seconds | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
+| F11 | Hold Start + Back for 0.5 seconds (opt-in) | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
 
-The fullscreen hold uses the selected controller's physical SDL Start and Back buttons (Options + Create on DualSense), independently of button remapping. It fires once per hold; release both buttons before repeating. Once the buttons overlap, neither reaches the game until both are released. An individual button pressed before the combination forms still works normally. Switching or reconnecting controllers does not inherit a held shortcut. The former instant Minus + Plus settings shortcut is replaced by this fullscreen hold; Guide / Home and F1 retain their existing settings behavior.
+By default, the original immediate Minus + Plus settings shortcut remains available and follows the current bindings.
+Enable **Fullscreen hold shortcut** in F1 > Controls > Controller (`pad_fullscreen_hold = 1`, or
+`TOTK_PAD_FULLSCREEN_HOLD` / `DKB_PAD_FULLSCREEN_HOLD`) to replace that combination with fullscreen.
+The setting defaults to off and takes effect immediately. Guide / Home and keyboard F1 work in either mode.
 
-The read-only **Shortcuts** section above **Buttons** shows settings, fullscreen and performance shortcuts using the selected controller's button labels. Performance data follows the current stick-click bindings, as before. Guide / Home must be forwarded by the operating system or streaming client.
+The opt-in fullscreen hold uses the selected controller's physical SDL Start and Back buttons (Options + Create on DualSense), independently of button remapping. It fires once per hold; release both buttons before repeating. Once the buttons overlap, neither reaches the game until both are released. An individual button pressed before the combination forms still works normally. Switching or reconnecting controllers does not inherit a held shortcut.
+
+The read-only **Shortcuts** section above **Buttons** shows settings, fullscreen and performance shortcuts using the selected controller's button labels and the enabled shortcut mode. Performance data follows the current stick-click bindings, as before. Guide / Home must be forwarded by the operating system or streaming client.
 
 In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
 
