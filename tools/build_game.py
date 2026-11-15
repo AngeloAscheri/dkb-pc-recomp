@@ -435,19 +435,21 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     # into the objects an earlier install left, and ninja decides by file times. A release unpacked from a zip carries
     # the archive's times, written in UTC and read as local time without a zone, so sources made less than the zone's
     # offset after the last install look older than its objects: a changed romfs.c was not compiled again and the
-    # PlayStation prompts never loaded. With content_keys each runtime source's command line carries a hash of the
-    # source and one of every runtime header; ninja compares command lines, so new contents always compile.
-    headers = None
+    # PlayStation prompts never loaded. With content_keys every runtime command line carries one hash over every file
+    # below runtime/ (a source can include a .c or embed a font, so no narrower set is safe); ninja compares command
+    # lines, so new contents always compile.
+    digest = None
     if content_keys and not make_lib:
-        heads = sorted(p for p in RUNTIME.rglob('*') if p.suffix in ('.h', '.hpp', '.inc') and p.is_file())
-        headers = hashlib.sha256(b''.join(h.read_bytes() for h in heads)).hexdigest()[:16]
+        h = hashlib.sha256()
+        for f in sorted(p for p in RUNTIME.rglob('*') if p.is_file()):
+            h.update(f.relative_to(RUNTIME).as_posix().encode() + b'|' + f.read_bytes())
+        digest = h.hexdigest()[:16]
     for src in sources:
         o = runtime_object(out, src)
-        if headers and src.suffix in ('.c', '.cpp') and src.is_relative_to(RUNTIME):
-            content = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+        if digest and src.suffix in ('.c', '.cpp') and src.is_relative_to(RUNTIME):
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
             extra = f' -std=c++20 -I {cmd_path(RUNTIME / "third_party" / "eglantine")}' if src.suffix == '.cpp' else ''
-            lines.append(f'  rtflags = $rtflags{extra} -DRT_SOURCE_DIGEST=0x{content} -DRT_HEADERS_DIGEST=0x{headers}')
+            lines.append(f'  rtflags = $rtflags{extra} -DRT_TREE_DIGEST=0x{digest}')
             rt.append(o)
             continue
         if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
@@ -470,9 +472,13 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     if runtime_lib:
         # Whole archive: the runtime's weak defaults (nvn_procs.c, nvn_api_core.c, vk_sync.c) would otherwise satisfy
         # references before the linker pulls the members with the strong definitions, which would stay out of totk.exe.
+        # The library's hash rides in the command: a lib unpacked with old zip times is only an implicit input and
+        # would not relink the exe on file times alone.
         rule = 'link_lib'
+        lib_sha = hashlib.sha256(runtime_lib.read_bytes()).hexdigest()[:16] if runtime_lib.is_file() else 'missing'
         lines += ['', 'rule link_lib',
-                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
+                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out'
+                  f' # {lib_sha}',
                   '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
     lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
               (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
