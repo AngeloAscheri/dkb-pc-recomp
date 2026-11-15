@@ -47,7 +47,6 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
   On `bananza` (9190e6b), `scene_res = full` draws it at the output size.
 - Add-on content: the installer unpacks DLC from a `.nup` (57eaed9); a player confirmed the DLC and the 3.2.0
   update load (#183). Loose RomFS mods load from a `mods` folder beside `dkb.exe` (7779dda).
-- `scene_res = full` at 3840x2160 crashes at start (#279); PR #244 grows the heap the pool comes from.
 
 Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 15 November 2026.
 
