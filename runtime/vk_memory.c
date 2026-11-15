@@ -1574,7 +1574,7 @@ static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mism
 
 static void sparse_cache_open(void);
 
-static void mirror_mode(int discrete) {
+static void mirror_mode(int discrete, uint32_t vendor) {
     const char *e = cfg_value("TOTK_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
     const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
@@ -1586,8 +1586,13 @@ static void mirror_mode(int discrete) {
     }
     vk_mirror_on = mode > 0;
     mirror_verify = mode == 2;
+    // The sparse write-back dispatch (sparse_ranges): by default on NVIDIA, the one vendor it was measured on;
+    // TOTK_SPARSE_MIRROR_COPY=1 turns it on elsewhere, 0 off.
     const char *sparse = cfg_get("TOTK_SPARSE_MIRROR_COPY");
-    mirror_sparse = vk_mirror_on && sparse && !strcmp(sparse, "1");
+    mirror_sparse = vk_mirror_on && (sparse && *sparse ? strcmp(sparse, "0") != 0 : vendor == 0x10de);
+    if (vk_mirror_on)
+        rt_log("mem: small write-back ranges are copied by %s (TOTK_SPARSE_MIRROR_COPY=%s)",
+               mirror_sparse ? "one compute dispatch a pool" : "copy regions", sparse && *sparse ? sparse : "auto");
     if (mirror_sparse) sparse_cache_open();
     const char *g = cfg_get("TOTK_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
@@ -1654,8 +1659,13 @@ static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, ui
 #define MRANGE_LESS(x, y) ((x)->r != (y)->r ? (uintptr_t)(x)->r < (uintptr_t)(y)->r : (x)->off < (y)->off)
 MSORT_DEFINE(sort_ranges, MRange, MRANGE_LESS)   // by pool, then offset, without a call per comparison (msort.h)
 
-// Local experiment: one dispatch for a pool's many small write-back ranges. The usual transfer path
-// handles large pools, bulk copies, and any unsupported alignment or device capability.
+// One dispatch for a pool's many small write-back ranges (TOTK_SPARSE_MIRROR_COPY, on by default on NVIDIA; 0 copies
+// every range with vkCmdCopyBuffer). A copy region costs the GPU about 0.7 us whatever its size: in the Hilltop Layer of Surf Hills
+// (3.2.0) 5,500 write-back ranges a frame of 870 bytes on average took 4.2 ms of an RTX 5090's GPU time as copy
+// regions and 0.4 ms as one workgroup each. The transfer path keeps bulk copies, where it is faster (the mirror
+// uploads, 80 KiB a range, took 4.5 ms as copies and 11 to 15 as a dispatch): the uploads, a pool's ranges over 4 KiB
+// on average, and any single range over SPARSE_RANGE_MAX or not word-aligned, since one 32-lane workgroup copies a
+// range. Also any unsupported device limit.
 static struct {
     int tried;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -1802,16 +1812,23 @@ static void sparse_cache_close(void) {
     for (int i = 0; i < n; i++) sparse_batch_free(ready[i]);
 }
 
+#define SPARSE_RANGE_MAX 65536u
+
+// The pool's merged ranges mregions[0, count): the ones the dispatch can take (word-aligned, at most SPARSE_RANGE_MAX)
+// are moved to the front, and their count is returned when the dispatch should copy them; 0 leaves every range to
+// vkCmdCopyBuffer.
 static int sparse_ranges(VkCtx *c, uint64_t size, int count) {
-    if (count < 64 || size > 4u * 1024 * 1024 || size > c->props.limits.maxStorageBufferRange ||
-        (uint32_t)count > c->props.limits.maxComputeWorkGroupCount[0]) return 0;
+    if (count < 64 || size > c->props.limits.maxStorageBufferRange) return 0;
+    int small = 0;
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
-        const VkBufferCopy *region = &mregions[i];
-        if ((region->srcOffset | region->size) & 3) return 0;
-        total += region->size;
+        VkBufferCopy region = mregions[i];
+        if ((region.srcOffset | region.size) & 3 || region.size > SPARSE_RANGE_MAX) continue;
+        mregions[i] = mregions[small], mregions[small++] = region;
+        total += region.size;
     }
-    return total <= 128u * (uint64_t)count;
+    if (small < 64 || (uint32_t)small > c->props.limits.maxComputeWorkGroupCount[0]) return 0;
+    return total <= 4096u * (uint64_t)small ? small : 0;
 }
 
 static void sparse_dispatch(VkCommandBuffer cb, SparseBatch *batch, PoolRec *pool, uint64_t size, int count) {
@@ -1860,21 +1877,20 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
             mregions[k++] = (VkBufferCopy){lo, lo, hi - lo};
         }
         if (!k) continue;
-        int dispatched = 0;
-        if (c && sparse_ranges(c, lim, k)) {
+        int dispatched = c ? sparse_ranges(c, lim, k) : 0;   // the first ones go to the dispatch, the rest are copied
+        if (dispatched) {
             if (!sparse_tried) {
                 sparse = sparse_batch_create(c, n);
                 sparse_tried = 1;
             }
             if (sparse) {
-                sparse_dispatch(cb, sparse, r, lim, k);
+                sparse_dispatch(cb, sparse, r, lim, dispatched);
                 rec += 4;
-                dispatched = 1;
-            }
+            } else dispatched = 0;
         }
-        if (!dispatched) {
-            if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
-            else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
+        if (dispatched < k) {
+            if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)(k - dispatched), mregions + dispatched);
+            else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)(k - dispatched), mregions + dispatched);
             rec++;
         }
         for (int j = 0; j < k; j++) *bytes += mregions[j].size;
@@ -2424,7 +2440,7 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
                               f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " LAZY" : "");
     }
     rt_log("%s", line);
-    mirror_mode(discrete);
+    mirror_mode(discrete, p->vendorID);
 }
 
 // ---------------------------------------------------------------- upload batches and deferred destruction
