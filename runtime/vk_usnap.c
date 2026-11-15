@@ -49,6 +49,7 @@ static struct {
     uint64_t fence, gen;
     uint64_t dseq;              // drops made so far (vk_usnap_drops)
     Arena *arena;
+    uint8_t *cpu;               // this submission's copy for the CPU (vk_usnap_cpu_reads), as laid out in the arena
     Rng *col;                   // collected ranges
     int ncol, ccol;
     Reg *reg;                   // merged, sorted by lo, disjoint
@@ -66,6 +67,17 @@ static struct {
 // region before it was dropped is itself dropped, because the generation moved (vk_exec.c par_join). The rest of U
 // changes only in vk_usnap_begin and vk_usnap_end, where no helper part is out.
 static void gen_bump(void) { __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELEASE); }
+
+// The arena is written once, in order, and lives in device-local memory through the BAR where the device has it: for
+// the CPU it is uncached, and reading a 256-byte block back takes microseconds. A caller that reads many copied blocks
+// (vk_exec_draw.c merge_pick, TOTK_DRAW_MERGE) asks for a second copy in cached host memory, made from the first
+// submission that begins after the call; vk_usnap_bytes reads that one. One submission records at a time
+// (vk_exec_record), so the one buffer, grown as needed, serves every submission.
+static int cpu_reads;
+static uint8_t *cpu_buf;
+static uint64_t cpu_cap;
+
+void vk_usnap_cpu_reads(void) { __atomic_store_n(&cpu_reads, 1, __ATOMIC_RELAXED); }
 
 static Arena *free_arenas;
 static PlatMutex free_lock = PLAT_MUTEX_INIT;
@@ -291,7 +303,7 @@ static void summary(void) {
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
-    U.on = 0, U.fence = fence, gen_bump();
+    U.on = 0, U.fence = fence, U.cpu = NULL, gen_bump();
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
         U.off_subs++;
@@ -332,8 +344,16 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     U.t_merge += t3 - t2;
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
-    for (int i = 0; i < U.nreg; i++)
-        memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+    if (__atomic_load_n(&cpu_reads, __ATOMIC_RELAXED) && cpu_cap < total) {
+        free(cpu_buf);
+        cpu_cap = (cpu_buf = malloc(total)) ? total : 0;
+    }
+    U.cpu = cpu_cap >= total && __atomic_load_n(&cpu_reads, __ATOMIC_RELAXED) ? cpu_buf : NULL;
+    for (int i = 0; i < U.nreg; i++) {
+        const void *src = (const void *)(uintptr_t)U.reg[i].lo;
+        if (U.cpu) src = memcpy(U.cpu + U.reg[i].off, src, U.reg[i].hi - U.reg[i].lo);   // the guest's bytes once
+        memcpy(U.arena->map + U.reg[i].off, src, U.reg[i].hi - U.reg[i].lo);
+    }
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     uint64_t t4 = kern_now_ns();
@@ -343,7 +363,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
 
 void vk_usnap_end(uint64_t fence) {
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
-    U.on = 0, gen_bump();
+    U.on = 0, U.cpu = NULL, gen_bump();
 }
 
 // First region whose end is above a.
@@ -391,7 +411,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 static PlatMutex drop_lock = PLAT_MUTEX_INIT;
 const void *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     VkDescriptorBufferInfo b;
-    return vk_usnap_find(addr, n, 1, &b) ? U.arena->map + b.offset : NULL;
+    return vk_usnap_find(addr, n, 1, &b) ? (U.cpu ? U.cpu : U.arena->map) + b.offset : NULL;
 }
 
 // 1 when a copy made for this submission overlaps [addr, addr+n): only then does a drop of that range change what a
