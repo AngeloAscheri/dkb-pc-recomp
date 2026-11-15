@@ -223,6 +223,16 @@ static void sort_new_writes(Wrote *a, int n, Wrote **tmp, size_t *cap) {
         src = dst, dst = t;
     }
     if (src != a) memcpy(a, src, (size_t)n * sizeof *a);   // three passes end in tmp
+    // The buckets are 16 bytes wide, and GPU write ranges need not be 16-byte aligned (inline uniform updates, buffer
+    // copies, query results): two ranges in one bucket keep the order they were added in, and the merge in wr_prune,
+    // which wants them by lo, then dropped the lower one. An insertion pass puts them in order; the array is sorted but
+    // inside buckets, so it moves only those few.
+    for (int i = 1; i < n; i++) {
+        Wrote w = a[i];
+        int j = i;
+        while (j > 0 && a[j - 1].lo > w.lo) a[j] = a[j - 1], j--;
+        a[j] = w;
+    }
 }
 
 static void wr_prune(void) {

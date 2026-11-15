@@ -1,8 +1,9 @@
 """runtime/vk_usnap.c wr_prune against a brute-force search: the GPU write ranges of the submissions in flight are kept
 sorted and merged, and wr_prune sorts only the ranges added since the last prune before merging them in. Over random
-submissions (ranges of 16 bytes to 4 KiB, a completed fence that moves forward), every range a write still in flight
-overlaps must be found by wr_hits, and the kept list must stay sorted and disjoint. wr_prune, sort_new_writes and
-wr_hits are cut out of the runtime source. No GPU or game runs.
+submissions (ranges of 4 bytes to 4 KiB, half of them not 16-byte aligned, a completed fence that moves forward),
+every range a write still in flight overlaps must be found by wr_hits, and the kept list must stay sorted and disjoint.
+A first case puts two unaligned ranges in one 16-byte bucket of the radix sort, the higher one added first.
+wr_prune, sort_new_writes and wr_hits are cut out of the runtime source. No GPU or game runs.
 """
 import argparse
 from pathlib import Path
@@ -34,11 +35,20 @@ int main(void) {
     int nall = 0, fails = 0, checks = 0;
     U.cwr = 2000000, U.wr = malloc(sizeof *U.wr * (size_t)U.cwr);
     if (!U.wr) return 2;
+    // Two unaligned ranges in one 16-byte bucket, the higher added first: both must survive the prune.
+    U.wr[U.nwr++] = (Wrote){0x1008, 0x1010, 1};
+    U.wr[U.nwr++] = (Wrote){0x1000, 0x1004, 1};
+    wr_prune();
+    checks += 2;
+    if (!wr_hits(0x1000, 0x1004)) fails++, puts("FAIL: [0x1000,0x1004) lost in its bucket");
+    if (!wr_hits(0x1008, 0x1010)) fails++, puts("FAIL: [0x1008,0x1010) lost");
+    U.nwr = 0, nwr_sorted = 0;
     for (uint64_t fence = 1; fence <= 300; fence++) {
         int add = (int)(rnd() % 3000);
         uint64_t base = rnd() % 4 ? 0x100000000ull : 0x7000000000ull * (1 + rnd() % 3);   /* spans past 128 GiB too */
         for (int i = 0; i < add; i++) {
-            uint64_t lo = base + rnd() % (1 << 20) * 16, n = 16 + rnd() % 4096;
+            // Half the ranges start anywhere, as inline updates, copies and query results do; half on 16 bytes.
+            uint64_t lo = base + (rnd() % 2 ? rnd() % (1 << 24) : rnd() % (1 << 20) * 16), n = 4 + rnd() % 4096;
             Wrote w = {lo, lo + n, fence};
             U.wr[U.nwr++] = w, all[nall++] = w;
         }
@@ -50,7 +60,7 @@ int main(void) {
         for (int i = 1; i < U.nwr; i++, checks++)
             if (U.wr[i - 1].hi > U.wr[i].lo) fails++;   /* sorted and disjoint */
         for (int q = 0; q < 300; q++, checks++) {
-            uint64_t lo = base + rnd() % (1 << 20) * 16, hi = lo + 1 + rnd() % 8192;
+            uint64_t lo = base + rnd() % (1 << 24), hi = lo + 1 + rnd() % 8192;
             int ref = 0;
             for (int i = 0; i < nall && !ref; i++) ref = all[i].fence > done_fence && all[i].lo < hi && lo < all[i].hi;
             if (ref && !wr_hits(lo, hi)) fails++;   /* a merged range may keep a completed part: only misses fail */
