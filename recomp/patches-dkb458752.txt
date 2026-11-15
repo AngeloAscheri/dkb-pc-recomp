@@ -144,3 +144,10 @@ site dkbscene main 38df08 bd400120 @page:x9 bd411920  # 1.0.0 3c1624
 set render3d DKB_RENDER3D 0
 site render3d main 79024 bd41b100 @page:x10 bd412140  # ldr s0, [x10, #0x120] in place of ldr s0, [x8, #0x1b0]
 site render3d main 79028 bd41b501 bd412541  # ldr s1, [x10, #0x124] in place of ldr s1, [x8, #0x1b4]
+
+# Text box per-character transform setter main+0x86d848 (1.0.0 main+0x84cd40, same 15 words): the null +0x150
+# block guards of patches-dkb100.txt (issues 157, 206, 173), placed by hand because tools/port_patches.py does not
+# port guards. Opt-out: DKB_FIX_FLCT_GUARD=0.
+set flctguard DKB_FIX_FLCT_GUARD 1
+guard flctguard main 86d858 86d868 ptr x8 bd000100
+guard flctguard main 86d870 86d880 ptr x8 bd000500
