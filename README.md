@@ -36,16 +36,18 @@ builds the game from your own dump: [docs/installer.md](docs/installer.md). What
   wait for a retest (#176, #193, #206, #267). GPU hangs under RADV on Linux are still open (#99, #122, #198, #204); 25d1089 fences
   the command buffer the recorder writes, a retest is asked.
 - Guest crashes (#148, #136, #218, #229). The write to address 0 at the title screen or on loads (#157, #173, #206)
-  is guarded on `bananza` (22f0a3a); retest asked. #218 sent a save and an input recording that reach
-  `main+0x429480` on a layer change.
+  is guarded on `bananza` (22f0a3a); retest asked. #218's crash on a layer change in 3.2.0 (`main+0x429480`) is the
+  loop 1.0.0 guards for #126; 3.2.0 has the same guards since 96a2ba7.
 - Intel Arc A770: a driver fault about 20 s in (#3).
-- Missing effects in the Tempest layer (falling golden hail, tornadoes: #221, #183).
+- Missing effects in the Tempest layer (#221): a player reports the tornado draws on `bananza`; retest asked.
 - Heavy scenes below 60 fps (#141, #156, #194, #207). On `bananza` (70c1b4a) new defaults raise our heavy test scene
   from about 53 to 58 fps and halve the frames over 25 ms; a stall of about 0.45 s on area loads is left. See
   [docs/dkb-lowend.md](docs/dkb-lowend.md).
 - A soft 3D picture: the game's dynamic resolution draws the scene at 2/3 of the output (1280x720 at 1080p, #210).
   On `bananza` (9190e6b), `scene_res = full` draws it at the output size.
-- Add-on content: the installer now unpacks DLC from a `.nup` (57eaed9), untested with a real DLC (#258).
+- Add-on content: the installer unpacks DLC from a `.nup` (57eaed9); a player confirmed the DLC and the 3.2.0
+  update load (#183). Loose RomFS mods load from a `mods` folder beside `dkb.exe` (7779dda).
+- `scene_res = full` at 3840x2160 crashes at start (#279); PR #244 grows the heap the pool comes from.
 
 Progress, day by day: [docs/devlog.md](docs/devlog.md). Last updated: 15 November 2026.
 
