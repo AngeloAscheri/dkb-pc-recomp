@@ -84,7 +84,7 @@ Which button each symbol names follows `pad_layout`, as the buttons do:
 - `auto` (a Sony pad counts as `xbox`) and `xbox`: Switch A is the bottom button, so A shows the cross, B the circle, X the square and Y the triangle. The face-button diamonds that point at one button point at the bottom one for A, and so on.
 - `nintendo` and `xbox_prompts`: Switch A is the right button, so A shows the circle, B the cross, X the triangle and Y the square.
 
-As with the Xbox prompts, a button remapped with a `bind_` line keeps the symbol of the Switch button it was.
+As with the Xbox prompts, a button remapped with a `bind_` line keeps the symbol of the Switch button it was. `auto` looks at every pad connected at start, not at the one `pad_device` chooses (the choice is made later, when input starts): with a PlayStation pad connected next to the one you play with, set `pad_prompts = switch`.
 
 Every prompt is a glyph of one font, `scft/NinDev-HardKey.bfotf`, the same in each `Font/Font*.Nin_Ounce_NVN2.bfarc.zs`: an irregular plate with the button's letter cut out of it (`tools/dkb_prompt_survey.py` found it). The setup runs `tools/dkb_ps_prompts.py`, which keeps each plate of the user's own font and cuts the PlayStation symbol into it instead of the letter: the symbols, the 1 and the 2 are drawn by the tool, and the L and R are the game's, from its ZL and ZR glyphs. It writes `romfs-patches-ps` and `romfs-patches-ps-nintendo` next to `romfs-index.bin`; `runtime/romfs.c` (`ps_prompts_init`) loads one of them next to the other overlays, which replace no Font archive. The D-pad, the sticks, Home and the controller pictures stay as the game draws them.
 
