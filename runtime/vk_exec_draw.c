@@ -121,7 +121,7 @@
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_RESET, W_GEOMETRY, W_LIST_RESTART, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_SKIP_CS, W_RESET, W_GEOMETRY, W_LIST_RESTART, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -404,7 +404,7 @@ typedef struct DrawCtx {
     TexPend bind_tp[MAX_BINDINGS];
     // descriptor_state: the descriptor tables, mappings and slot generation the descriptor serial was last bumped for.
     struct { const VkExec *ex; dpool_ref tex, samp; uint64_t pool_gen; uint32_t slots_gen; int keep; } desc_last;
-    SkipList skip_vs, skip_fs;
+    SkipList skip_vs, skip_fs, skip_cs;
     uint64_t wait_frame, wait_left_ns;   // prepare_draw: the frame the full-screen wait budget belongs to, what is left
     struct { int on, filtered; uint64_t filter; unsigned records; } GCL;   // geometry_context_log; on -1: not read yet
     // token_of: slot tokens by texture id, with the pool, slot generation and memory generation they were read under.
@@ -3196,7 +3196,7 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
     return 1;
 }
 
-// DKB_SKIP_VS / DKB_SKIP_FS (debug only, for bisecting the device loss of #75): comma-separated 16-digit hex NVN 2
+// DKB_SKIP_VS / DKB_SKIP_FS / DKB_SKIP_CS (debug only, for bisecting the device loss of #75): comma-separated 16-digit hex NVN 2
 // stage origins. A draw whose vertex (fragment) stage is listed in the matching variable is skipped, so a run that
 // stops faulting names the culprit shader. Parsed once; unset costs one flag test per draw.
 static int skip_listed(const VkExec *ex, int stage, SkipList *sl, const char *var, int warn, const char *msg) {
@@ -3222,6 +3222,11 @@ static int skip_listed(const VkExec *ex, int stage, SkipList *sl, const char *va
 
 static int skip_vs_listed(const VkExec *ex) {
     return skip_listed(ex, NVN_STAGE_VS, &DC_OF(ex)->skip_vs, "TOTK_SKIP_VS", W_SKIP_VS, "DKB_SKIP_VS is active: draws of the listed NVN 2 vertex stages are skipped");
+}
+
+// DKB_SKIP_CS covers direct dispatches only (op_dispatch), not indirect ones.
+static int skip_cs_listed(const VkExec *ex) {
+    return skip_listed(ex, NVN_STAGE_CS, &DC_OF(ex)->skip_cs, "TOTK_SKIP_CS", W_SKIP_CS, "DKB_SKIP_CS is active: direct dispatches of the listed NVN 2 compute stages are skipped");
 }
 
 static int skip_fs_listed(const VkExec *ex) {
@@ -3904,6 +3909,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (skip < 0) skip = getenv("DKB_SKIP_COMPUTE") != NULL;
     if (skip) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    if (skip_cs_listed(ex)) return;
     cb_res(ex);
     dummies_init();
     int present;
@@ -4294,7 +4300,7 @@ struct DrawCtx *vk_exec_draw_main(void) {
         ready = 1;
         draw_main.bind_gen = 1, draw_main.descriptor_serial = 1, draw_main.frame = &vk_exec_frame;
         draw_main.BS.on = draw_main.RS.on = draw_main.DP.on = draw_main.SM.on = draw_main.PM.on = -1;
-        draw_main.skip_vs.n = draw_main.skip_fs.n = -1, draw_main.GCL.on = -1;
+        draw_main.skip_vs.n = draw_main.skip_fs.n = draw_main.skip_cs.n = -1, draw_main.GCL.on = -1;
     }
     return &draw_main;
 }
