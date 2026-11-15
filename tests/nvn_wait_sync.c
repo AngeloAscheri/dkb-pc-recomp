@@ -72,7 +72,11 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     (void)p; (void)off; (void)size; rt_fatal("unexpected pool flush");
 }
 uint64_t rt_original(Cpu *c) { (void)c; rt_fatal("unexpected guest observer"); return 0; }
-int cfg_bool(const char *name) { (void)name; rt_fatal("unexpected setting lookup"); return 0; }
+int cfg_bool(const char *name) {   // TOTK_CALL_REF off: CallCommands copies the recording in, as this fixture expects
+    if (!strcmp(name, "TOTK_CALL_REF")) return 0;
+    rt_fatal("unexpected setting lookup");
+    return 0;
+}
 void plat_sleep_ms(uint32_t ms) { (void)ms; rt_fatal("unexpected sleep"); }
 
 // Actual concurrent locks, not no-op stubs: the completion thread also acquires the recording-copy lock.

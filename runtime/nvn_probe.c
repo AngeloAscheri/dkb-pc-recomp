@@ -722,21 +722,28 @@ static void probe_commands(void) {
     uint64_t h = record_all();
     parse_all(h);
 
-    // CallCommands inlines the called recording at the call position
+    // CallCommands inlines the called recording at the call position, or with TOTK_CALL_REF (the default) records one
+    // OP_CALL naming it when the recording holds no deferred binds or pushes
     begin(&cmd2, ctlmem2, 0x34000);
     CALL(nvnCommandBufferBarrier, U(&cmd2), 1);
     CALL(nvnCommandBufferCallCommands, U(&cmd2), 1, U(&h));
     CALL(nvnCommandBufferBarrier, U(&cmd2), 2);
     uint64_t h2 = CALL(nvnCommandBufferEndRecording, U(&cmd2));
-    int n = 0, barriers = 0, inner = 0, forbidden = 0;
+    int n = 0, barriers = 0, inner = 0, jumps = 0, calls = 0, call_to_h = 0;
     for (const op_hdr *o = nvn_op_first(h2); o->op != OP_END; o = nvn_op_next(o)) {
-        forbidden += o->op == OP_CALL || o->op == OP_JUMP;
+        jumps += o->op == OP_JUMP;
+        if (o->op == OP_CALL) calls++, call_to_h += ((const p_jump *)nvn_op_payload(o))->target == h;
         if (o->op != OP_BEGIN) n++;
         if (o->op == OP_BARRIER) barriers++;
         inner++;
     }
-    CHECK(!forbidden && n == nexpect + 2 && barriers == 3 && inner == nexpect + 3, "CallCommands inlined: %d ops (expected %d), %d barriers",
-          n, nexpect + 2, barriers);
+    if (calls) {
+        CHECK(nvn_call_ref_on() && !jumps && calls == 1 && call_to_h == 1 && n == 3 && barriers == 2,
+              "CallCommands referenced: %d ops (expected 3), %d calls naming the handle, %d barriers", n, call_to_h, barriers);
+    } else {
+        CHECK(!jumps && n == nexpect + 2 && barriers == 3 && inner == nexpect + 3,
+              "CallCommands inlined: %d ops (expected %d), %d barriers", n, nexpect + 2, barriers);
+    }
     CHECK(nvn_op_first(h2)->op == OP_BEGIN && nvn_op_next(nvn_op_first(h2))->op == OP_BARRIER, "the first op before the call stays first");
 
     // adding the control memory again retires the recordings made in it
