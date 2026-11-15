@@ -564,7 +564,7 @@ class Data(Step):
             # below against the preflight list taken from the same records.
             romfs = Path(sources['nup'])
             run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'extract_nup.py', romfs,
-                                     '--select', sources['nup_package'], '--pack', '--out', stage])
+                                     '--select', sources['nup_package'], '--pack', '--aoc', '--out', stage])
         else:
             exefs = Path(sources['exefs'])
             for name in ctx.info['hashes']:
@@ -602,6 +602,13 @@ class Data(Step):
             copy_file(stage / 'exefs' / name, ctx.dest / 'exefs' / name)
         for name in ('romfs.bin', 'index.json'):
             copy_file(stage / 'romfs' / name, ctx.dest / 'romfs' / name)
+        # Add-on content found in the .nup: a failed pack was skipped by the tool, so only whole folders are here.
+        for folder in sorted((stage / 'aoc').glob('aoc-*')):
+            try:
+                for name in ('romfs.bin', 'aoc-index.bin'):
+                    copy_file(folder / name, ctx.dest / folder.name / name)
+            except (InstallError, OSError) as e:
+                ctx.reporter.log(f'{self.id}: add-on content {folder.name} not installed: {e}')
         image = ctx.dest / 'romfs' / 'romfs.bin'
         return {'sha256': manifest['romfs_sha256'], 'size': image.stat().st_size, 'mtime_ns': image.stat().st_mtime_ns,
                 'index_sha256': sha256(ctx.dest / 'romfs' / 'index.json')}
