@@ -266,7 +266,7 @@ static void copy_block_free(copy_prefix *pf) {
 // The game may copy a cmd_t (see nvnCommandBufferInitialize), so two objects can hold one seg. Only the object named in
 // the cmd_t's seg_tok (its own address) writes into it or frees it; another one takes a block of its own (or copies and leaves the
 // shared one alone). Safe rather than fatal: a twin that records on is a game quirk we can serve, and the owner's
-// buffer, or the copy handed over from it, stays intact. A handed-over buffer loses REC_MAGIC, so no object owns it.
+// buffer, or the copy handed over from it, stays intact. Once handed over, the buffer belongs to the copy list: the command buffer takes a new seg and a new seg_tok.
 static uint8_t *rec_buffer(size_t cap, size_t *room) {
     copy_prefix *b = copy_block(sizeof *b + cap);
     b->magic = REC_MAGIC;
