@@ -110,6 +110,9 @@ def inventory(root, reporter):
     files = tree_files(root)
     if not files:
         raise InstallError('dkb.romfs_empty', path=str(root))
+    # The largest real RomFS file is about 55 MB; a file past 1 GiB is a RomFS image from a dumping tool.
+    if any(p.stat().st_size > 1 << 30 for p in files):
+        raise InstallError('dkb.romfs_image', path=str(root))
     result = []
     for i, p in enumerate(files):
         before = p.stat()
