@@ -102,6 +102,12 @@ cmd = ["{python}", "tests/perf_evidence_test.py"]
 # ------------------------------------------------------------------ tier 1
 
 [[test]]
+name = "build-game-keys"
+tier = 1
+area = "tools"
+cmd = ["{python}", "tests/build_game_keys_test.py"]
+
+[[test]]
 name = "romfs-image"
 tier = 1
 area = "tools"
