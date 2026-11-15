@@ -26,7 +26,7 @@
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
 #define COPY_MAGIC 0x59504f43444d43ull     // "CMDCOPY": prefix of a live recording copy
-#define REC_MAGIC 0x4345524d444d43ull      // "CMDMREC": prefix of a recording buffer; made_at holds its owner
+#define REC_MAGIC 0x4345524d444d43ull      // "CMDMREC": prefix of a live recording buffer
 #define OP_RESERVE 24                       // room always kept at the end of the recording buffer
 #define MIN_COMMAND_SIZE 512                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_COMMAND_SIZE (nvn_api_core.c devinfo)
 #define MIN_CONTROL_SIZE 256                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_CONTROL_SIZE
@@ -72,6 +72,8 @@ static void memory_event(Cpu *c, cmd_t *o, int event, uint64_t min) {
 }
 
 // ---------- recording buffer
+#define SEG_TOK(o) ((uint32_t)(((uintptr_t)(o) >> 3) & 0x7fffffffu))
+#define SEG_OWNED(o) ((o)->seg && (o)->seg_tok == SEG_TOK(o))
 // The prefix of a copy and of a recording buffer (see "recording copies" below).
 typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, block; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
@@ -83,7 +85,7 @@ static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) {
 // The recording buffer is a copy block (copy_block below) with the copy's prefix in front, so EndRecording can hand
 // it over as the copy (take_recording). rec_buffer: one with room for at least cap bytes after the prefix, and the
 // room in *room.
-static uint8_t *rec_buffer(const cmd_t *o, size_t cap, size_t *room);
+static uint8_t *rec_buffer(size_t cap, size_t *room);
 static void rec_buffer_free(uint8_t *seg);
 static int rec_owned(const cmd_t *o);
 
@@ -100,19 +102,30 @@ static void seg_check(const cmd_t *o, size_t need) {
 }
 
 static void cmd_reserve(cmd_t *o, size_t need) {
-    if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
-    seg_check(o, need);
+    if (o->seg && SEG_OWNED(o) && o->cur + need + OP_RESERVE <= o->end) return;
+    int twin = o->seg && !SEG_OWNED(o);
+    if (twin) {   // a copied cmd_t: its seg may be a handed-over copy or already freed, so it is not read
+        rt_log("nvn: command buffer %p records on a buffer it does not own; starting a new one", (void *)o);
+        o->seg = o->cur = o->end = NULL;
+    } else {
+        seg_check(o, need);
+    }
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0;
     if (!cap) cap = 48 << 10;
     while (used + need + OP_RESERVE > cap) cap *= 2;
     size_t room;
-    uint8_t *b = rec_buffer(o, cap, &room);
+    uint8_t *b = rec_buffer(cap, &room);
     if (used) memcpy(b, o->seg, used);
-    if (rec_owned(o)) rec_buffer_free(o->seg);   // a twin's seg stays with its owner
+    rec_buffer_free(o->seg);
     o->seg = b;
+    o->seg_tok = SEG_TOK(o);
     o->cur = b + used;
     o->end = b + room;
+    if (twin && o->recording) {   // the lost records are gone; keep what follows a valid recording
+        put_hdr(o->cur, OP_BEGIN, 8);
+        o->cur += 8;
+    }
 }
 
 // Space for one record (header included); the header's op is filled by the caller.
@@ -251,25 +264,23 @@ static void copy_block_free(copy_prefix *pf) {
 }
 
 // The game may copy a cmd_t (see nvnCommandBufferInitialize), so two objects can hold one seg. Only the object named in
-// the buffer's prefix writes into it or frees it; another one takes a block of its own (or copies and leaves the
+// the cmd_t's seg_tok (its own address) writes into it or frees it; another one takes a block of its own (or copies and leaves the
 // shared one alone). Safe rather than fatal: a twin that records on is a game quirk we can serve, and the owner's
 // buffer, or the copy handed over from it, stays intact. A handed-over buffer loses REC_MAGIC, so no object owns it.
-static uint8_t *rec_buffer(const cmd_t *o, size_t cap, size_t *room) {
+static uint8_t *rec_buffer(size_t cap, size_t *room) {
     copy_prefix *b = copy_block(sizeof *b + cap);
     b->magic = REC_MAGIC;
-    b->made_at = (uintptr_t)o;
     *room = (size_t)b->block - sizeof *b;
     return (uint8_t *)(b + 1);
 }
 
-static int rec_owned(const cmd_t *o) {
-    if (!o->seg) return 0;
-    const copy_prefix *pf = (const copy_prefix *)o->seg - 1;
-    return pf->magic == REC_MAGIC && pf->made_at == (uintptr_t)o;
-}
+// From the object alone: a twin's seg may be freed, so the prefix is never read to decide.
+static int rec_owned(const cmd_t *o) { return SEG_OWNED(o); }
 
 static void rec_buffer_free(uint8_t *seg) {
-    if (seg) copy_block_free((copy_prefix *)seg - 1);
+    if (!seg) return;
+    ((copy_prefix *)seg - 1)->magic = 0;   // a stale REC_MAGIC must not look live
+    copy_block_free((copy_prefix *)seg - 1);
 }
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -363,7 +374,7 @@ static uint8_t *take_recording(cmd_t *o) {
         blk_class(sizeof *pf + n) == blk_class((size_t)((copy_prefix *)o->seg - 1)->block)) {
         pf = (copy_prefix *)o->seg - 1;
         size_t room;
-        o->seg = o->cur = rec_buffer(o, (size_t)pf->block - sizeof *pf, &room);
+        o->seg = o->cur = rec_buffer((size_t)pf->block - sizeof *pf, &room);
         o->end = o->seg + room;
     } else {
         pf = copy_block(sizeof *pf + n);
@@ -455,9 +466,12 @@ NVN_API(nvnCommandBufferInitialize) {
 // void nvnCommandBufferFinalize(NVNcommandBuffer *cmd): handles outlive their recorder
 NVN_API(nvnCommandBufferFinalize) {
     cmd_t *o = cmd_of(c);
-    seg_check(o, 0);
-    if (rec_owned(o)) rec_buffer_free(o->seg);
+    if (rec_owned(o)) {
+        seg_check(o, 0);
+        rec_buffer_free(o->seg);
+    }
     o->seg = o->cur = o->end = NULL;
+    o->seg_tok = 0;
     o->magic = 0;
     cb_set_disabled(o, CB_NO_COMMAND | CB_NO_CONTROL, 0);
     nvn_mode_trace(NVN_MODE_FINALIZE, (uintptr_t)o, 0, 0, 0);

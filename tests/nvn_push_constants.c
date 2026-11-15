@@ -215,7 +215,7 @@ static void large_recordings(void) {
     CALL(nvnCommandBufferInitialize, U(&cmd), 0);
     CALL(nvnCommandBufferAddCommandMemory, U(&cmd), 0, 0, 0x10000);
     CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
-    record_scissors(&cmd, 4400, &big1);     // about 105 KiB: the buffer grows to 256 KiB and is handed over
+    record_scissors(&cmd, 4400, &big1);     // about 103 KiB: the buffer grows to 128 KiB and is handed over
     record_scissors(&cmd, 4400, &big2);
     record_scissors(&cmd, 1700, &mid);      // about 41 KiB: past the handover size, another class than the buffer's
     record_scissors(&cmd, 3, &small);       // after a large one: copied, the buffer stays with the command buffer
@@ -229,8 +229,31 @@ static void large_recordings(void) {
     CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
 }
 
+// A cmd_t copied mid-recording shares the buffer; once the owner has handed it over as a copy, the twin must not write
+// into it.
+static void twin_recording(void) {
+    NVNcommandBuffer cmd = {0}, twin;
+    _Alignas(16) uint8_t control[0x4000];
+    uint64_t h;
+    CALL(nvnCommandBufferInitialize, U(&cmd), 0);
+    CALL(nvnCommandBufferAddCommandMemory, U(&cmd), 0, 0, 0x10000);
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+    CALL(nvnCommandBufferBeginRecording, U(&cmd));
+    for (int i = 0; i < 2000; i++) CALL(nvnCommandBufferSetScissor, U(&cmd), (uint64_t)i, 1, 2, 3);
+    memcpy(&twin, &cmd, sizeof twin);
+    for (int i = 2000; i < 4400; i++) CALL(nvnCommandBufferSetScissor, U(&cmd), (uint64_t)i, 1, 2, 3);
+    h = CALL(nvnCommandBufferEndRecording, U(&cmd));
+    CALL(nvnCommandBufferSetScissor, U(&twin), 999999, 1, 2, 3);
+    CHECK(scissors_ok(h, 4400), "a copied command buffer does not write into a handed-over recording");
+    CALL(nvnCommandBufferFinalize, U(&twin));
+    CHECK(scissors_ok(h, 4400), "finalizing the twin does not free the handed-over recording");
+    CALL(nvnCommandBufferFinalize, U(&cmd));
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+}
+
 int main(void) {
     large_recordings();
+    twin_recording();
     for (int compute = 0; compute <= 1; compute++) {
         deferred_snapshot(compute);
         bounds(compute);
