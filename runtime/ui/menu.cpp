@@ -42,6 +42,7 @@ extern "C" {
 #include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
+#include "window_filter.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -724,7 +725,13 @@ static void rows_render_options(const MenuTarget &target) {
         opt_choice("TOTK_SCENE_RES", UI_MENU_SCENE_RES, scene, 2, UI_MENU_SCENE_RES_DESC);
     }
     // DLSS (runtime/vk_dlss.c) takes effect at the next start: NGX adds its Vulkan extensions when the device is made.
-    static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR, UI_MENU_UPSCALER_DLSS, UI_MENU_UPSCALER_FSR3, UI_MENU_UPSCALER_FSR4};
+    // fsr and bilinear both mean the game's own upscaler (cfg.c UPSCALER): bilinear shows as the first choice
+    static const char *const up_vals[] = {"fsr", "dlss", "fsr3", "fsr4"};
+    const char *up_names[] = {menu_text(UI_MENU_UPSCALER_GAME), menu_text(UI_MENU_UPSCALER_DLSS),
+                              menu_text(UI_MENU_UPSCALER_FSR3), menu_text(UI_MENU_UPSCALER_FSR4)};
+    int up_cur = 0;
+    for (int i = 1; i < 4; i++)
+        if (!strcmp(cfg_value("TOTK_UPSCALER"), up_vals[i])) up_cur = i;
     int fitted[4];
     gfx_fit_rect(target.image_w, target.image_h, target.width, target.height, fitted);
     bool no_upscale = target.image_w > 0 && target.image_h > 0 &&
@@ -733,9 +740,23 @@ static void rows_render_options(const MenuTarget &target) {
     // whether or not the final image fits the display, so the row stays open there: greyed out at the default
     // 2880x1620 virtual display on a 1440p or 1080p screen, it hid DLSS from the players of issues #152 and #306.
     if (no_upscale && rt_game_version) opt_disable_next(UI_MENU_NO_UPSCALING);
-    opt_choice("TOTK_UPSCALER", UI_MENU_UPSCALER, up, 5, UI_MENU_UPSCALER_DESC);
-    if (no_upscale) opt_disable_next(UI_MENU_NO_UPSCALING);
-    else if (!strcmp(cfg_value("TOTK_UPSCALER"), "bilinear")) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
+    opt_choice_list("TOTK_UPSCALER", UI_MENU_UPSCALER, up_vals, up_names, 4, UI_MENU_UPSCALER_DESC, up_cur);
+    // The Window scaling filter (TOTK_WINDOW_FILTER, live): how the finished picture is scaled to the window, with
+    // every upscaler. While the window is the picture's size the row says so and keeps the saved value. It shows the
+    // filter in effect (window_filter.h wf_resolve: upscaler = bilinear with no filter chosen is Linear); choosing one
+    // while the upscaler is the legacy bilinear also writes upscaler = fsr, so that alias stops mattering.
+    static const char *const filter_vals[] = {"linear", "catmull_rom", "lanczos", "fsr1"};
+    const char *filter_names[] = {menu_text(UI_MENU_FILTER_LINEAR), menu_text(UI_MENU_FILTER_CATMULL_ROM),
+                                  menu_text(UI_MENU_FILTER_LANCZOS), menu_text(UI_MENU_FILTER_FSR1)};
+    if (target.image_w > 0 && target.image_h > 0 && !wf_needed(target.image_w, target.image_h, fitted[2], fitted[3]))
+        opt_disable_next(UI_MENU_FILTER_NOT_NEEDED);
+    int filter_cur = wf_resolve(cfg_value("TOTK_WINDOW_FILTER"), cfg_is_set("TOTK_WINDOW_FILTER"), cfg_value("TOTK_UPSCALER"));
+    if (filter_cur == WF_BLIT) filter_cur = WF_LINEAR;   // the legacy plain blit is the linear filter without the pass
+    if (opt_choice_list("TOTK_WINDOW_FILTER", UI_MENU_FILTER, filter_vals, filter_names, 4, UI_MENU_FILTER_DESC, filter_cur) &&
+        !strcmp(cfg_value("TOTK_UPSCALER"), "bilinear"))
+        cfg_set("TOTK_UPSCALER", "fsr");
+    // Sharpness (TOTK_SHARPNESS, live): FSR 1's RCAS where it scales up, or, with another filter chosen, the window
+    // pass's sharpen at any window size (vk_fsr.c, window_filter.h wf_plan)
     opt_slider("TOTK_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     static const UiTextId smaa[] = {UI_MENU_OFF, UI_MENU_SMAA_LOW, UI_MENU_SMAA_MEDIUM, UI_MENU_SMAA_HIGH};
     opt_choice("TOTK_SMAA", UI_MENU_SMAA, smaa, 4, UI_MENU_SMAA_DESC);
@@ -1417,9 +1438,12 @@ static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
     else if (!rt_game_version)
         snprintf(v[2], sizeof v[2], menu_text(UI_MENU_OV_FMT_UPSCALE), scene[0], scene[1], out[0], out[1]);
     else snprintf(v[2], sizeof v[2], menu_text(UI_MENU_OV_FMT_SCENE), scene[0], scene[1], scene[0] * 100.0 / out[0]);
-    if (t->scaler == 2) {
+    if (t->scaler >= 2) {   // FSR 1 or the scaling pass: the filter's name and the slider
+        static const UiTextId filters[] = {UI_MENU_FILTER_FSR1, UI_MENU_FILTER_LINEAR, UI_MENU_FILTER_CATMULL_ROM,
+                                           UI_MENU_FILTER_LANCZOS};
         int s = cfg_int("TOTK_SHARPNESS");
-        snprintf(v[3], sizeof v[3], menu_text(UI_MENU_OV_FMT_FSR), s < 0 ? 0 : s > 100 ? 100 : s);
+        snprintf(v[3], sizeof v[3], menu_text(UI_MENU_OV_FMT_SHARP), menu_text(filters[ImClamp(t->scaler - 2, 0, 3)]),
+                 s < 0 ? 0 : s > 100 ? 100 : s);
     } else {
         snprintf(v[3], sizeof v[3], "%s", menu_text(t->scaler ? UI_MENU_OV_SCALE_BILINEAR : UI_MENU_OV_SCALE_NONE));
     }

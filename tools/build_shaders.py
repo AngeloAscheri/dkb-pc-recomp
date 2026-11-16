@@ -103,6 +103,10 @@ FSR3FI_VARIANTS = [   # (header name, SDK folder, pass file, defines)
      OF_OPTIONS),
 ]
 
+# Runtime shaders that are also compiled with a define into a header of their own: source stem -> [(header name,
+# define)]. The window scaling pass for the game's own HDR picture (runtime/vk_fsr.c).
+VARIANTS = {'win_scale': [('win_scale_pq', 'WIN_SCALE_PQ')]}
+
 INCLUDE = re.compile(rb'^\s*#\s*include\s*"([^"]+)"', re.M)
 
 
@@ -153,6 +157,9 @@ def stale(runtime):
 
 def shader_sources(runtime):
     jobs = [Job(p, p.stem) for p in sorted((runtime / 'shaders').iterdir()) if p.suffix in STAGES or p.suffix == '.spvasm']
+    for job in list(jobs):   # a shader that is also built with a define, into a header of its own
+        for name, define in VARIANTS.get(job.src.stem, []):
+            jobs.append(job._replace(name=name, defs=(define,)))
     sdk = runtime / FFX_DIR
     inc = (sdk / 'include' / 'FidelityFX' / 'gpu',)
     for name, p, extra in FSR3_VARIANTS:
