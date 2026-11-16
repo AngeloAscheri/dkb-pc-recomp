@@ -811,7 +811,7 @@ static void rows_display_output(void) {
     opt_choice("TOTK_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC, present_note());
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL,
                                      UI_MENU_PERF_BREAKDOWN, UI_MENU_PERF_COUNTER};
-    opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 4, UI_MENU_PERF_OVERLAY_DESC);
+    opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 5, UI_MENU_PERF_OVERLAY_DESC);
     row_gpu();
 }
 
@@ -1348,7 +1348,7 @@ static int perf_mode_of(const char *s) {
 
 extern "C" void menu_perf_cycle(void) {
     static const char *const modes[] = {"off", "fps", "full", "breakdown", "counter"};
-    cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 4]);
+    cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 5]);
     g_perf_save.store(1);
 }
 
