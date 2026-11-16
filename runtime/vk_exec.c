@@ -1906,8 +1906,8 @@ static int par_threads(void) {
 
 static int par_start(VkExec *ex) {
     par_threads();
-    // An open pass (a clear opened it, or its first draws were indirect) can still be sliced: it is ended and opened
-    // again below. One look per pass. Disabled rendering does not matter: the slices skip their draws as the walk would.
+    // An open pass (a clear opened it) can still be sliced: it is ended and opened again below. One look per pass.
+    // Disabled rendering does not matter: the slices skip their draws as the walk would.
     if (!par_mode || ex != &X || (ex->in_pass && pass_tried)) return 0;
     par_settle_ready(ex);
     pass_tried = 1, pass_why = PAR_WHY_NONE;
@@ -2001,7 +2001,12 @@ static int par_take(VkExec *ex, const op_hdr *h, const void *a) {
     case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CONST:
         vk_exec_op_draw(ex, h->op, a);   // binds only change ex
         break;
-    case OP_DRAW: case OP_DRAW_IDX:
+    // Indirect draws too: the GPU reads their arguments when the secondaries run, in the pass's order, as it would from
+    // the primary. A dispatch or copy that wrote them came before the pass, whose opening on the primary records a full
+    // barrier (vk_exec_pass_begin, barrier_to); a barrier inside the pass ends the collection. Before they were taken,
+    // the first one ended the collection and the rest of its pass was recorded on this thread: in Canyon Layer about
+    // 1,900 draws a frame, 92% of them indirect, at 2.1 us each (DKB_DRAW_PROFILE, 6 threads).
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
         if (PC.slice_draws >= PC.slice_size && PC.nslices < PAR_MAX_SLICES) {
             // A new slice starts at this draw, from ex as it is now; the one before is complete and goes to the workers.
             if (PC.nslices > PC.s0) par_publish();
@@ -2042,7 +2047,7 @@ static ParOut par_out[PAR_MAX_SLICES];
 // Records slice i into a secondary command buffer of pp, from the slice's copy of the replay state, into w.
 static void par_rec_note(int worker, int i, uint64_t ns) {   // TOTK_TRACE=perf: who recorded slice i, and how long
     int end = PC.end[i], draws = 0;
-    for (int k = PC.start[i]; k < end; k++) draws += PC.ops[k]->op == OP_DRAW || PC.ops[k]->op == OP_DRAW_IDX;
+    for (int k = PC.start[i]; k < end; k++) draws += par_run_op(PC.ops[k]->op) == 2;
     plat_add64(&par_rec[worker][0], 1), plat_add64(&par_rec[worker][1], draws), plat_add64(&par_rec[worker][2], (int64_t)ns);
     // Slices that took over 1 ms, and the longest with its draws: a slice of a few hundred draws that takes milliseconds
     // stalled (a lock another thread held, a driver call, the thread descheduled), and the pass end waits for it.
@@ -2566,13 +2571,13 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         if (h->op != OP_END && h->op != OP_BEGIN && h->op != OP_JUMP && h->op != OP_CALL) {
             if (PC.on) {
                 if (par_take(ex, h, a)) {
-                    if (h->op == OP_DRAW || h->op == OP_DRAW_IDX) draws_total++, pass_draws++;
+                    if (par_run_op(h->op) == 2) draws_total++, pass_draws++;
                     h = nvn_op_next(h);
                     continue;
                 }
                 par_end_op[h->op]++;
                 par_flush(ex);
-            } else if ((h->op == OP_DRAW || h->op == OP_DRAW_IDX) && par_start(ex) && par_take(ex, h, a)) {
+            } else if (par_run_op(h->op) == 2 && par_start(ex) && par_take(ex, h, a)) {
                 draws_total++, pass_draws++;
                 h = nvn_op_next(h);
                 continue;

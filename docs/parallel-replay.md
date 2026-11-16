@@ -111,10 +111,11 @@ The replay keeps its state in file-level variables, written for one thread:
 
 A pass whose targets drew at least 256 draws the last time (`par_hist`, keyed by the `OP_SET_RT` payload) opens with
 `VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT`. From its first draw the walk collects ops (`par_take`): state
-and bind ops are applied to the replay state as usual, draws are only kept, and every 1024 draws a copy of the replay
-state starts a new slice. The first op of another kind (other targets, a clear, a copy, a barrier, an indirect draw, an
-uniform update, the end of the submission) flushes (`par_flush`): each slice is replayed from its copy into its own
-secondary command buffer, inheriting the pass's formats, and the primary executes them in order and ends the pass.
+and bind ops are applied to the replay state as usual, draws (indexed indirect ones included) are only kept, and every
+1024 draws a copy of the replay state starts a new slice. The first op of another kind (other targets, a clear, a copy,
+a barrier, an uniform update, the end of the submission) flushes (`par_flush`): each slice is replayed from its copy
+into its own secondary command buffer, inheriting the pass's formats, and the primary executes them in order and ends
+the pass.
 
 Kept out: passes without attachments, passes with feedback-layout targets, passes while occlusion queries count, and
 frames being dumped. Inside a slice, anything that would end, restart or begin a pass, record a full barrier or an
