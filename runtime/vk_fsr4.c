@@ -18,6 +18,7 @@
 // and far distances and field of view come from the scene's projection.
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
@@ -44,6 +45,7 @@ typedef struct {
     struct ffxCreateContextDescUpscale upscale;
     ffxContext context;
     uint32_t width, height;   // its output, which is also the most the render size can be
+    int non_linear;           // the colour is perceptual (not an _SRGB or float format)
 } Context;
 
 static struct {
@@ -197,7 +199,21 @@ static void retire(uint64_t fence) {
 
 // A context for outputs of w x h, any render size up to that (the game's dynamic resolution changes it every so often: one
 // context takes them all).
-static Context *make_context(uint32_t w, uint32_t h) {
+// Float and _SRGB colour is not perceptual data the upscaler should treat as gamma coded.
+static int perceptual(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R8_SRGB: case VK_FORMAT_R8G8_SRGB:
+    case VK_FORMAT_R8G8B8_SRGB: case VK_FORMAT_B8G8R8_SRGB: case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+static Context *make_context(uint32_t w, uint32_t h, int non_linear) {
     Context *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     c->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -208,7 +224,8 @@ static Context *make_context(uint32_t w, uint32_t h) {
     c->upscale.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     c->upscale.header.pNext = &c->backend.header;
     // The scene's colour is the game's LDR, perceptual image (no auto exposure); the depth is not inverted.
-    c->upscale.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+    c->non_linear = non_linear;
+    c->upscale.flags = (non_linear ? FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE : 0) | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     c->upscale.maxRenderSize = (struct FfxApiDimensions2D){w, h};
     c->upscale.maxUpscaleSize = (struct FfxApiDimensions2D){w, h};
     c->upscale.fpMessage = &on_message;
@@ -304,8 +321,13 @@ static int camera(const float p[16], float *near_z, float *far_z, float *fov_y) 
     if (!(p[0] > 0.0f) || !(p[5] > 0.0f) || !isfinite(p[0]) || !isfinite(p[5])) return 0;
     *fov_y = 2.0f * atanf(1.0f / p[5]);
     *near_z = 1.0f, *far_z = 5000.0f;   // (the game's own, when the matrix gives no sane ones)
+    if (p[11] > 0.0f) return 0;   // as vk_fsr3.c camera_factors: depth 0 is at the near plane
     double n = (double)p[11] / ((double)p[10] - 1.0), f = (double)p[11] / ((double)p[10] + 1.0);
-    if (isfinite(n) && isfinite(f) && n > 0.0 && f > n) *near_z = (float)n, *far_z = (float)f;
+    if (isfinite(n) && n > 0.0) {
+        *near_z = (float)n;
+        if (isfinite(f) && f > n) *far_z = (float)f;   // else (an infinite far plane): the near one only
+        else if (*far_z <= *near_z) *far_z = *near_z * 5000.0f;
+    }
     return 1;
 }
 
@@ -330,9 +352,12 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     }
     sweep();
     int reset_ctx = 0;
-    if (!G.context || G.context->width != ow || G.context->height != oh) {
+    const int nl = perceptual(in->format);
+    static int fmt_logged;
+    if (!fmt_logged++) rt_log("fsr4: colour format %d, %s", (int)in->format, nl ? "perceptual" : "linear or sRGB-decoded");
+    if (!G.context || G.context->width != ow || G.context->height != oh || G.context->non_linear != nl) {
         retire(fence);
-        G.context = make_context(ow, oh);
+        G.context = make_context(ow, oh, nl);
         if (!G.context) return fail("its upscaler could not be made");
         reset_ctx = 1;
     }
@@ -377,7 +402,7 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     d.reset = t.reset || reset_ctx;
     d.cameraNear = near_z, d.cameraFar = far_z, d.cameraFovAngleVertical = fov_y;
     d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    d.flags = nl ? FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB : 0;
     rec_drain();   // AMD records into cb on this thread: everything queued for the recorder first
     ffxReturnCode_t r = G.dispatch(&G.context->context, &d.header);
 
@@ -391,6 +416,8 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
         char why[64];
         snprintf(why, sizeof why, "its dispatch failed (%d)", (int)r);
         fail(why);
+        t.temporal = 0;
+        vk_temporal_done(&t, w, h, ow);
         return -1;
     }
     vk_temporal_done(&t, w, h, ow);
