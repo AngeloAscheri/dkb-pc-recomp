@@ -1103,6 +1103,11 @@ static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDevic
     // yet a vertex stage there may write locations up to 31 (128 output components) and its geometry stage reads any
     // of them. Bananza's destructible terrain passes location 19 through its geometry stage, so the table's limit
     // dropped the cut faces of dug rock on AMD under Linux. The component count itself is still checked.
+    // Accepting locations past the table on RADV is deliberate: the validation layers flag such a pipeline there
+    // (VUID-RuntimeSpirv-Location-06272), and RADV draws it right. Eglantine builds the pipeline without any such check
+    // (src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp GraphicsPipeline::MakePipeline).
+    // Other drivers keep the table's limit: ANV, which also reports 64 components, may still refuse the draw, as it
+    // did before this check took the vertex stage's limit on RADV.
     uint32_t gi_limit = limits->maxGeometryInputComponents;
     if (vk_caps.radv && gi_limit < limits->maxVertexOutputComponents) gi_limit = limits->maxVertexOutputComponents;
     if (gi.components > limits->maxGeometryInputComponents || go.components > limits->maxGeometryOutputComponents ||
