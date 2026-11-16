@@ -171,6 +171,9 @@ void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
 void vk_hdr_release(void);   // before the device goes away
 void vk_present_flip(void);
 void vk_present_lock(void);     // the lock vk_present_release runs under (vk_framegen.c display_main)
+// vk_present_image under vk_present_lock, gfx_window_start called before the lock was taken (the start lock is never
+// taken under the present lock)
+void vk_present_image_held(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
 void vk_present_unlock(void);
 // TOTK_FLIGHT thumbnails (GfxBackend.thumbs_enable, thumbs_read; flight.c): the present thread blits every presented
 // frame into a host-visible ring of n thumbnails.
