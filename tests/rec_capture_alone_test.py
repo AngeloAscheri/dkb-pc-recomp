@@ -10,6 +10,8 @@ vk_rec.c is compiled with Vulkan stubs that log each command made, and no record
 - after rec_capture_end, calls into A are made at once again;
 - a call that has no packet (a barrier with a pNext chain) spills the capture first (the spill function ends it), then
   is made after it;
+- a capture that fills up spills, and the call that did not fit is made right after what the spill made (with no
+  recorder nothing reads the ring, so it would be lost there): every query end of the run is made once, in order;
 - rec_capture_alone answers 1 without the recorder, 0 for no command buffer.
 
 Usage: python tests/rec_capture_alone_test.py --cc clang --deps /path/to/runtime/deps
@@ -34,9 +36,18 @@ STUBS = r'''
 typedef struct { const char *name; void *cb; uint64_t a; } Call;
 Call calls[64];
 int ncalls;
-static void note(const char *name, void *cb, uint64_t a) { calls[ncalls++] = (Call){name, cb, a}; }
+static void note(const char *name, void *cb, uint64_t a) {
+    if (ncalls < 64) calls[ncalls] = (Call){name, cb, a};
+    ncalls++;
+}
+// The query ends made, in order: query_next is the index the next one must have, query_bad counts the others.
+uint32_t query_next, query_bad, query_made;
 void vkCmdEndRendering(void *cb) { note("EndRendering", cb, 0); }
-void vkCmdEndQuery(void *cb, void *pool, uint32_t q) { (void)pool; note("EndQuery", cb, q); }
+void vkCmdEndQuery(void *cb, void *pool, uint32_t q) {
+    (void)pool;
+    note("EndQuery", cb, q);
+    if (q >= 1000) query_bad += q - 1000 != query_next, query_next = q - 1000 + 1, query_made++;
+}
 typedef struct { uint32_t a[4]; int32_t o[3]; uint32_t b[4]; int32_t p[3]; uint32_t e[3]; } Region;   // VkImageCopy
 void vkCmdCopyImage(void *cb, void *s, int sl, void *d, int dl, uint32_t n, const Region *r) {
     (void)s, (void)sl, (void)d, (void)dl;
@@ -81,6 +92,7 @@ MAIN = r'''
 typedef struct { const char *name; void *cb; uint64_t a; } Call;
 extern Call calls[64];
 extern int ncalls;
+extern uint32_t query_next, query_bad, query_made;
 static int fails, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); puts(""); } } while (0)
 static VkCommandBuffer A = (VkCommandBuffer)(uintptr_t)0x1000, B = (VkCommandBuffer)(uintptr_t)0x2000;
@@ -130,6 +142,17 @@ int main(void) {
     ncalls = 0;
     vkCmdEndRendering(A);
     CHECK(ncalls == 1, "after the spill A's calls are made at once");
+    // A capture that fills up: the spill makes what it held, and the call that did not fit is made right after it,
+    // not lost in a ring nobody reads. Query ends numbered from 1000 must all be made, once each, in order.
+    rec_capture_reset();
+    spills = 0, ncalls = 0;
+    spill_lo = rec_capture_begin_for(A);
+    uint32_t n = 0;
+    while (spills == 0 && n < 100000) vkCmdEndQuery(A, VK_NULL_HANDLE, 1000 + n++);
+    CHECK(spills == 1, "the full capture spilled once (%d)", spills);
+    CHECK(query_made == n && query_bad == 0, "all %u query ends made in order (%u made, %u out of order)", n, query_made, query_bad);
+    vkCmdEndQuery(A, VK_NULL_HANDLE, 1000 + n++);
+    CHECK(query_made == n && query_bad == 0, "after the spill the next one is made at once (%u of %u)", query_made, n);
     printf("rec capture alone: %d checks, %d failures\n", checks, fails);
     return fails != 0;
 }
