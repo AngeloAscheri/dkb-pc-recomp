@@ -1099,11 +1099,24 @@ static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDevic
     uint64_t need = gi.builtin_mask & ~generated;
     if ((need & ~vo.builtin_mask) || !(go.builtin_mask & 1)) return "geometry per-vertex built-in mismatch";
     for (unsigned i = 0; i < 64; i++) if ((need >> i & 1) && gi.builtin[i] != vo.builtin[i]) return "geometry built-in type mismatch";
+    // RADV reports 64 geometry input components, which by the specification's table allows input locations 0 to 15,
+    // yet a vertex stage there may write locations up to 31 (128 output components) and its geometry stage reads any
+    // of them. Bananza's destructible terrain passes location 19 through its geometry stage, so the table's limit
+    // dropped the cut faces of dug rock on AMD under Linux. The component count itself is still checked.
+    uint32_t gi_limit = limits->maxGeometryInputComponents;
+    if (vk_caps.radv && gi_limit < limits->maxVertexOutputComponents) gi_limit = limits->maxVertexOutputComponents;
     if (gi.components > limits->maxGeometryInputComponents || go.components > limits->maxGeometryOutputComponents ||
         (uint64_t)go.components * g->max_output_vertices > limits->maxGeometryTotalOutputComponents ||
-        vo.components > limits->maxVertexOutputComponents || !geometry_locations(gi.mask, limits->maxGeometryInputComponents) ||
-        !geometry_locations(go.mask, limits->maxGeometryOutputComponents) || !geometry_locations(vo.mask, limits->maxVertexOutputComponents))
+        vo.components > limits->maxVertexOutputComponents || !geometry_locations(gi.mask, gi_limit) ||
+        !geometry_locations(go.mask, limits->maxGeometryOutputComponents) || !geometry_locations(vo.mask, limits->maxVertexOutputComponents)) {
+        rt_log("vk_pipeline: geometry interface: input %u of %u components, output %u of %u, output %u x %u vertices of %u in total, "
+               "vertex output %u of %u; location masks in %llx out %llx vertex %llx",
+               (unsigned)gi.components, limits->maxGeometryInputComponents, (unsigned)go.components, limits->maxGeometryOutputComponents,
+               (unsigned)go.components, (unsigned)g->max_output_vertices, limits->maxGeometryTotalOutputComponents,
+               (unsigned)vo.components, limits->maxVertexOutputComponents,
+               (unsigned long long)gi.mask, (unsigned long long)go.mask, (unsigned long long)vo.mask);
         return "geometry interface component device limit";
+    }
     if (s->fs) {
         if (!geometry_interface(s->fs, 1, 0, &fi)) return "unsupported fragment input interface or missing scalar-width metadata";
         // VUID-VkGraphicsPipelineCreateInfo-pStages-00740 requires the GS to
