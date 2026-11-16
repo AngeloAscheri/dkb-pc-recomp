@@ -1894,13 +1894,14 @@ static int par_nworkers;
 // 7 7700 (16) with an RX 9070 XT (Windows, driver 26.10 and 26.11) sliced passes ran over many sessions of free play
 // and the Hilltop hills with 5 to 8 threads, without device loss or glitch. In the hills (3.2.0, about 24,000 to 27,000
 // draws a frame), 5 threads replayed a frame about 2% slower than 6 to 8, which were even within the runs' spread, and
-// 6 had the deepest drops (worst 60-frame windows 42 to 46 fps against 50 to 54 with 7 or 8). RADV stays at 0 until
-// it is measured.
+// 6 had the deepest drops (worst 60-frame windows 42 to 46 fps against 50 to 54 with 7 or 8). That is one RDNA 4 card:
+// RDNA 3 is untested, and the driver branch of RDNA 1 and 2 (vk_caps.amd_sc), whose device losses turned the recorder
+// off as well (a Radeon 610M, issue #84; a ROG Xbox Ally X, issue #155), stays at 0 until it is measured, as RADV does.
 static int par_threads(void) {
     if (par_mode < 0) {
         const char *e = cfg_get("TOTK_REPLAY_THREADS");
         uint32_t cpus = plat_cpu_usable();
-        par_mode = e && *e ? atoi(e) : vk_caps.radv ? 0 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
+        par_mode = e && *e ? atoi(e) : vk_caps.radv || vk_caps.amd_sc ? 0 : cpus >= 12 ? 6 : cpus >= 8 ? 4 : 0;
         if (par_mode < 0) par_mode = 0;
         if (par_mode) rt_log("vk: passes of %d or more draws are recorded in slices of up to %d draws into secondary command buffers "
                              "(TOTK_REPLAY_THREADS=%d%s: recorded by that many threads)", PAR_MIN_DRAWS, PAR_SLICE_DRAWS, par_mode,
