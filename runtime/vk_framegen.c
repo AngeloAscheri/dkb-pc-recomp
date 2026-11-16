@@ -11,7 +11,10 @@
 // 2x: one made frame at t = 0.5, shown first, then the game's own frame half an interval later. The present thread
 // (vk_backend.c present_main) calls vk_fg_record with the game's texture before its blit (it returns 1), then vk_fg_show
 // in place of the blit: the made frame goes through vk_present_image, the history copy of the game's frame through
-// vk_present_blit, and its flip waits until half an interval after the made one.
+// vk_present_blit, and its flip waits until half an interval after the made one. With frame_gen_by = fsr3
+// (TOTK_FRAME_GEN_BY) the made frame comes from AMD FSR 3.1's frame interpolation instead of steps 2 and 3
+// (vk_fsr3fi.c), over the depth and motion of the frame's temporal upscaler (vk_fg_record's fi); a frame it cannot
+// make gets the built-in one.
 //
 // Auto and 3x to 8x (vk_fg_record returns 2), two threads as in Hookshot. A fixed multiplier m gives each game frame as
 // many frames as the display can show, m at most (fg_pace_fixed_frames): the made ones at t = k / n, then the game's own.
@@ -99,14 +102,14 @@ static struct {
     uint64_t last_at;     // when the previous job reached vk_fg_record; 0 = none
     int64_t interval;     // the game's frame interval, fg_pace_interval
     // the 5 s log
-    uint64_t t0, real, made_n, no_hist, hitch, over, crop, cut, late;
+    uint64_t t0, real, made_n, by_fsr, no_hist, hitch, over, crop, cut, late;
 } S;
 // S and the images are touched by vk_fg_record (the present thread) and vk_fg_release (the exit, under vk_present.c's g_pl
 // first: that order everywhere), so each holds this lock for its whole run; vk_fg_show copies what it needs and presents
 // without it. The display thread reads a set only between its queueing and its busy flag going down, and takes neither
 // this lock nor S.
 static PlatMutex fgl = PLAT_MUTEX_INIT;
-enum { SAY_HDR = 1, SAY_MODE = 2, SAY_GAME = 4, SAY_FMT = 8, SAY_BLIT = 16, SAY_SLOW = 32 };
+enum { SAY_HDR = 1, SAY_MODE = 2, SAY_GAME = 4, SAY_FMT = 8, SAY_BLIT = 16, SAY_SLOW = 32, SAY_NOFI = 64 };
 
 // The display thread's queue: the sets made and not yet taken, in order (D.mu, signalled on D.cv). dead is set by
 // vk_fg_release under the present lock, and the display thread reads it under that lock before each present, so it
@@ -403,11 +406,11 @@ static void log_stats(uint64_t now) {
                "over refresh %u, crop %u", s, (double)S.real / s, (unsigned)S.made_n, (double)S.made_n / s,
                (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop);
     else
-        rt_log("fg: %.1f s: real %.1f fps, shown %.1f fps, made %u; skipped: no history %u, hitch %u, over refresh %u, crop %u; "
-               "real cut short %u; late >2 ms %u", s, (double)S.real / s, (double)(S.real + S.made_n) / s,
-               (unsigned)S.made_n, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
+        rt_log("fg: %.1f s: real %.1f fps, shown %.1f fps, made %u (by AMD FSR 3.1 %u); skipped: no history %u, "
+               "hitch %u, over refresh %u, crop %u; real cut short %u; late >2 ms %u", s, (double)S.real / s,
+               (double)(S.real + S.made_n) / s, (unsigned)S.made_n, (unsigned)S.by_fsr, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
                (unsigned)S.cut, (unsigned)S.late);
-    S.t0 = now, S.real = S.made_n = S.no_hist = S.hitch = S.over = S.crop = S.cut = S.late = 0;
+    S.t0 = now, S.real = S.made_n = S.by_fsr = S.no_hist = S.hitch = S.over = S.crop = S.cut = S.late = 0;
 }
 
 // Waits until at: a sleep to 1 ms before it, then yields (the sleep alone wakes up to ~0.5 ms late), as Hookshot's
@@ -491,7 +494,7 @@ static void display_main(void *arg) {
     }
 }
 
-static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], uint64_t frame_no) {
+static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no) {
     VkCtx *c = vk_ctx();
     if (S.dead || !c) return 0;
     if (gfx_window_closing()) return 0;   // the exit is about to free everything below
@@ -647,7 +650,21 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], ui
     VkDescriptorImageInfo in[3];
     in[0] = (VkDescriptorImageInfo){S.nearest, S.hist[cur].view, G};
     pass(cb, &S.luma, in, S.luma_img[cur].view, qw, qh, NULL, 0);
-    if (any_made) {
+    // 2x with frame_gen_by = fsr3: AMD's interpolation makes the frame where the upscaler gave this frame's depth and
+    // motion (vk_fsr3fi.c; a size that is not the 3D's shape, a first frame after a gap and a camera cut it refuses).
+    // The flow and synthesis passes below then run only for a frame it did not make (the luma above always runs: the
+    // built-in flow of a later frame reads it).
+    int by_amd = 0;
+    if (!frames && any_made && vk_fsr3fi_wanted()) {
+        if (fi && fi->valid)
+            by_amd = vk_fsr3fi_generate(cb, fi, S.hist[cur].view, S.hist[prev].view, S.made.view, uw, uh);
+        else
+            say(SAY_NOFI, "fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler (upscaler = dlss, "
+                          "fsr3 or fsr4, with the 3D drawn below the output size): the built-in interpolation makes this "
+                          "frame", 0);
+    }
+    if (by_amd) S.made_n++, S.by_fsr++;
+    if (any_made && !by_amd) {
         in[0] = (VkDescriptorImageInfo){S.nearest, S.luma_img[prev].view, G};
         in[1] = (VkDescriptorImageInfo){S.nearest, S.luma_img[cur].view, G};
         pass(cb, &S.flow, in, S.flow_img[0].view, fw, fh, NULL, 0);
@@ -717,9 +734,9 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], ui
     return 2;   // Auto: also a set of no frames, when the game outruns the display and this frame has no refresh
 }
 
-int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], uint64_t frame_no) {
+int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no) {
     plat_mutex_lock(&fgl);
-    int r = record(src, fmt, w, h, crop, frame_no);
+    int r = record(src, fmt, w, h, crop, fi, frame_no);
     // a frame the display thread does not get is presented by the caller (or by vk_fg_show): the sets before it go out first
     if (r != 2) display_idle();
     plat_mutex_unlock(&fgl);

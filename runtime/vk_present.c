@@ -727,6 +727,7 @@ void vk_present_release(void) {
         vk_fsr_release();
         vk_smaa_release();
         vk_fg_release();
+        vk_fsr3fi_release();
         vk_color_release();
         vk_hdr_release();
         free_capture();

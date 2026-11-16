@@ -34,7 +34,7 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; VkFiInputs fi; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -89,7 +89,8 @@ static void present_main(void *arg) {
         // `made` replaces the blit below, and busy goes down as soon as that buffer is submitted; 1 is 2x, shown by
         // vk_fg_show below, 2 is Auto and 3x to 8x, whose display thread presents the frames, so this thread is free for
         // the next job at once
-        int made = vk_fg_record(j.image, j.format, j.w, j.h, j.has_crop ? j.crop : NULL, flight_on ? j.frame : 0);
+        int made = vk_fg_record(j.image, j.format, j.w, j.h, j.has_crop ? j.crop : NULL, &j.fi,
+                                flight_on ? j.frame : 0);
         if (!made) {
             if (flight_on) vk_thumbs_frame(j.frame);
             vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
@@ -157,6 +158,9 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
     }
     vk_upload_flush(0);   // an upload vk_texture_get just recorded goes before the blit
+    // The depth and motion the temporal upscaler was given for this frame (vk_fsr3fi.c): taken here, on the thread that
+    // recorded the frame, before the next frame's are noted
+    vk_fsr3fi_take(&j.fi);
     plat_mutex_lock(&pl);
     if (!present_thread) {
         if (!plat_thread_spawn(present_main, NULL, "vk present", 0)) rt_fatal("vk: cannot start the present thread");

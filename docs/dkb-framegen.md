@@ -1,6 +1,6 @@
 # Frame generation (experimental)
 
-Off by default. Code: `runtime/vk_framegen.c`, pacing arithmetic in `runtime/fg_pace.h`, shaders in `runtime/shaders/fg_*.comp`.
+Off by default. Code: `runtime/vk_framegen.c`, pacing arithmetic in `runtime/fg_pace.h`, shaders in `runtime/shaders/fg_*.comp`; AMD FSR 3.1's frame interpolation as the other way to make the frames at 2x: `runtime/vk_fsr3fi.c` (see "AMD FSR 3.1 frame interpolation" below).
 
 ## What it does
 
@@ -50,6 +50,21 @@ Hookshot's own log on the same machine at Auto: 806 to 827 frames per 5 s, 714 t
 
 Set `frame_gen` in `dkb.ini` (or `TOTK_FRAME_GEN` in the environment) to `auto` or `2x` to `8x`. It can be changed while running (turning it off frees the images; another multiplier rebuilds them and starts the history again).
 
+## AMD FSR 3.1 frame interpolation (`frame_gen_by = fsr3`, experimental)
+
+`frame_gen_by` (`TOTK_FRAME_GEN_BY`, live) chooses what makes the frame at 2x: `builtin` (the default) is the interpolation above, which sees the picture only; `fsr3` is AMD's FSR 3.1 frame interpolation, which also uses the scene's depth and motion and an optical flow over the two pictures. The passes are AMD's own (FidelityFX SDK v1.1.4, commit `c6efa6bf7f2027b3ec94f28578bb5965eabb9e55`: ten frame interpolation passes, seven optical flow passes) compiled from `runtime/third_party/fidelityfx` by `tools/build_shaders.py` (`runtime/fsr3_fi_*_spv.h`, `runtime/fsr3_of_*_spv.h`) and recorded by `runtime/vk_fsr3fi.c` as compute dispatches; no AMD library is loaded.
+
+The depth and motion are the temporal upscaler's: `vk_dlss.c` `vk_temporal_inputs` makes them for DLSS, FSR 3.1 and FSR 4, and `vk_temporal_done` hands them to `vk_fsr3fi_note`. So AMD's frame is made only when:
+
+- `frame_gen = 2x` (FSR 3.1's interpolation makes the midpoint only; Auto and 3x to 8x always use the built-in one);
+- a temporal upscaler drew this frame's 3D (`upscaler = dlss`, `fsr3` or `fsr4`, with the 3D below the output size, so that a scene was noted at the input size), and the projection is a perspective one;
+- the GPU has push descriptors, storage images without a format and the subgroup arithmetic and quad operations the passes need (the log says what is missing);
+- the history is there: the first frame after a gap, a resize or a camera cut is made by the built-in interpolation, as is any frame the passes refuse (a picture whose shape is not the 3D's).
+
+Otherwise the built-in frame is made, with no other change to frame generation. The game's HUD is part of the picture the passes read, so it is interpolated with the scene, as it is by the built-in interpolation; AMD's SDK can take the picture without the HUD as well, which this runtime does not make yet.
+
+Log lines: `fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU` and `fsr3fi: 17 pass pipelines ready` once the setting is chosen on a capable device, `fsr3fi: making the 2x frames at WxH from RWxRH depth and motion` at the first frame it makes, and `by AMD FSR 3.1 N` in the 2x `fg:` line (below), which counts the made frames AMD's passes made. `fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler ...` says once that a frame had none.
+
 ## Requirements
 
 Without these, no made frames are produced (one log line says why) and presentation is unchanged:
@@ -75,11 +90,11 @@ A skipped frame is shown as the game's frame alone.
 
 At 2x, every 5 seconds:
 
-`fg: 5.0 s: real R fps, shown S fps, made N; skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
+`fg: 5.0 s: real R fps, shown S fps, made N (by AMD FSR 3.1 M); skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
 
 - real: game frames per second.
 - shown: real plus made frames per second.
-- made: made frames in the period.
+- made: made frames in the period; by AMD FSR 3.1: those AMD's passes made (`frame_gen_by = fsr3`), the rest the built-in interpolation.
 - skipped: made frames not produced, by reason (see above).
 - real cut short: the game's frame was flipped before its half-interval wait ended because a newer frame was already waiting.
 - late >2 ms: the game's frame flipped more than 2 ms after its due time.
@@ -107,4 +122,4 @@ The set-up line says the mode: `fg: frame generation Auto on (experimental): a f
 
 ## Attribution
 
-The shaders and the approach come from Hookshot (<https://github.com/NotRexed/Hookshot>, GPL-3.0); Auto, the multipliers above 2x, the sets and the display thread from <https://git.notrexed.dev/Hookshot/Hookshot>. See `THIRD_PARTY_NOTICES.md`.
+The shaders and the approach come from Hookshot (<https://github.com/NotRexed/Hookshot>, GPL-3.0); Auto, the multipliers above 2x, the sets and the display thread from <https://git.notrexed.dev/Hookshot/Hookshot>. AMD FSR 3.1 frame interpolation: the passes are AMD's FidelityFX SDK (MIT), the dispatches follow Hookshot's `vk_fsr3fi.cpp` (<https://git.notrexed.dev/Hookshot/Hookshot>). See `THIRD_PARTY_NOTICES.md`.

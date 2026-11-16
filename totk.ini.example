@@ -183,6 +183,13 @@
 # the picture's size changes, for the game's own HDR picture, when the display's refresh is below the rate asked, or
 # unless vk_present is mailbox or immediate. Changes while the game runs take effect at once.
 # frame_gen = off
+# What makes the frames of frame_gen = 2x (experimental): builtin, the default, from the picture alone; fsr3, AMD FSR 3.1's
+# frame interpolation, which also uses the scene's depth and motion. fsr3 runs only while a temporal upscaler (upscaler =
+# dlss, fsr3 or fsr4) draws the 3D below the output size, at 2x, with the display's refresh over twice the game's rate; a
+# frame it cannot make (no depth or motion, a camera cut, the first frame after a gap) gets the built-in one, and the other
+# frame_gen values always use the built-in one. The game's HUD is interpolated with the scene. Changes while the game runs
+# take effect at once.
+# frame_gen_by = builtin
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
