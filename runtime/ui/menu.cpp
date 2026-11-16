@@ -32,6 +32,7 @@ static int g_font_bad;
 #pragma clang diagnostic pop
 #include "ui/binds_page.h"
 #include "ui/option_rows.h"
+#include "ui/perf_counter.h"
 
 extern "C" {
 #include "cfg.h"
@@ -809,7 +810,7 @@ static void rows_display_output(void) {
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("TOTK_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC, present_note());
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL,
-                                     UI_MENU_PERF_BREAKDOWN};
+                                     UI_MENU_PERF_BREAKDOWN, UI_MENU_PERF_COUNTER};
     opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 4, UI_MENU_PERF_OVERLAY_DESC);
     row_gpu();
 }
@@ -1331,20 +1332,22 @@ static int g_save_pending;   // a changed setting still waits for its write to t
 // (menu.mm): the machine's load and temperatures, the frame rate and frame times with a graph, the render thread's waits.
 // "breakdown": the full panel with each frame's parts stacked in the graph's columns (perfmon.h PERF_PART_*), and a
 // legend of the parts' means.
+// "counter": the same frame rate as "fps" (the game's own presents), drawn as a large outlined number with no plate
+// (ui/perf_counter.cpp).
 // Off, it costs a cfg_version load per present.
 static unsigned g_perf_ver = ~0u;
-static int g_perf_mode;                  // 0 off, 1 fps, 2 full, 3 breakdown
+static int g_perf_mode;                  // 0 off, 1 fps, 2 full, 3 breakdown, 4 counter
 static std::atomic<int> g_perf_save;     // F10 changed the mode: totk.ini is written on the present thread
 static uint64_t g_perf_last_ns, g_perf_win_ns, g_perf_max_ns;
 static int g_perf_frames;
-static char g_perf_text[96];
+static char g_perf_text[96];             // fps mode: the line; counter mode: the number alone
 
 static int perf_mode_of(const char *s) {
-    return !strcmp(s, "breakdown") ? 3 : !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0;
+    return !strcmp(s, "counter") ? 4 : !strcmp(s, "breakdown") ? 3 : !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0;
 }
 
 extern "C" void menu_perf_cycle(void) {
-    static const char *const modes[] = {"off", "fps", "full", "breakdown"};
+    static const char *const modes[] = {"off", "fps", "full", "breakdown", "counter"};
     cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 4]);
     g_perf_save.store(1);
 }
@@ -1381,12 +1384,12 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
         int m = perf_mode_of(cfg_value("TOTK_PERF_OVERLAY"));
         if (m != g_perf_mode) {
             g_perf_last_ns = 0, g_perf_text[0] = 0;
-            if (m >= 2) perf_gpu_once(t);
-            perfmon_mode(m);
+            if (m == 2 || m == 3) perf_gpu_once(t);
+            perfmon_mode(m == 4 ? 1 : m);   // the counter only needs the presents' times, as fps
         }
         g_perf_mode = m;
     }
-    if (g_perf_mode != 1) return;
+    if (g_perf_mode != 1 && g_perf_mode != 4) return;
     uint64_t d = now - g_perf_last_ns;
     if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
         g_perf_win_ns = g_perf_max_ns = 0;
@@ -1396,7 +1399,8 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
         g_perf_frames++;
         if (d > g_perf_max_ns) g_perf_max_ns = d;
         if (g_perf_win_ns >= 500000000ull) {
-            snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), g_perf_frames * 1e9 / g_perf_win_ns);
+            snprintf(g_perf_text, sizeof g_perf_text, g_perf_mode == 4 ? "%.0f" : menu_text(UI_PERF_LINE_FPS),
+                     g_perf_frames * 1e9 / g_perf_win_ns);
             g_perf_win_ns = g_perf_max_ns = 0;
             g_perf_frames = 0;
         }
@@ -1622,11 +1626,12 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
 }
 
 static void perf_draw(const MenuTarget *t, float scale) {
-    if (g_perf_mode >= 2) return perf_full_draw(t, scale);
+    if (g_perf_mode == 2 || g_perf_mode == 3) return perf_full_draw(t, scale);
     float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
     // with the menu open: under its window, over the dimming layout_menu drew before
     ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+    if (g_perf_mode == 4) return perf_counter_draw(dl, scale, w, g_perf_text, menu_text(UI_PERF_FPS_LABEL));
     ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
     float pad = 6 * scale;
     ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);   // the top right corner: the game's HUD leaves it empty

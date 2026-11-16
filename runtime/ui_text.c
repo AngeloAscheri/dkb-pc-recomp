@@ -89,12 +89,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "Choose which graphics card runs the game. Use Automatic unless you need to select a specific card.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Full also shows a frame time graph and hardware statistics. "
+    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Counter shows it as a large number with no background. Full also shows a frame time graph and hardware statistics. "
                                   "Breakdown splits each frame in the graph into its parts: the game's own work, the GPU frame prep, "
                                   "the waits by what was waited for, and the frame rate limit. Press F10 to cycle through the modes.",
     [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full", [UI_MENU_PERF_BREAKDOWN] = "Breakdown",
+    [UI_MENU_PERF_COUNTER] = "Counter",
     // printf format of the overlay line in FPS mode: the frame rate
     [UI_PERF_LINE_FPS] = "%.0f fps",
+    // the small label beside the number in Counter mode
+    [UI_PERF_FPS_LABEL] = "FPS",
     [UI_MENU_RESOLUTION_GROUP] = "Resolution",
     [UI_MENU_DISPLAY_OUTPUT] = "Display output",
     [UI_MENU_RENDER_OPTIONS] = "Render Options",
@@ -478,12 +481,14 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Полный» добавляет время кадров с графиком, "
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Счётчик» показывает её крупным числом без фона. «Полный» добавляет время кадров с графиком, "
                                   "загрузку ЦП, GPU и памяти, температуры и ожидания потока отрисовки. F10 переключает "
                                   "режимы. «Разбивка» делит каждый кадр на графике на части: работа самой игры, подготовка "
                                   "кадра для GPU, ожидания по причинам и ограничение кадров.",
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный", [UI_MENU_PERF_BREAKDOWN] = "Разбивка",
+    [UI_MENU_PERF_COUNTER] = "Счётчик",
     [UI_PERF_LINE_FPS] = "%.0f к/с",
+    [UI_PERF_FPS_LABEL] = "к/с",
     [UI_MENU_RESOLUTION_GROUP] = "Разрешение",
     [UI_MENU_DISPLAY_OUTPUT] = "Вывод изображения",
     [UI_MENU_RENDER_OPTIONS] = "Настройки рендеринга",
