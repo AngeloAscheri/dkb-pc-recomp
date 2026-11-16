@@ -22,6 +22,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "temporal_idle.h"
 #include "vk.h"
 
 #include "fsr3_accumulate_spv.h"
@@ -756,6 +757,27 @@ int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
                (unsigned long long)G.frames, (unsigned long long)G.temporal, (unsigned long long)G.resets, w, h, ow, oh,
                t.jx, t.jy, t.phases);
     return 1;
+}
+
+// Whether the internal images exist.
+int vk_fsr3_holding(void) { return G.output.image != VK_NULL_HANDLE; }
+
+// The setting has chosen another upscaler for a while (vk_dlss.c vk_temporal_idle_tick): the internal images, about 40
+// to 60 MB at 1280x800 and some 320 MB at 4K, are freed once the submissions recorded so far are done (drop_image,
+// which is vk_defer_image and vk_defer_view: the objects go when the recorded work that may use them is done), and the
+// next evaluation makes them again (make_images, with a new history: G.first). The passes, samplers and constants
+// buffer stay: they are small, and building pipelines again would stall the frame that brings FSR 3.1 back. The
+// constants ring needs nothing: a slot is free once its submission is done, and the idle frames have used none.
+// Longshot's equivalent is release() in gpu/vk/vk_fsr3.cpp (commit e314e2b7), which hands its retired images to the
+// chain's later().
+void vk_fsr3_idle_release(void) {
+    if (!G.output.image || vk_fsr3_wanted()) return;
+    size_t n;
+    Img *const *all = all_images(&n);
+    for (size_t i = 0; i < n; i++) drop_image(all[i]);
+    G.rw = G.rh = G.uw = G.uh = 0;
+    rt_log("fsr3: not used for %u frames: its images let go; the next upscale with it makes them again",
+           TEMPORAL_IDLE_FRAMES);
 }
 
 void vk_fsr3_release(void) {   // device idle
