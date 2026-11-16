@@ -48,7 +48,7 @@ Hookshot's own log on the same machine at Auto: 806 to 827 frames per 5 s, 714 t
 
 ## Turning it on
 
-Set `frame_gen` in `dkb.ini` (or `TOTK_FRAME_GEN` in the environment) to `auto` or `2x` to `8x`. It can be changed while running (turning it off frees the images; another multiplier rebuilds them and starts the history again).
+The Display tab of the settings menu (F1) has the Frame generation row (a note under it says that VSync makes no frames) and, at 2x, a Made by row for `frame_gen_by`. Or set `frame_gen` in `dkb.ini` (or `TOTK_FRAME_GEN` in the environment) to `auto` or `2x` to `8x`. It can be changed while running (turning it off frees the images; another multiplier rebuilds them and starts the history again).
 
 ## AMD FSR 3.1 frame interpolation (`frame_gen_by = fsr3`, experimental)
 

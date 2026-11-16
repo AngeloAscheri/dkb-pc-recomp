@@ -44,9 +44,10 @@ typedef struct {
     float part_ms[PERF_PARTS];
 } PerfStats;
 
-// Overlay mode 0 off, 1 fps, 2 full, 3 breakdown (TOTK_PERF_OVERLAY), from the present path when the setting changes.
-// Full and breakdown start the machine sampling thread (twice a second) and turn on the event counts and GPU
-// timestamps; leaving them stops those. Off: perf_present skips perfmon_frame and nothing samples.
+// Overlay mode 0 off, 1 fps, 2 full, 3 breakdown, 4 counter (TOTK_PERF_OVERLAY), from the present path when the setting
+// changes. Full and breakdown start the machine sampling thread (twice a second) and turn on the event counts and GPU
+// timestamps; leaving them stops those. The counter is like fps: no hardware sampler. Off: perf_present skips
+// perfmon_frame and nothing samples.
 void perfmon_mode(int mode);
 // The Vulkan device the game renders on: its name, its LUID (8 bytes; NULL when the driver gives none), its PCI bus
 // (-1 unknown) and its device-local memory. Before the first perfmon_mode(2).

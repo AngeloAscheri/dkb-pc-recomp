@@ -636,6 +636,18 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
 int vk_fsr4_wants_descriptor_buffer(void);
 void vk_fsr4_descriptor_buffer(int enabled);
 void vk_fsr4_release(void);
+// An upscaler the setting no longer chooses gives back what it holds (temporal_idle.h for the rule).
+// vk_temporal_idle_tick (vk_dlss.c) asks once per presented frame, on the replay thread, from op_dispatch; fence is
+// the submission being recorded, which everything that may still use the released objects was recorded in or before.
+// xxx_holding: there is something to give back. xxx_idle_release: gives it back once the GPU is done with it
+// (vk_defer_*, or the fence), and does nothing while the upscaler is chosen again. The next evaluation makes it again.
+// FSR 4's has only its context (its images are the temporal inputs of vk_dlss.c, which the tick frees once no temporal
+// upscaler is chosen).
+void vk_temporal_idle_tick(uint64_t fence);
+int vk_fsr3_holding(void);
+void vk_fsr3_idle_release(void);
+int vk_fsr4_holding(void);
+void vk_fsr4_idle_release(uint64_t fence);
 // An FSR upscaler (3.1 or 4) is chosen: the scene's draws are jittered and noted for it.
 static inline int vk_fsr_wanted(void) { return vk_fsr3_wanted() || vk_fsr4_wanted(); }
 // Any temporal upscaler is chosen.

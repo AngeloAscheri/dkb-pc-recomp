@@ -49,6 +49,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "temporal_idle.h"
 #include "vk.h"
 #include "vk_rec.h"
 
@@ -769,6 +770,42 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
                (unsigned long long)G.frames, (unsigned long long)G.temporal, (unsigned long long)G.resets, w, h, ow, oh,
                t.jx, t.jy, t.phases);
     return 1;
+}
+
+// Whether there is anything to give back: the context, one waiting in the grave, or any of the images of this file's own
+// (the input pass's colour, depth and motion, the output, the unit exposure).
+int vk_fsr4_holding(void) {
+    if (G.context || G.color.image || G.depth.image || G.motion.image || G.output.image || G.exposure.image) return 1;
+    for (int i = 0; i < GRAVE; i++)
+        if (G.grave[i].c) return 1;
+    return 0;
+}
+
+// The setting has chosen another upscaler for a while (vk_dlss.c vk_temporal_idle_tick). Two things go. The images of
+// this file's own (the input pass's colour, depth and motion, the output, the exposure) go through drop_image, which is
+// vk_defer_image and vk_defer_view: freed once the submissions recorded so far are done. AMD's context, which holds the
+// library's own images and pipelines, is retired as one replaced by a new output size is (retire): destroyed in the
+// grave once the submission being recorded is done (sweep), the same ffxDestroyContext call a resize already makes
+// during play. The library stays loaded, and so do the input pass's pipeline and its layouts, as FSR 3.1's
+// pipelines do (a pipeline has no deferred free and holds little). What a long idle adds is that the images and the
+// context made again cost what images and make_context log, at the frame that chooses FSR 4 again; that frame's reset
+// is set (reset_ctx). The depth and motion that vk_dlss.c's temporal inputs hold are freed by its own tick. A full grave
+// leaves the context in place and the next frame asks again; the images go either way.
+void vk_fsr4_idle_release(uint64_t fence) {
+    sweep();
+    if (vk_fsr4_wanted()) return;
+    int images = G.color.image || G.depth.image || G.motion.image || G.output.image || G.exposure.image;
+    Img *all[] = {&G.color, &G.depth, &G.motion, &G.output, &G.exposure};
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) drop_image(all[i]);
+    G.exposure_set = 0;
+    int context = 0;
+    if (G.context) {
+        for (int i = 0; i < GRAVE && !context; i++)
+            if (!G.grave[i].c) context = retire(fence);   // retire would destroy the oldest entry early when every slot is in flight
+    }
+    if (images || context)
+        rt_log("fsr4: not used for %u frames: %s%s%s let go; the next upscale with FSR 4 makes them again", TEMPORAL_IDLE_FRAMES,
+               images ? "its images" : "", images && context ? " and " : "", context ? "AMD's context" : "");
 }
 
 void vk_fsr4_release(void) {   // device idle
