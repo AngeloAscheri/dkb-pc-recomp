@@ -675,6 +675,11 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
     present_image(src, layout, fmt, w, h, crop, 1);
 }
 
+// The present lock, for a caller that must not present after vk_present_release freed what it presents (vk_framegen.c
+// display_main): the release runs under it.
+void vk_present_lock(void) { plat_rmutex_lock(&g_pl); }
+void vk_present_unlock(void) { plat_rmutex_unlock(&g_pl); }
+
 void vk_present_flip(void) {
     plat_rmutex_lock(&g_pl);
     flip_locked();
