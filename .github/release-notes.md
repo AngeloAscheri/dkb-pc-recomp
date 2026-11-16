@@ -51,6 +51,7 @@ Thank you to everyone who sent code. Each one below is on `bananza` since 0.4.0:
 - #345 Run DLSS, FSR 3.1 and FSR 4 as native anti-aliasing at scene_res = full (@roverdrubber)
 - #346 Add AMD FSR 3.1 frame interpolation as a way to make frame generation's 2x frames (frame_gen_by = fsr3) (@roverdrubber)
 - #347 Pace the audio renderer evenly instead of in bursts after each device period (@Gabinou22s)
+- #356 Refill a behind audio queue at once, drop the dead device pacing path (@Gabinou22s)
 - #348 Give AMD FSR 3.1 frame interpolation the frames without their HUD, so the HUD is not moved with the scene (@roverdrubber)
 - #349 Add Frame generation and its Made by row to the Display tab (@roverdrubber)
 - #350 Add a Counter value to the performance overlay: a large FPS number with a small label, after Hookshot's (@roverdrubber)
