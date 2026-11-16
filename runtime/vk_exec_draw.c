@@ -1191,13 +1191,20 @@ static uint64_t stage_origin(DrawCtx *dc, const prog_t *p, int nvn_stage) {
 // the lock once a submission; keyed on the pool generation, the locked read took 3.7% of the slices' recording on
 // Canyon Layer instead of 4.4%. Most of the rest were collisions: with 256 entries, two texture ids sharing one sent
 // a tenth of the lookups to the lock. With TK_N (2048) 1.1% go there, and the Canyon Layer replay took 10.6 ms a frame
-// instead of 11.3 (three runs each, interleaved).
+// instead of 11.3 (three runs each, interleaved). TOTK_DESC_KEEP=0 keys them on vk_mem_gen again, with the descriptor
+// memos (desc_keep, descriptor_state), so that they start every submission empty as before.
+static int desc_keep(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("DESC_KEEP", "1");
+    return RT_KNOB_ON(mode);
+}
+
 static uint64_t token_of(const VkExec *ex, uint64_t h) {
     if (!h) return 1;
     DrawCtx *const dc = DC_OF(ex);
     int id = (int)(h & 0xfffff);
     uint32_t sg = vk_texture_slots_gen();
-    uint64_t mg = vk_mem_pool_gen();
+    uint64_t mg = desc_keep() ? vk_mem_pool_gen() : vk_mem_gen();
     typeof(dc->tk[0]) *k = &dc->tk[(id ^ id >> 11) & (TK_N - 1)];
     if (k->tok && k->pool == ex->tex_pool.addr && k->id == (uint32_t)id && k->mg == mg) {
         if (k->sg == sg) return k->tok;
@@ -3700,14 +3707,13 @@ static int skip_fs_listed(const VkExec *ex) {
 // and their address mappings stay unchanged. A sampler table switch also changes combined image descriptors.
 // The mappings are vk_mem_pool_gen's: vk_mem_gen also moves at every submission's start and with the buffer mirrors,
 // which no descriptor key reads, and under it every memo here started each submission empty.
-// TOTK_DESC_KEEP=0 keys them on vk_mem_gen as before, so that they start every submission empty again; ab alternates
-// the two with the A/B blocks, which is how the gain of keeping them is measured inside one run.
+// TOTK_DESC_KEEP=0 keys them on vk_mem_gen as before, so that they start every submission empty again, and the texture
+// slot tokens with them (token_of); ab alternates the two with the A/B blocks, which is how the gain of keeping them is
+// measured inside one run.
 static void descriptor_state(VkExec *ex) {
     DrawCtx *const dc = DC_OF(ex);
     typeof(dc->desc_last) *const last = &dc->desc_last;
-    static int mode = -1;
-    if (mode < 0) mode = rt_knob("DESC_KEEP", "1");
-    int keep = RT_KNOB_ON(mode);
+    int keep = desc_keep();
     uint64_t mg = keep ? vk_mem_pool_gen() : vk_mem_gen();
     uint32_t sg = vk_texture_slots_gen();
     if (last->ex != ex || last->tex.addr != ex->tex_pool.addr || last->tex.count != ex->tex_pool.count ||
