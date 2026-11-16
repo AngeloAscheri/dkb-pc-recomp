@@ -402,6 +402,16 @@ static int create_device(void) {
                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
         }
     }
+#ifdef VK_AMD_anti_lag
+    // AMD Anti-Lag 2 (vk_antilag.c): enabled wherever the device has it, so the setting needs no restart; enabled alone
+    // it does nothing. Before the graphics pipeline library pair, which must stay the last two entries of the extension
+    // list and the last link of the chain for the n_ext -= 2 and *gpl_link = NULL below.
+    int has_antilag_ext = n_ext < 45 && has_ext(ep, ne, VK_AMD_ANTI_LAG_EXTENSION_NAME);
+    if (has_antilag_ext) {
+        ext[n_ext++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
+        CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
+    }
+#endif
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -410,16 +420,6 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
-
-#ifdef VK_AMD_anti_lag
-    // AMD Anti-Lag 2 (vk_antilag.c): enabled wherever the device has it, so the setting needs no restart; enabled alone
-    // it does nothing
-    int has_antilag_ext = n_ext < 47 && has_ext(ep, ne, VK_AMD_ANTI_LAG_EXTENSION_NAME);
-    if (has_antilag_ext) {
-        ext[n_ext++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
-        CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
-    }
-#endif
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
