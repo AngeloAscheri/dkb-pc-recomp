@@ -59,6 +59,12 @@ enum { PAR_WHY_UNSEEN, PAR_WHY_NONE, PAR_WHY_NEW, PAR_WHY_SMALL, PAR_WHY_BANNED,
 // begins (vk_exec_draw_twins_copy), learned from the slices that needed one (vk_exec_par_twin).
 #define PAR_TWINS 4
 typedef struct { uint64_t sig; uint32_t draws; uint8_t banned, ntwin; uint32_t twin[PAR_TWINS]; } ParHist;
+typedef struct { int n; uint32_t id[PAR_TWINS]; } ParTwins;
+// The depth twins the replay thread copied for an unsliced pass (vk_exec_draw.c twin_prepare), kept for its target
+// set's history until the pass ends (vk_exec_pass_end): its next sliced pass copies them ahead, and its slices do not
+// sample the colour image first (VUID-vkCmdDrawIndexed-None-06479).
+static ParTwins par_seen;
+static uint64_t par_seen_sig;
 static ParHist par_hist[PAR_HIST];
 static int par_mode = -1;                       // DKB_REPLAY_THREADS: 0 off, else the threads (stage A: 1)
 static int par_threads(void);
@@ -70,7 +76,7 @@ static uint64_t par_wait_max, par_wait_long;   // the longest wait for the worke
 #define PAR_DEFER_DEPTH 4
 #define PAR_CAP_ROOM 4096   // capture words a pass end may take (vk_rec.c CAP_WORDS): the end, its query, BC copies
 static int par_defer_mode = -1;
-static struct { int s0, s1; uint64_t sig; uint32_t cap_lo, cap_hi; } PDQ[PAR_DEFER_DEPTH];
+static struct { int s0, s1; ParTwins twin; uint64_t sig; uint32_t cap_lo, cap_hi; } PDQ[PAR_DEFER_DEPTH];
 static int pd_head, pd_n;
 static volatile uint8_t pdone[1024];   // PAR_MAX_SLICES: each slice of the batch is recorded
 // A slice is begun only once the slices of the passes before its own are recorded (par_ready): a slice changes the
@@ -124,6 +130,7 @@ static struct {
     VkQueryControlFlags soqf[PAR_MAX_SLICES];
     int draws, slice_draws, slice_size;
     int expect;                                  // draws this piece of the pass took the last time (par_expect)
+    ParTwins twin;                               // the twins its set had learned when it began (par_outputs)
     int oq;                                      // an occlusion query spans the pass: the slices inherit it
     VkQueryControlFlags oq_flags;
 } PC;
@@ -854,6 +861,14 @@ void vk_exec_pass_end(VkExec *ex) {
             par_unsliced[pass_draws < 64 ? 0 : pass_draws < 256 ? 1 : pass_draws < 1024 ? 2 : 3] += pass_draws;
         ParHist *e = par_find(sig, pass_draws >= PAR_MIN_DRAWS);
         if (e) e->draws = pass_draws >= e->draws ? pass_draws : e->draws - e->draws / 8;
+        if (e && par_seen.n && par_seen_sig == sig) {   // twins its draws needed (vk_exec_par_twin_seen)
+            for (int i = 0; i < par_seen.n; i++) {
+                int j = 0;
+                while (j < e->ntwin && e->twin[j] != par_seen.id[i]) j++;
+                if (j == e->ntwin && e->ntwin < PAR_TWINS) e->twin[e->ntwin++] = par_seen.id[i];
+            }
+            par_seen.n = 0;
+        }
         uint32_t *x = par_expect(par_piece_key(sig, 1), pass_draws >= PAR_MIN_DRAWS);
         if (x) *x = pass_draws;
     }
@@ -1823,6 +1838,15 @@ static void par_log(void) {
 static int par_collecting(void) { return PC.on; }
 void vk_exec_par_hazard(void) { if (!par_hazard) par_hazard = 1; }
 void vk_exec_par_order_hazard(void) { if (par_hazard < 2) par_hazard = 2; }
+void vk_exec_par_twin_seen(VkExec *ex, uint32_t id) {
+    if (!par_mode || ex != &X) return;
+    uint64_t sig = par_sig(ex);
+    if (sig != par_seen_sig) par_seen.n = 0, par_seen_sig = sig;
+    for (int i = 0; i < par_seen.n; i++)
+        if (par_seen.id[i] == id) return;
+    if (par_seen.n < PAR_TWINS) par_seen.id[par_seen.n++] = id;
+}
+
 void vk_exec_par_twin(uint32_t id) {
     for (int i = 0; i < par_ntw && i < PAR_TWINS; i++)
         if (par_tw[i] == id) return;
@@ -1952,8 +1976,21 @@ static int par_start(VkExec *ex) {
         par_restarts++;
     }
     // The depth twins this target set's slices needed before: copied now, outside the pass, since a slice cannot end
-    // the pass to copy them (vk_exec_draw.c twin_prepare). The pass's slices read them from its snapshot below.
-    int twins = e->ntwin ? vk_exec_draw_twins_copy(ex, e->twin, e->ntwin) : 0;
+    // the pass to copy them (vk_exec_draw.c twin_prepare). The pass's slices read them from its snapshot below. An id
+    // whose texture no longer needs a twin is dropped. One that still does stays while the set samples it or not: up
+    // to PAR_TWINS are copied for every sliced pass of the set, and a set past that many misses the others until it is
+    // left unsliced. If the pass does not open below (queries, no pass), the copies were made for nothing, which only
+    // costs their time.
+    uint32_t gone = 0;
+    int twins = e->ntwin ? vk_exec_draw_twins_copy(ex, e->twin, e->ntwin, &gone) : 0;
+    if (gone) {
+        int k = 0;
+        for (int i = 0; i < e->ntwin; i++)
+            if (!(gone >> i & 1)) e->twin[k++] = e->twin[i];
+        e->ntwin = (uint8_t)k;
+    }
+    ParTwins known = {e->ntwin};
+    memcpy(known.id, e->twin, sizeof known.id);
     VkQueryControlFlags qf = 0;
     int qopen = 0, q = vk_exec_oq_begin_outside(ex, &qf, &qopen);
     if (q < 0) return pass_why = PAR_WHY_QUERY, pass_tried = 1, par_skipped_oq++, 0;
@@ -1976,7 +2013,7 @@ static int par_start(VkExec *ex) {
     vk_exec_draw_twins_snap(ex, PC.upd, twins);            // and the depth twins copied above
     uint32_t *x = par_expect(par_piece_key(sig, 0), 0);
     PC.expect = (int)(x && *x ? *x : e->draws);
-    PC.on = 1, PC.sig = sig, PC.draws = 0;
+    PC.on = 1, PC.sig = sig, PC.draws = 0, PC.twin = known;
     PC.slice_size = PC.slice_draws = par_size();   // the first draw starts a slice
     par_t0 = kern_now_ns();
     par_wake_workers();   // they spin while the pass is collected
@@ -2210,7 +2247,8 @@ static void par_start_workers(void) {
 static int par_defer_ok(const VkExec *ex);
 static void par_defer(VkExec *ex);
 static void par_wait_range(int s0, int s1, uint64_t t1);
-static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, ParDone **done_out, VkCommandBuffer **cbs_out);
+static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, const ParTwins *known, ParDone **done_out,
+                       VkCommandBuffer **cbs_out);
 static void par_hazards(int hazard, uint64_t sig);
 
 static void par_flush(VkExec *ex) {
@@ -2275,7 +2313,7 @@ static void par_flush(VkExec *ex) {
     par_wait_range(PC.s0, PC.nslices, t1);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(ex, PC.s0, PC.nslices, 0, PC.sig, &done, &cbs);
+    int hazard = par_outputs(ex, PC.s0, PC.nslices, 0, PC.sig, &PC.twin, &done, &cbs);
     uint64_t t3 = kern_now_ns();
     rec_drain();   // the recorder has made every earlier call into the primary
     if (PC.nslices > PC.s0) vkCmdExecuteCommands(ex->cb, (uint32_t)(PC.nslices - PC.s0), cbs);
@@ -2355,7 +2393,7 @@ static void par_spill(void) {
     par_wait_range(d->s0, d->s1, t0);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(&X, d->s0, d->s1, 1, d->sig, &done, &cbs);
+    int hazard = par_outputs(&X, d->s0, d->s1, 1, d->sig, &d->twin, &done, &cbs);
     rec_drain();
     if (d->s1 > d->s0) vkCmdExecuteCommands(X.cb, (uint32_t)(d->s1 - d->s0), cbs);
     rec_capture_play(X.cb, d->cap_lo, d->cap_hi);
@@ -2368,7 +2406,7 @@ static void par_spill(void) {
 static void par_defer(VkExec *ex) {
     __atomic_store_n(&pw_active, 0, __ATOMIC_RELEASE);   // every slice is published: idle workers sleep once none is left
     typeof(PDQ[0]) *d = &PDQ[(pd_head + pd_n++) % PAR_DEFER_DEPTH];
-    d->s0 = PC.s0, d->s1 = PC.nslices, d->sig = PC.sig;
+    d->s0 = PC.s0, d->s1 = PC.nslices, d->sig = PC.sig, d->twin = PC.twin;
     rec_capture_spill(par_spill);
     pd_cur = d, pd_spilled = 0;
     d->cap_lo = rec_capture_begin_for(ex->cb);
@@ -2437,7 +2475,7 @@ static int par_settle_front(VkExec *ex, int wait) {
     par_wait_range(d.s0, d.s1, t0);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(ex, d.s0, d.s1, 1, d.sig, &done, &cbs);
+    int hazard = par_outputs(ex, d.s0, d.s1, 1, d.sig, &d.twin, &done, &cbs);
     ParTail t = {d.s1 - d.s0, cbs, d.cap_lo, d.cap_hi};
     vk_sync_split_finish(par_tail, &t);
     free(cbs);
@@ -2509,12 +2547,15 @@ static void par_wait_range(int s0, int s1, uint64_t t1) {
 
 // Slices [s0, s1) recorded: their command buffers (*cbs, freed by the caller; *done, for the completion), their views
 // into the submission's, and the worst hazard they met. The texture ids whose depth twins they lacked go to the target
-// set's history (sig), for par_start to copy from the next such pass on; an id it had learned already, or one past
-// PAR_TWINS, is a hazard (1): the copy failed or the set needs more twins than are copied, and the draw sampled the
-// colour image, so a set that keeps missing them is left unsliced (par_hazards). held: the pass has ended already, so what the primary's pass
+// set's history (sig), for par_start to copy from the next such pass on. An id the set had learned when the pass began
+// (known: par_start copied it), or one past PAR_TWINS, is a hazard (1): the copy failed or the set needs more
+// twins than are copied, and the draw sampled the colour image, so a set that keeps missing them is left unsliced
+// (par_hazards). An id learned after the pass began, by another slice of it or by a held pass of the same set, is not:
+// each id would otherwise cost the slices that missed it before par_start could copy it. held: the pass has ended already, so what the primary's pass
 // state takes from the slices no longer matters. The recording contexts' frame counters go to vk_exec_frame once no
 // slice is being recorded.
-static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, ParDone **done_out, VkCommandBuffer **cbs_out) {
+static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, const ParTwins *known, ParDone **done_out,
+                       VkCommandBuffer **cbs_out) {
     par_unmerged = 1;
     if (!held && !pd_n) vk_exec_draw_slices_end(par_nworkers + 1), par_unmerged = 0;
     int n = s1 - s0;
@@ -2533,9 +2574,11 @@ static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, ParDo
             ParHist *e = par_find(sig, 1);
             int miss = o->ntw > PAR_TWINS;
             for (int k = 0; k < o->ntw && k < PAR_TWINS; k++) {
-                int j = 0;
+                int j = 0, copied = 0;
+                for (int m = 0; m < known->n; m++) copied |= known->id[m] == o->tw[k];
                 while (j < e->ntwin && e->twin[j] != o->tw[k]) j++;
-                if (j < e->ntwin) miss = 1;
+                if (copied) miss = 1;
+                else if (j < e->ntwin) continue;   // learned since the pass began
                 else if (e->ntwin < PAR_TWINS) {
                     e->twin[e->ntwin++] = o->tw[k];
                     static int told;

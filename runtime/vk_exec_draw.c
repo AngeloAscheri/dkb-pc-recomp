@@ -2385,6 +2385,8 @@ static void twin_prepare(VkExec *ex, const GfxShader *vs, const GfxShader *fs) {
         return;
     }
     if (!n || (IS_HELPER(dc) && vk_spec_fail(VK_SPEC_FEEDBACK))) return;   // the replay thread's pass would restart
+    if (!HELPER_COPY)   // the target set learns them for its sliced passes
+        for (int i = 0; i < n; i++) vk_exec_par_twin_seen(ex, (uint32_t)(ids[i] & 0xfffff));
     uint32_t old = ex->pass_serial;
     vk_exec_pass_end(ex);
     Twin *made[TWINS];
@@ -2409,13 +2411,17 @@ static void twin_prepare(VkExec *ex, const GfxShader *vs, const GfxShader *fs) {
 static Twin *twin_par[TWINS];   // the twins vk_exec_draw_twins_copy copied for the pass about to begin
 static int twin_npar;
 
-int vk_exec_draw_twins_copy(VkExec *ex, const uint32_t *ids, int n) {
-    twin_npar = 0;
+int vk_exec_draw_twins_copy(VkExec *ex, const uint32_t *ids, int n, uint32_t *gone) {
+    twin_npar = 0, *gone = 0;
     if (!twin_df(VK_FORMAT_R32_SFLOAT) && !twin_df(VK_FORMAT_R16_UNORM)) return 0;
     vk_texture_lock();
     for (int i = 0; i < n && twin_npar < TWINS; i++) {
         const VkTexImage *img = vk_texture_by_id_locked(&ex->tex_pool, (int)ids[i], NULL, NULL);
-        if (!img || !twin_format(img)) continue;
+        if (!img || !twin_format(img) ||
+            (VkDeviceSize)img->width * img->height * (img->layers ? img->layers : 1) * 4 > TWIN_MAX) {
+            *gone |= 1u << i;   // the slot holds another texture now, or one twin_prepare would not twin
+            continue;
+        }
         int skip = 0;   // an attachment of the pass is sampled as it is (twin_prepare)
         for (uint32_t k = 0; k < 9; k++) skip |= (k < 8 ? &ex->color[k] : &ex->depth)->image == img->image;
         for (int k = 0; k < twin_npar; k++) skip |= twin_par[k]->src == img->image;

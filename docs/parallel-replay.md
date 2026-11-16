@@ -184,8 +184,10 @@ colour image once and the target set learns the texture (`vk_exec_par_twin`, up 
 of the learned textures before the set's next sliced pass begins (`vk_exec_draw_twins_copy`), and the pass's slices
 read their views from a snapshot of their own (`TwinSnap`, one per update snapshot), since the replay thread copies
 twins for later passes while they record. The replaced twin's image goes after the submission, which holds the pass.
-A texture missed again after it was learned is a hazard, so a target set whose twins cannot be made is left alone after
-eight.
+The twins the replay thread copies for an unsliced pass of the set (`vk_exec_par_twin_seen`) are learned the same way,
+so the set's first sliced pass already has them, and an id whose texture no longer needs a twin is dropped at
+`par_start`. A texture the pass's `par_start` copied that a slice still misses is a hazard (one learned after the pass
+began is not), so a target set whose twins cannot be made is left alone after eight.
 
 ### The key of the draw history
 
