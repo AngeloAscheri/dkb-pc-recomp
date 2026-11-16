@@ -201,7 +201,7 @@ static int build_swapchain(void) {
             g_sc_view[i] = VK_NULL_HANDLE;
         }
         if (old) vkDestroySwapchainKHR(c->device, old, NULL);
-        g_sc = VK_NULL_HANDLE;
+        g_sc = VK_NULL_HANDLE, g_sc_hdr = 0;
         g_sc_n = 0;
         vk_queue_unlock();
         if (hdr) {   // once: vk_hdr_off makes the next pick SDR
