@@ -464,13 +464,16 @@ static void display_main(void *arg) {
             const int64_t due = fg_pace_show_due(timed, st->due[k], next_show, now, at, interval, step);
             wait_until(due);
             const int64_t t = (int64_t)kern_now_ns();
+            // The start lock (gfx_window_start) before the present lock, never under it: the exit holds the start lock
+            // while vk_present_release waits for the present lock (vk_present_image_held).
+            gfx_window_start();
             vk_present_lock();   // the release frees the images under this lock and sets D.dead first
             plat_mutex_lock(&D.mu);   // g_pl, then D.mu: the release's order
             const int live = !D.dead && gen == D.gen;
             plat_mutex_unlock(&D.mu);
             if (live) {
                 if (st->game[k] && st->frame_no) vk_thumbs_frame(st->frame_no);   // the thumbnail and the dump name the game's frame
-                vk_present_image(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
+                vk_present_image_held(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
             }
             vk_present_unlock();
             if (shown_at) {
