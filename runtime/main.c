@@ -285,9 +285,16 @@ static void check_cpu(void) {
     printf("cpu: AArch64 (portable FP/SIMD lowering)\n");
 #else
     __builtin_cpu_init();
+#if defined(__AVX2__)
     int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
-    printf("cpu: x86-64-v3 (AVX2, FMA, BMI2) %s\n", ok ? "present" : "MISSING");
-    CHECK(ok, "the lifted code is built for x86-64-v3");
+    const char *level = "x86-64-v3 (AVX2, FMA, BMI2)";
+#else
+    // A --march v2 build (tools/build_game.py) needs only SSE4.2 and POPCNT, as require_cpu checks at start (#318)
+    int ok = __builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt");
+    const char *level = "x86-64-v2 (SSE4.2, POPCNT)";
+#endif
+    printf("cpu: %s %s\n", level, ok ? "present" : "MISSING");
+    CHECK(ok, "the lifted code is built for %s", level);
 #endif
 }
 
