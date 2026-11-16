@@ -198,21 +198,50 @@ guard recguard main a37a9c a3a388 ptr x11 3dc00160
 # pixels, which the consumer divides by the cache size at x19+0x28/+0x2c). So: every raster size doubles, every
 # multiplier halves, the per-font pixel padding tables double, the ascent doubles and the cache texture doubles.
 set fontk DKB_FONT_SCALE 0
-# SetScale (PLT 1985530) takes the size as 16.16 fixed point: lsl #16 -> lsl #17. Cache fill, then the width, kerning
-# and advance queries (86f42c, 86f65c), which must measure at the same scale because their results use the halved multiplier.
-site fontk main 6f85a0 53103d01 530f3901
-site fontk main 86f4c4 53103ec1 530f3ac1
-site fontk main 86f7e4 53103e81 530f3a81
-site fontk main 86f860 53103e81 530f3a81
-site fontk main 86f8e8 53103e81 530f3a81
-# Ascent in pixels, size * ratio + 0.5 (fmadd at 6f85d8): double the size read from entry +0x36 (s1 is converted here).
-site fontk main 6f85d0 7e21d821 7e21d821 1e212821
+# Big fonts stay at k=1. The area titles (fcpx FontHeadline, 180 px) still came out garbled at 2x while the HUD text
+# (FontCaption, 48 px) was right, so a font whose size is above 96 px keeps the stock raster and layout. The size is the
+# one each site already has: node +0x36 in the cache fill, the size argument (w22 in 86f42c, w20 in 86f65c) in the
+# queries. Every site derives k from that value with the same flag-free test, bit = (96 - size) >> 31 (1 above 96 px),
+# so the raster scale, the ascent, the multipliers and the pixel tables of a glyph always agree. The entry multipliers
+# and tables stay halved and doubled at init (49ebc8.., 49e75c..), and the reading sites undo that when bit is 1.
+# SetScale (PLT 1985530) takes the size as 16.16 fixed point: lsl #16 -> lsl #(17 - bit). Cache fill, then the width,
+# kerning and advance queries (86f42c, 86f65c), which must measure at the same scale as the multiplier they use.
+site fontk main 6f85a0 53103d01 51018501 531f7c21 11004021 1ac12101
+site fontk main 86f4c4 53103ec1 510186c1 531f7c21 11004021 1ac122c1
+site fontk main 86f7e4 53103e81 51018681 531f7c21 11004021 1ac12281
+site fontk main 86f860 53103e81 51018681 531f7c21 11004021 1ac12281
+site fontk main 86f8e8 53103e81 51018681 531f7c21 11004021 1ac12281
 # Multipliers (str of the file's two floats into the entry): halve. s1 is dead (reloaded at the next 49eb18+ use).
 site fontk main 49ebc8 bd001160 1e2c1001 1e210800 bd001160
 site fontk main 49ebd8 bd001560 1e2c1001 1e210800 bd001560
 # Per-font pixel tables used with glyph widths (1c10, 1c28 of the cache): store them doubled. The registers are dead after.
 site fontk main 49e75c 7837796a 531f794a 7837796a
 site fontk main 49e794 78377928 531f7908 78377928
+# Ascent in pixels, size * ratio + 0.5 (fmadd at 6f85d8): the size read from node +0x36 into s1, shifted left by
+# 1 - bit. x9 (consumed at 6f85c4) and x10 are dead until after the call at 6f85e0.
+site fontk main 6f85d0 7e21d821 1e260029 5101852a 531f7d4a 1aca2129 1e230121
+# Fill: the multiplier pair (ldp at 6f87e8) times 2^bit, by adding bit to the exponents (they are 0.5 to 0.6, normal).
+# w9 is rewritten at 6f87ec, x10 at 6f8840/6f88a8/6f8948 before any read.
+site fontk main 6f87e8 2d42252a 2d42252a 79406f49 4b0903e9 11018129 531f7d29 53092129 1e26014a 0b09014a 1e27014a 1e26012a 0b09014a 1e270149
+# Fill: the pixel tables (1c10 at 6f8844, 6f8860, 6f8950, 6f8970; 1c28 at 6f8890, 6f88ac) shifted right by bit, which is
+# exact since init doubled them. The two ldrh sites feed a signed halving of the u16, so they load signed and mask back
+# to 16 bits. x11 is not used between 6f8838 and its next write at 6f8a80.
+site fontk main 6f8844 78e8794a 78e8794a 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb294a
+site fontk main 6f8860 78687929 78e87929 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb2929 12003d29
+site fontk main 6f8890 78e87929 78e87929 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb2929
+site fontk main 6f88ac 78e87929 78e87929 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb2929
+site fontk main 6f8950 78e8794a 78e8794a 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb294a
+site fontk main 6f8970 78687929 78e87929 79406f4b 4b0b03eb 1101816b 531f7d6b 1acb2929 12003d29
+# Width query (86f42c, size w22): multiplier times (bit ? 2.0 : 1.0) through s1 (rewritten at 86f540, w8 at 86f534),
+# table 1c10 shifted right by bit through w10 (unused in the function).
+site fontk main 86f530 bd401100 bd401100 4b1603e8 11018108 531f7d08 53092108 32091908 1e270101 1e210800
+site fontk main 86f538 78f57929 78f57929 4b1603ea 1101814a 531f7d4a 1aca2929
+# Kerning query (86f65c, size w20): the same factor on each multiplier load. x9 is reloaded right after 86f830 and
+# 86f8ac, where s1 is free before the call; at 86f94c and 86f9b8 s1 holds the kerning value, so s2 carries the factor.
+site fontk main 86f830 bd401128 bd401128 4b1403e9 11018129 531f7d29 53092129 32091929 1e270121 1e210908
+site fontk main 86f8ac bd401128 bd401128 4b1403e9 11018129 531f7d29 53092129 32091929 1e270121 1e210908
+site fontk main 86f94c bd401100 bd401100 4b1403e8 11018108 531f7d08 53092108 32091908 1e270102 1e220800
+site fontk main 86f9b8 bd401100 bd401100 4b1403e8 11018108 531f7d08 53092108 32091908 1e270102 1e220800
 # Raster work buffer of the engine that fills the cache (ScalableFontEngine::Initialize at 49e594, size from descriptor
 # +0x88, which the config default f_70004739e0 sets to 0x80000 and nothing overrides): x4, as a glyph bitmap at 2x is
 # four times larger. With 512 KiB AcquireGlyphmap (6f85e0) returns null and the fill reads glyph +0x1e off it. The
