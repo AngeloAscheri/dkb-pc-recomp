@@ -41,7 +41,8 @@ typedef struct VkCtx {
         debug_utils,                       // VK_EXT_debug_utils enabled on the instance (validation or the checkpoints)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
-        has_swapchain_colorspace;           // VK_EXT_swapchain_colorspace enabled on the instance (HDR10 formats)
+        has_swapchain_colorspace,           // VK_EXT_swapchain_colorspace enabled on the instance (HDR10 formats)
+        has_anti_lag;                       // VK_AMD_anti_lag enabled and its antiLag feature there (vk_antilag.c)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -173,14 +174,25 @@ void vk_crt_release(void);
 // into its history and, when the frame before is there, makes the frames between them; frame_no (0: none) goes to
 // vk_thumbs_frame for the game's frame. fi: the scene's depth and motion of this frame (vk_fsr3fi_take), NULL or not
 // valid for none: at 2x with frame_gen_by = fsr3, AMD FSR 3.1's interpolation makes the frame from them (vk_fsr3fi.c).
-// Returns 1 at 2x when a made frame exists (then the caller calls vk_fg_show in place of the blit), 2 when the frames go
-// to the display thread, which presents them (the caller neither blits nor flips), 0 for the plain present (off, no
-// history, a hitch, a failure). The game's texture is read only by the command buffer it submits. vk_fg_show: presents
-// the made frame, then the game's, whose flip waits half a frame interval, or until pending() says another job is
-// waiting.
-int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no);
-void vk_fg_show(int (*pending)(void), uint64_t frame);
+// Returns 1 at 2x when a made frame exists (then the caller calls vk_fg_show in
+// place of the blit), 2 when the frames go to the display thread, which presents them (the caller neither blits nor
+// flips), 0 for the plain present (off, no history, a hitch, a failure). The game's texture is read only by the command
+// buffer it submits. vk_fg_show: presents the made frame, then the game's, whose flip waits half a frame interval, or
+// until pending() says another job is waiting. antilag (both): the game frame's AMD Anti-Lag 2 index, given as its
+// present stage right before the game's own frame is presented (vk_fg_show, or the display thread for a set); made
+// frames get none.
+int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no, uint64_t antilag);
+void vk_fg_show(int (*pending)(void), uint64_t frame, uint64_t antilag);
 void vk_fg_release(void);   // before the device goes away
+// AMD Anti-Lag 2 (vk_antilag.c, TOTK_ANTILAG). vk_antilag_available: the device can run it (0 before the device).
+// vk_antilag_frame: the index of the game frame being made now (its input stage was given), 0 while off or none; a
+// present job keeps it. vk_antilag_input: after the game presented, the next frame's input stage, where the driver
+// waits until that frame should start. vk_antilag_present: before the present of game frame `frame` (0: none, as for
+// a made frame), its present stage.
+int vk_antilag_available(void);
+uint64_t vk_antilag_frame(void);
+void vk_antilag_input(void);
+void vk_antilag_present(uint64_t frame);
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.

@@ -47,6 +47,7 @@ extern "C" {
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+int vk_antilag_available(void);   // vk_antilag.c: the device can run AMD Anti-Lag 2; its row is shown only then
 void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);
 int res_sizes(unsigned out[2], unsigned scene[2]);
 double frame_step_limit_hz(void);
@@ -815,6 +816,7 @@ static void tab_display(float scale) {
     if (!rt_game_version && settings_section(UI_MENU_FRAME_RATE_GROUP, "frame_rate")) {
         row_fps_limit();
         opt_toggle("TOTK_REALTIME", UI_MENU_DKB_REALTIME, UI_MENU_DKB_REALTIME_DESC);
+        if (vk_antilag_available()) opt_toggle("TOTK_ANTILAG", UI_MENU_ANTILAG, UI_MENU_ANTILAG_DESC);   // vk_antilag.c
     }
     if (!rt_game_version && settings_section(UI_MENU_ULTRAWIDE, "ultrawide")) {
         row_dkb_ultrawide();
