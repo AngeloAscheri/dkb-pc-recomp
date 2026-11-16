@@ -131,6 +131,64 @@ typedef struct Pipe {
     uint8_t key[];
 } Pipe;
 
+// ---- pipeline cache gate: no vkGetPipelineCacheData while a pipeline is being built (Intel on Windows)
+//
+// The cache is the driver's to synchronise, and on other drivers the autosave copies it while workers build. Intel's
+// Windows driver crashes in vkGetPipelineCacheData when a build is under way on another thread (Longshot met it every
+// few minutes of play and gates the two the same way: gpu/vk/vk_draw.cpp PcacheFetch and PcacheUse, f41a5c59, #190). There the builds
+// count themselves and the save waits until none runs; a build that starts during the copy (about 60 ms, at most every
+// 20 s) waits for it. Other drivers keep the lock-free path: TOTK_PCACHE_GATE=1 or 0 overrides the choice.
+// Not gated on purpose: gpl_link and the internal pipelines made with a null cache never touch the saved cache, so
+// they cannot race its copy.
+static struct { PlatMutex lock; PlatCond cv; int on, builds, fetching; } pcg = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT, .on = -1};
+
+static int pcache_gate_on(void) {
+    int on = __atomic_load_n(&pcg.on, __ATOMIC_ACQUIRE);
+    if (on >= 0) return on;
+    const char *e = cfg_get("TOTK_PCACHE_GATE");
+#ifdef _WIN32
+    on = vk_ctx()->props.vendorID == 0x8086;
+#else
+    on = 0;
+#endif
+    if (e && *e) on = strcmp(e, "0") != 0;
+    if (on) rt_log("vk_pipeline: the pipeline cache is saved only while no pipeline is being built (%s)",
+                   e && *e ? "TOTK_PCACHE_GATE" : "Intel's Windows driver");
+    __atomic_store_n(&pcg.on, on, __ATOMIC_RELEASE);
+    return on;
+}
+
+static void pcache_build_begin(void) {
+    if (!pcache_gate_on()) return;
+    plat_mutex_lock(&pcg.lock);
+    while (pcg.fetching) plat_cond_wait(&pcg.cv, &pcg.lock);
+    pcg.builds++;
+    plat_mutex_unlock(&pcg.lock);
+}
+
+static void pcache_build_end(void) {
+    if (!pcache_gate_on()) return;
+    plat_mutex_lock(&pcg.lock);
+    if (!--pcg.builds) plat_cond_broadcast(&pcg.cv);
+    plat_mutex_unlock(&pcg.lock);
+}
+
+static void pcache_fetch_begin(void) {   // one fetch at a time: save_lock is held
+    if (!pcache_gate_on()) return;
+    plat_mutex_lock(&pcg.lock);
+    pcg.fetching = 1;   // new builds wait from here, so the count only falls
+    while (pcg.builds) plat_cond_wait(&pcg.cv, &pcg.lock);
+    plat_mutex_unlock(&pcg.lock);
+}
+
+static void pcache_fetch_end(void) {
+    if (!pcache_gate_on()) return;
+    plat_mutex_lock(&pcg.lock);
+    pcg.fetching = 0;
+    plat_cond_broadcast(&pcg.cv);
+    plat_mutex_unlock(&pcg.lock);
+}
+
 static Layout *layouts[LAYOUT_BUCKETS];
 static Pipe *pipes[PIPE_BUCKETS];
 
@@ -598,62 +656,6 @@ void vk_pipeline_answers(const VkPipeState *s, GfxShaderAnswers *vs, GfxShaderAn
             VkFormat f = target_format(s->color_fmt[i], NULL, NULL);
             fs->frag_out_type[i] = (uint8_t)(f == VK_FORMAT_UNDEFINED ? GFX_TYPE_FLOAT : format_type(f));
         }
-}
-
-// ---- pipeline cache gate: no vkGetPipelineCacheData while a pipeline is being built (Intel on Windows)
-//
-// The cache is the driver's to synchronise, and on other drivers the autosave copies it while workers build. Intel's
-// Windows driver crashes in vkGetPipelineCacheData when a build is under way on another thread (Longshot met it every
-// few minutes of play and gates the two the same way: gpu/vk/vk_draw.cpp PcacheFetch and PcacheUse, f41a5c59, #190). There the builds
-// count themselves and the save waits until none runs; a build that starts during the copy (about 60 ms, at most every
-// 20 s) waits for it. Other drivers keep the lock-free path: TOTK_PCACHE_GATE=1 or 0 overrides the choice.
-static struct { PlatMutex lock; PlatCond cv; int on, builds, fetching; } pcg = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT, .on = -1};
-
-static int pcache_gate_on(void) {
-    int on = __atomic_load_n(&pcg.on, __ATOMIC_ACQUIRE);
-    if (on >= 0) return on;
-    const char *e = cfg_get("TOTK_PCACHE_GATE");
-#ifdef _WIN32
-    on = vk_ctx()->props.vendorID == 0x8086;
-#else
-    on = 0;
-#endif
-    if (e && *e) on = strcmp(e, "0") != 0;
-    if (on) rt_log("vk_pipeline: the pipeline cache is saved only while no pipeline is being built (%s)",
-                   e && *e ? "TOTK_PCACHE_GATE" : "Intel's Windows driver");
-    __atomic_store_n(&pcg.on, on, __ATOMIC_RELEASE);
-    return on;
-}
-
-static void pcache_build_begin(void) {
-    if (!pcache_gate_on()) return;
-    plat_mutex_lock(&pcg.lock);
-    while (pcg.fetching) plat_cond_wait(&pcg.cv, &pcg.lock);
-    pcg.builds++;
-    plat_mutex_unlock(&pcg.lock);
-}
-
-static void pcache_build_end(void) {
-    if (!pcache_gate_on()) return;
-    plat_mutex_lock(&pcg.lock);
-    if (!--pcg.builds) plat_cond_broadcast(&pcg.cv);
-    plat_mutex_unlock(&pcg.lock);
-}
-
-static void pcache_fetch_begin(void) {   // one fetch at a time: save_lock is held
-    if (!pcache_gate_on()) return;
-    plat_mutex_lock(&pcg.lock);
-    pcg.fetching = 1;   // new builds wait from here, so the count only falls
-    while (pcg.builds) plat_cond_wait(&pcg.cv, &pcg.lock);
-    plat_mutex_unlock(&pcg.lock);
-}
-
-static void pcache_fetch_end(void) {
-    if (!pcache_gate_on()) return;
-    plat_mutex_lock(&pcg.lock);
-    pcg.fetching = 0;
-    plat_cond_broadcast(&pcg.cv);
-    plat_mutex_unlock(&pcg.lock);
 }
 
 // ---- vertex input (pipeline state, or vkCmdSetVertexInputEXT)
