@@ -106,21 +106,31 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                "sharper picture at a higher GPU cost, and the upscaler and DLSS are not used. Applies at the next start.",
     [UI_MENU_SCENE_RES_AUTO] = "Auto (game)", [UI_MENU_SCENE_RES_FULL] = "Full",
     [UI_MENU_UPSCALER] = "Upscaling method",
-    [UI_MENU_UPSCALER_DESC] = "This applies when the game image is smaller than the area it fills on your screen or in your window. "
-                              "AMD FSR 1 can keep edges sharper than Bilinear. NVIDIA DLSS (RTX GPU, nvngx_dlss.dll next to dkb.exe) "
-                              "replaces the game's own upscale of its 3D scene and applies at the next start.",
-    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
+    [UI_MENU_UPSCALER_DESC] = "What scales the game's 3D scene up. Game's own keeps the game's upscaler. NVIDIA DLSS (RTX GPU, "
+                              "nvngx_dlss.dll next to dkb.exe), AMD FSR 3.1 and AMD FSR 4 replace it; DLSS applies at the next start. "
+                              "How the finished picture is then fitted to the window is the Window scaling filter's.",
+    [UI_MENU_UPSCALER_GAME] = "Game's own", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_UPSCALER_FSR3] = "AMD FSR 3.1", [UI_MENU_UPSCALER_FSR4] = "AMD FSR 4",
+    [UI_MENU_FILTER] = "Window scaling filter",
+    [UI_MENU_FILTER_DESC] = "How the finished picture is scaled to the window, with any Upscaling method. AMD FSR 1, the default, "
+                            "enlarges with AMD's edge-adaptive upscaler where the window is larger than the picture, as before. "
+                            "Linear is the plainest and softest; Catmull-Rom and Lanczos keep edges sharper, Lanczos the most. "
+                            "These three also sharpen with Sharpness at any window size and scale the game's own HDR picture. "
+                            "A window smaller than the picture is filtered over the pixels each window pixel covers.",
+    [UI_MENU_FILTER_LINEAR] = "Linear", [UI_MENU_FILTER_CATMULL_ROM] = "Catmull-Rom", [UI_MENU_FILTER_LANCZOS] = "Lanczos",
+    [UI_MENU_FILTER_FSR1] = "AMD FSR 1",
+    [UI_MENU_FILTER_NOT_NEEDED] = "Not needed (window = output)",
     [UI_MENU_ASPECT] = "Display scaling",
     [UI_MENU_ASPECT_DESC] = "Default keeps the game's shape and adds black bars if needed.\n"
                             "Stretch to fill uses the whole window or screen. The image stretches only if the shapes differ.",
     [UI_MENU_ASPECT_FIT] = "Default", [UI_MENU_ASPECT_STRETCH] = "Stretch to fill",
     [UI_MENU_FOV] = "Field of view",
     [UI_MENU_FOV_DESC] = "Adjusts the camera's view as a percentage of the original angle. 100% uses the game's default view.",
-    [UI_MENU_SHARPNESS] = "FSR sharpness",
-    [UI_MENU_SHARPNESS_DESC] = "Sharpening after FSR scaling; 0 turns it off.",
+    [UI_MENU_SHARPNESS] = "Sharpness",
+    [UI_MENU_SHARPNESS_DESC] = "Sharpens the finished picture as it is scaled to the window: with AMD FSR 1 where it enlarges, and "
+                               "with Linear, Catmull-Rom or Lanczos at any window size, the output's size included. 0 turns it off. "
+                               "Too much shows halos around edges.",
     [UI_MENU_NO_UPSCALING] = "Requires a smaller game image",
-    [UI_MENU_SHARPNESS_NEEDS_FSR] = "Requires AMD FSR 1",
     [UI_MENU_SMAA] = "Anti-aliasing (SMAA)",
     [UI_MENU_SMAA_DESC] = "Smooths jagged edges in the game image and HUD. Higher settings use more GPU time.",
     [UI_MENU_SMAA_LOW] = "Low", [UI_MENU_SMAA_MEDIUM] = "Medium", [UI_MENU_SMAA_HIGH] = "High",
@@ -379,7 +389,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OV_FMT_SIZE] = "%ux%u", [UI_MENU_OV_FMT_SCENE] = "%ux%u, %.0f%%",
     [UI_MENU_OV_FMT_UPSCALE] = "%ux%u -> %ux%u",
     [UI_MENU_OV_NO_UPSCALER] = "no upscaler",
-    [UI_MENU_OV_FMT_FSR] = "AMD FSR 1, sharpness %d%%", [UI_MENU_OV_SCALE_NONE] = "none (1:1)",
+    [UI_MENU_OV_FMT_SHARP] = "%s, sharpness %d%%", [UI_MENU_OV_SCALE_NONE] = "none (1:1)",
     [UI_MENU_OV_SCALE_BILINEAR] = "bilinear",
 };
 
@@ -448,11 +458,22 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                "по каждой стороне, и затем растягивает её. Полное: 3D-сцена рисуется в полном разрешении "
                                "рендеринга, картинка чётче, но нагрузка на GPU выше; апскейлер и DLSS не работают. Действует после перезапуска.",
     [UI_MENU_SCENE_RES_AUTO] = "Авто (игра)", [UI_MENU_SCENE_RES_FULL] = "Полное",
-    [UI_MENU_UPSCALER] = "Масштабирование под окно",
-    [UI_MENU_UPSCALER_DESC] = "Этот параметр действует, когда изображение игры меньше области вывода на экране или в окне. "
-                              "AMD FSR 1 может сохранять края более чёткими, чем билинейное масштабирование.",
-    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Билинейное", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
+    [UI_MENU_UPSCALER] = "Метод апскейла",
+    [UI_MENU_UPSCALER_DESC] = "Чем увеличивается 3D-сцена игры. «Апскейлер игры» оставляет встроенный апскейлер игры. NVIDIA DLSS "
+                              "(видеокарта RTX, nvngx_dlss.dll рядом с dkb.exe), AMD FSR 3.1 и AMD FSR 4 заменяют его; DLSS "
+                              "применяется при следующем запуске. Как готовая картинка потом подгоняется под окно, определяет "
+                              "фильтр масштабирования под окно.",
+    [UI_MENU_UPSCALER_GAME] = "Апскейлер игры", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_UPSCALER_FSR3] = "AMD FSR 3.1", [UI_MENU_UPSCALER_FSR4] = "AMD FSR 4",
+    [UI_MENU_FILTER] = "Фильтр масштабирования под окно",
+    [UI_MENU_FILTER_DESC] = "Как готовая картинка масштабируется под окно, с любым методом апскейла. AMD FSR 1, по умолчанию, "
+                            "увеличивает картинку адаптивным к краям апскейлером AMD, когда окно больше картинки, как и раньше. "
+                            "Линейный фильтр самый простой и мягкий; Catmull-Rom и Lanczos сохраняют края чётче, Lanczos сильнее всего. "
+                            "Эти три фильтра также повышают резкость при любом размере окна и масштабируют собственную HDR-картинку игры. "
+                            "Окно меньше картинки фильтруется по пикселям, которые покрывает каждый пиксель окна.",
+    [UI_MENU_FILTER_LINEAR] = "Линейный", [UI_MENU_FILTER_CATMULL_ROM] = "Catmull-Rom", [UI_MENU_FILTER_LANCZOS] = "Lanczos",
+    [UI_MENU_FILTER_FSR1] = "AMD FSR 1",
+    [UI_MENU_FILTER_NOT_NEEDED] = "Не требуется (окно = вывод)",
     [UI_MENU_ASPECT] = "Масштабирование вывода",
     [UI_MENU_ASPECT_DESC] = "По умолчанию пропорции игры сохраняются, при необходимости появляются чёрные полосы.\n"
                             "В режиме «Растянуть» изображение заполняет всё окно или экран. Оно растягивается, только "
@@ -460,10 +481,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT_FIT] = "По умолчанию", [UI_MENU_ASPECT_STRETCH] = "Растянуть",
     [UI_MENU_FOV] = "Поле зрения",
     [UI_MENU_FOV_DESC] = "Меняет угол обзора камеры в процентах от исходного. При 100 % используется исходный угол.",
-    [UI_MENU_SHARPNESS] = "Резкость FSR",
-    [UI_MENU_SHARPNESS_DESC] = "Повышение резкости после масштабирования FSR; 0 выключает его.",
+    [UI_MENU_SHARPNESS] = "Резкость",
+    [UI_MENU_SHARPNESS_DESC] = "Повышает резкость готовой картинки при масштабировании под окно: с AMD FSR 1, когда он увеличивает "
+                               "картинку, а с линейным фильтром, Catmull-Rom или Lanczos при любом размере окна, в том числе равном "
+                               "разрешению вывода. 0 выключает его. При слишком большом значении вокруг краёв появляются ореолы.",
     [UI_MENU_NO_UPSCALING] = "Нужно меньшее разрешение игры",
-    [UI_MENU_SHARPNESS_NEEDS_FSR] = "Требуется AMD FSR 1",
     [UI_MENU_SMAA] = "Сглаживание (SMAA)",
     [UI_MENU_SMAA_DESC] = "Сглаживает лесенки на готовой картинке после масштабирования под окно и до отрисовки этого "
                           "меню. Интерфейс игры тоже сглаживается. Чем выше качество, тем больше нагрузка на GPU.",
@@ -737,7 +759,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_FMT_SIZE] = "%ux%u", [UI_MENU_OV_FMT_SCENE] = "%ux%u, %.0f%%",
     [UI_MENU_OV_FMT_UPSCALE] = "%ux%u -> %ux%u",
     [UI_MENU_OV_NO_UPSCALER] = "без апскейлера",
-    [UI_MENU_OV_FMT_FSR] = "AMD FSR 1, резкость %d%%", [UI_MENU_OV_SCALE_NONE] = "нет (1:1)",
+    [UI_MENU_OV_FMT_SHARP] = "%s, резкость %d%%", [UI_MENU_OV_SCALE_NONE] = "нет (1:1)",
     [UI_MENU_OV_SCALE_BILINEAR] = "билинейное",
 };
 

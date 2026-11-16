@@ -1,8 +1,8 @@
 # DLSS (experimental)
 
 `upscaler = dlss` in `dkb.ini` (or `DKB_UPSCALER=dlss`) replaces the game's own upscaler, the compute dispatch that
-scales the rendered frame to the output resolution, with NVIDIA DLSS Super Resolution (`runtime/vk_dlss.c`). FSR still
-scales the output to the window when the window is larger. The setting is read at start.
+scales the rendered frame to the output resolution, with NVIDIA DLSS Super Resolution (`runtime/vk_dlss.c`). The window
+scaling is the `window_filter` setting's, as with any upscaler (below). The setting is read at start.
 
 Needs:
 

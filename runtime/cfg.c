@@ -50,7 +50,7 @@ static const char *const known[] = {
     "SHADER_MEMO", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SKIP_CS", "SKIP_FS", "SKIP_VS", "SMAA", "SPARSE_MIRROR_COPY", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STICK_DEADZONE", "SVC_SLOW", "SWKBD_ANSWER",
     "SWKBD_TEST", "TEST_PAD", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_HASH", "TEX_MEMO", "TEX_REPEAT", "TEX_VRAM_PRESSURE", "TIMER_1MS", "REC_BATCH", "TRACE", "UBO_SNAPSHOT", "UPSCALER", "USNAP_FAST", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VULKAN_DRIVER", "VRAM_HEADROOM", "VS_OUTS",
-    "ULTRAWIDE", "HUD_POSITION", "WB_ASYNC", "WB_EXACT", "WB_FENCE_LIMIT", "WB_UNLOCKED", "WINDOW_MODE", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_PROCS", "ZSTD_CHECK", "ZSTD_NATIVE",
+    "ULTRAWIDE", "HUD_POSITION", "WB_ASYNC", "WB_EXACT", "WB_FENCE_LIMIT", "WB_UNLOCKED", "WINDOW_FILTER", "WINDOW_MODE", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_PROCS", "ZSTD_CHECK", "ZSTD_NATIVE",
 };
 
 // The totk.ini section a key cfg_set may write goes to when the file lacks it (totk.ini.example's sections).
@@ -58,7 +58,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"FPS_LIMIT", "frame rate"}, {"FPS60", "frame rate"},
     {"REALTIME", "frame rate"}, {"CLOTH_REALTIME", "frame rate"}, {"HIGHFPS_FIX", "frame rate"},
     {"FULLSCREEN", "display"}, {"CONSOLE", "display"}, {"WINDOW_MODE", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"},
-    {"GPU_INDEX", "display"}, {"VULKAN_DRIVER", "display"}, {"OUTPUT_RES", "display"}, {"RENDER_SCALE", "display"}, {"UPSCALER", "display"}, {"DLSS_PRESET", "display"}, {"SCENE_RES", "display"},
+    {"GPU_INDEX", "display"}, {"VULKAN_DRIVER", "display"}, {"OUTPUT_RES", "display"}, {"RENDER_SCALE", "display"}, {"UPSCALER", "display"}, {"WINDOW_FILTER", "display"}, {"DLSS_PRESET", "display"}, {"SCENE_RES", "display"},
     {"ULTRAWIDE", "display"}, {"HUD_POSITION", "display"},
     {"SHARPNESS", "display"}, {"SMAA", "display"}, {"FRAME_GEN", "display"}, {"FRAME_GEN_BY", "display"}, {"ASPECT", "display"}, {"FOV", "display"}, {"COLOR_PRESET", "display"},
     {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
@@ -109,7 +109,12 @@ static const CfgMeta metas[] = {
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|59|67|75|77|100|125|150|200", RESTART},
     {"SCENE_RES", "auto", "auto|full", RESTART},   // Bananza only (dkb_wide.c)
+    // UPSCALER fsr and bilinear both mean the game's own upscaler (bilinear is the older spelling of the plain linear
+    // window filter, kept as an alias: window_filter.h wf_resolve); dlss, fsr3 and fsr4 replace it. WINDOW_FILTER is
+    // how the finished picture is scaled to the window, with every upscaler (vk_present.c, vk_fsr.c); the menu shows
+    // the two settings as the Upscaling method and Window scaling filter rows (ui/menu.cpp rows_render_options).
     {"UPSCALER", "fsr", "fsr|bilinear|dlss|fsr3|fsr4", LIVE}, {"DLSS_PRESET", "auto", "auto|k|m", LIVE},   // vk_dlss.c preset_for
+    {"WINDOW_FILTER", "fsr1", "fsr1|linear|catmull_rom|lanczos", LIVE},
     {"SHARPNESS", "80", "0..100", LIVE}, {"SMAA", "off", "off|low|medium|high", LIVE},
     {"FRAME_GEN", "off", "off|auto|2x|3x|4x|5x|6x|7x|8x", LIVE},   // vk_framegen.c, experimental
     {"FRAME_GEN_BY", "builtin", "builtin|fsr3", LIVE},   // vk_fsr3fi.c: AMD FSR 3.1's interpolation at 2x, opt-in

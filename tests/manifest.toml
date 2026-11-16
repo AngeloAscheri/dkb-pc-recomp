@@ -856,3 +856,9 @@ name = "nx-extract"
 tier = 0
 area = "tools"
 cmd = ["{python}", "tests/nx_extract_test.py"]
+
+[[test]]
+name = "window-filter"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/window_filter_test.py", "--cc", "{cc}"]

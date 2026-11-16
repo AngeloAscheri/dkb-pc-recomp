@@ -40,7 +40,7 @@ static VkSwapchainKHR g_sc;
 static VkFormat g_sc_fmt;
 static int g_sc_hdr;                        // HDR10 (hdr, vk_hdr.c): PQ code values in Rec. 2020; stored atomically
 static VkExtent2D g_sc_ext;
-static int g_scaler;                        // the last present: 0 the game image 1:1, 1 scaled by the blit, 2 by FSR
+static int g_scaler;                        // the last present: 0 the picture 1:1, 1 blit, 2 FSR 1, 3 to 5 window pass
 static uint32_t g_sc_n;
 static VkImage g_sc_img[MAX_IMAGES];
 static VkImageView g_sc_view[MAX_IMAGES];   // colour attachment views for the menu overlay
@@ -511,12 +511,13 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = g_sc_img[idx];
-    // Native HDR (DKB_HDR_NATIVE, ov_gfx.c hdr_native_on): in its HDR mode the game writes Rec. 2020 PQ
-    // code values into an A2B10G10R10 window texture, which is what an HDR10 swapchain takes, so the picture is blitted
-    // to it as it is. Colour adjustment, FSR and SMAA are skipped: they expect a display-referred SDR picture, and PQ is
-    // not one. The format alone does not say PQ (TotK presents through here too), hence the setting. The blit needs
-    // BLIT_DST on the swapchain's format, which Vulkan does not require of A2R10G10B10; without it the output falls back
-    // to SDR, the game is told so (gfx_window_hdr10) and switches back to its SDR picture.
+    // Native HDR (DKB_HDR_NATIVE, ov_gfx.c hdr_native_on): in its HDR mode the game writes Rec. 2020 PQ code values
+    // into an A2B10G10R10 window texture, which is what an HDR10 swapchain takes, so the picture goes to it as the
+    // codes it is: blitted, or scaled and sharpened by vk_fsr.c's PQ pass when window_filter and Sharpness ask for it.
+    // Colour adjustment and SMAA are skipped: they expect a display-referred SDR picture, and PQ is not
+    // one. The format alone does not say PQ (TotK presents through here too), hence the setting. The blit needs
+    // BLIT_DST on the swapchain's format, which Vulkan does not require of A2R10G10B10; without it the output falls
+    // back to SDR, the game is told so (gfx_window_hdr10) and switches back to its SDR picture.
     int native_hdr = g_sc_hdr && hdr_native_on() && fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     if (native_hdr && !(sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
         static int logged;
@@ -552,10 +553,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkImage psrc = graded ? graded : src;
     VkFormat pfmt = graded ? VK_FORMAT_R16G16B16A16_SFLOAT : fmt;
     const int *prect = graded ? grect : rect;
-    // FSR (TOTK_UPSCALER) when the picture's rectangle is larger than the crop; else the bilinear blit
-    int fsr = general && !native_hdr && vk_fsr_record(cb, slot, psrc, pfmt, graded ? cw : w, graded ? ch : h, prect, tgt, to);
-    g_scaler = fsr ? 2 : cw != to[2] || ch != to[3];
-    if (!fsr) {
+    // The window scaling (TOTK_WINDOW_FILTER, TOTK_SHARPNESS, vk_fsr.c): FSR 1 or the scaling pass when the setting and
+    // the sizes need one (the game's own HDR picture: the pass for PQ codes, never FSR 1); else the plain bilinear blit
+    int scaled = general ? vk_fsr_record(cb, slot, psrc, pfmt, native_hdr, graded ? cw : w, graded ? ch : h, prect, tgt, to)
+                         : 0;
+    g_scaler = scaled ? scaled : cw != to[2] || ch != to[3];
+    if (!scaled) {
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
             sync_barrier(cb, psrc, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);

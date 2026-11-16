@@ -93,8 +93,11 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it. Shader stages are compiled ahead into libraries; a draw that meets a new state links them at once (fast link), and an optimised pipeline replaces the linked one when a background thread finishes it. Pipeline keys seen in play are saved and built at boot. A draw whose pipeline is not ready is skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise, so one-shot passes are never lost; a full-screen draw is skipped as well rather than waiting (`TOTK_PIPE_SKIP`); the stage libraries a waiting draw needs are built on idle workers in parallel (`TOTK_PIPE_WAIT`). Without the extension, a missing pipeline is built on a worker and the draw waits or is skipped by the same rule.
 - Resolution. Patch sets make the game read its output, swapchain and scene sizes from the patch page
   (MacNativeGames' sites); `resolution.c` sets them from `output_res` and `render_scale` and grows the texture heap
-  and the application pool to match. When the window is larger than the output, `vk_fsr.c` runs AMD FSR 1 (EASU,
-  RCAS) on the present, then `vk_smaa.c` runs SMAA 1x on the finished picture when `TOTK_SMAA` asks for it, before the
+  and the application pool to match. On the present, `vk_fsr.c` scales the picture to the window by `window_filter`
+  (`window_filter.h`: linear, Catmull-Rom, Lanczos 2, or AMD FSR 1 (EASU, RCAS) where the window is larger).
+  `shaders/win_scale.comp` filters over the picture's pixels one window pixel covers, so a smaller window is filtered
+  too, then sharpens by `TOTK_SHARPNESS` at any window size, 1:1 included; with the window the picture's size and
+  Sharpness 0 nothing runs and the picture is blitted. Then `vk_smaa.c` runs SMAA 1x on the finished picture when `TOTK_SMAA` asks for it, before the
   overlay is drawn. An `output_res` that is not 16:9 (more than 1% off, `res_is_16x9`) also switches on the
   `aspect` patch set, which hands the output's ratio to the camera, and `romfs.c` `overlay_init` loads the
   `romfs-patches-<w>x<h>` overlay for it when it exists (`tools/make_romfs_patches.py --aspect`, laid out by
@@ -115,8 +118,12 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 - Native HDR, Bananza 3.2.0 (`hdr_native = 1` with `hdr = 1`). `ov_gfx.c` answers the game's
   `nn::vi::QueryDisplayHdrStatus` with "on" and `hdr_peak_nits`, and `QueryDisplayHdrPaperWhite` with
   `hdr_game_nits`. The game then switches to its own HDR mode: its window texture becomes A2B10G10R10 holding
-  Rec. 2020 PQ, which `vk_present.c` `present_image` copies onto the HDR10 swapchain as it is (no colour adjustment,
-  FSR or SMAA, which expect an SDR picture). The game's tonemap stops its highlights at about 1.36 times paper white,
+  Rec. 2020 PQ, which `vk_present.c` `present_image` puts on the HDR10 swapchain as the codes it is: blitted, or,
+  when `window_filter` and Sharpness ask for it (a filter other than FSR 1, and the window differs from the picture or
+  Sharpness is above 0), scaled
+  and sharpened by `vk_fsr.c` with `win_scale_pq` (`win_scale.comp` with `WIN_SCALE_PQ`: the filters and the sharpen work
+  on the PQ code values and write an A2B10G10R10 image, so the 10 bits stay; only with linear, Catmull-Rom or Lanczos
+  chosen, `window_filter.h` `wf_plan`). No colour adjustment or SMAA, which expect an SDR picture. The game's tonemap stops its highlights at about 1.36 times paper white,
   whatever peak it is told; `spirv_hdr_shoulder.c` (`DKB_HDR_SHOULDER=0` turns it off) rewrites its composite stage
   so they reach the peak, leaving everything below the shoulder's knee as the game grades it. Findings and
   measurements: [hdr-native-plan.md](hdr-native-plan.md).

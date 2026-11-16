@@ -152,10 +152,11 @@
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
 # TotK only: Bananza draws at the game's own size, and the HUD and dkb.log report its upscaler's input and output sizes.
 # render_scale = game
-# Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
-# from 0 (off) to 100. Changes while the game runs take effect at once.
+# What scales the 3D picture up (the menu's Upscaling method row): fsr and bilinear are both the game's own upscaler;
+# dlss, fsr3 and fsr4 below replace it. bilinear is also the older spelling of window_filter = linear, honoured only
+# while window_filter is not set. Changes while the game runs take effect at once.
 # upscaler = dlss (experimental, NVIDIA RTX only, read at start) also replaces the game's own upscaler with NVIDIA DLSS
-# and keeps FSR for the window; it needs nvngx_dlss.dll next to dkb.exe (docs/dkb-dlss.md) and falls back to the
+# and leaves the window to window_filter; it needs nvngx_dlss.dll next to dkb.exe (docs/dkb-dlss.md) and falls back to the
 # game's upscaler, with a "dlss:" line in the log, when anything is missing.
 # upscaler = fsr3 (experimental, any GPU with push descriptors and extended storage formats, read each frame) does the same
 # with AMD FSR 3.1's temporal upscaler, from the same jitter, scene depth and camera motion DLSS gets; frames without a scene
@@ -164,14 +165,22 @@
 # (amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to dkb.exe, docs/dkb-dlss.md); without them, or on
 # a GPU with no FSR 4 (NVIDIA), the log has one "fsr4:" line saying why and FSR 3.1 runs instead.
 # upscaler = fsr
+# How the finished picture is scaled to the window, with any upscaler (the menu's Window scaling filter row): fsr1 (the
+# default: AMD FSR 1 where the window is larger than the game's picture, as before, and nothing else), or linear,
+# catmull_rom or lanczos, which also sharpen with Sharpness at any window size and scale the game's own HDR picture
+# (hdr_native) on its PQ code values. A window smaller than the picture is filtered over the pixels each window pixel
+# covers. Takes effect at once.
+# window_filter = fsr1
 # Bananza only: auto keeps the game's dynamic 3D resolution (usually two thirds of output_res on each side), full draws
 # the 3D scene at output_res (sharper, more GPU cost; no upscaler or DLSS then), a ratio from 1.0 to 3.0 draws it at
 # output_res divided by that ratio and upscales it to output_res (1.5 with upscaler = dlss: DLSS Quality at output_res).
 # Read at start.
 # scene_res = auto
+# Sharpening of the finished picture, 0 (off) to 100, at any window size, the game resolution's size included, and on the
+# game's own HDR picture too. Takes effect at once.
 # sharpness = 80
 # SMAA 1x anti-aliasing of the final picture: off (the default), low, medium or high. It runs after the picture is scaled to
-# the window (FSR or bilinear) and before the menu is drawn, so the game's HUD is smoothed as well. Changes while the game
+# the window (window_filter) and before the menu is drawn, so the game's HUD is smoothed as well. Changes while the game
 # runs take effect at once.
 # smaa = off
 # Frame generation (experimental, Donkey Kong Bananza only): off (the default), auto, or 2x to 8x. Frames are made between
