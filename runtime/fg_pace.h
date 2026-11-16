@@ -1,7 +1,8 @@
 // Pacing arithmetic of the frame generation (vk_framegen.c), kept free of Vulkan and of clocks so a test can drive it with
 // a synthetic one. Times are nanoseconds. From Hookshot gpu/vk/vk_framegen.cpp (display_main: the interval average and
 // the 100 ms rule; show_due, auto_cap, fixed_frames and auto_slots: Auto and the multipliers),
-// https://git.notrexed.dev/Hookshot/Hookshot @ 7191250b7b0f8a4becd79ee086229a2620872fc7, GPL-3.0.
+// https://git.notrexed.dev/Hookshot/Hookshot @ 7191250b7b0f8a4becd79ee086229a2620872fc7, GPL-3.0 (the 2x path's
+// pacing from https://github.com/NotRexed/Hookshot @ fab8cb37641714bd839ae83c2a7bc582bedc4d70, GPL-3.0).
 #pragma once
 #include <stdint.h>
 

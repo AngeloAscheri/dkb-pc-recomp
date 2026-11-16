@@ -526,9 +526,11 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], ui
     }
     if (!S.tried) {
         if (!init(c)) return 0;
-        vk_present_lock();   // a device made again after a release: the display thread presents again
+        // a device made again after a release: the display thread presents again. D.mu only: vk_present_release holds
+        // the present lock and then takes fgl, so taking the present lock here, under fgl, would invert that order.
+        plat_mutex_lock(&D.mu);
         D.dead = 0;
-        vk_present_unlock();
+        plat_mutex_unlock(&D.mu);
     }
     if (fmt != S.fmt_ok) {
         if (fmt != S.fmt_bad) {
@@ -693,7 +695,10 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], ui
     // Auto and 3x to 8x: to the display thread, which starts with the first set
     plat_mutex_lock(&D.mu);
     if (!D.started) {
-        if (!plat_thread_spawn(display_main, NULL, "vk fg display", 0)) rt_fatal("fg: cannot start the display thread");
+        if (!plat_thread_spawn(display_main, NULL, "vk fg display", 0)) {
+            plat_mutex_unlock(&D.mu);   // fail waits on the display queue under this lock
+            return fail(c, "cannot start the display thread");
+        }
         D.started = 1;
     }
     const int tail = (D.at_head + D.count) % SETS;
