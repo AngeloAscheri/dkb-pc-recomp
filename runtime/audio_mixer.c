@@ -213,10 +213,10 @@ static void output_open(Mixer *m, int rate) {
         return;
     }
 #if defined(__linux__) && defined(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)
-    // PipeWire gave a 1024-frame period, and with it the renderer works in bursts of four or five 240-frame blocks and
-    // the output clicked at every block edge (issue #133: static on all sound; 240 frames, or 768 through PulseAudio,
-    // measured clean). Ask for one block per period unless the player's SDL_AUDIO_DEVICE_SAMPLE_FRAMES says otherwise
-    // (the default priority loses to the environment variable). A guess about the cause; the measured fix is the period.
+    // PipeWire gives a 1024-frame period. Rendering in bursts of four or five 240-frame blocks after each period made
+    // the output click at every block edge (#133); render_thread now paces blocks evenly, which is clean at 1024 frames
+    // too. Asking for one block per period stays as a smaller delay to the speakers where the server grants it, unless
+    // the player's SDL_AUDIO_DEVICE_SAMPLE_FRAMES says otherwise (the default priority loses to the environment variable).
     SDL_SetHintWithPriority(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "240", SDL_HINT_DEFAULT);
 #endif
     SDL_AudioSpec spec = {SDL_AUDIO_F32, m->channels, rate};
@@ -270,17 +270,6 @@ static void output_open(Mixer *m, int rate) {
     rt_log("audio: SDL device '%s' opened, %d Hz %s float (device %d channels), prefill %d ms, device period %d frames; "
            "the device paces rendering at %.1f ms queued", name ? name : "?", rate, m->channels == 6 ? "5.1" : "stereo",
            dev.channels, m->prefill * 5, period, m->target * 1000.0 / rate);
-}
-
-int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
-    Mixer *m = r->mixer;
-    if (!m || !m->device_ok || !atomic_load_explicit(&m->playing, memory_order_acquire)) return -1;
-    uint64_t pulled = atomic_load_explicit(&m->pulled_ns, memory_order_acquire);
-    if (!pulled || (now > pulled && now - pulled > m->stall_ns)) return -1;
-    uint64_t have = atomic_load(&m->wr) - atomic_load_explicit(&m->rd, memory_order_acquire);
-    if (have < (uint64_t)m->target) return 0;
-    int64_t ns = (int64_t)((have - (uint64_t)m->target + 1) * 1000000000ull / (uint64_t)m->rate);
-    return ns < 500000 ? 500000 : ns;   // until the device has taken it below the target
 }
 
 int audio_mixer_fill(AudioRenderer *r, uint64_t now, int64_t *have, int64_t *target, int64_t *period) {
