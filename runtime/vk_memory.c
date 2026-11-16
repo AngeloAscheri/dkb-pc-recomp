@@ -1403,7 +1403,7 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
     plat_mutex_lock(&shadow_lock);
     // Look each range's pool up first: only a range the copy below takes (the pool has a shadow map covering it) has
     // its pages thawed and prewritten, so a range outside every pool leaves its pages as they are.
-    PoolRec **pr = calloc((size_t)m, sizeof *pr);
+    PoolRec **pr = calloc((size_t)n, sizeof *pr);
     if (!pr) rt_fatal("vk: out of memory for a write-back batch");
     PoolRec *r = NULL;
     for (int i = 0; i < m; i++) {

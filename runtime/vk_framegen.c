@@ -117,6 +117,7 @@ static struct {
     int jobs[SETS], at_head, count;
     int64_t job_at[SETS];
     int started, dead;
+    uint64_t gen;   // bumped by vk_fg_release (D.mu): a set made before it is not presented after it
 } D = {.mu = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT};
 
 static void say(int bit, const char *msg, int arg) {
@@ -428,6 +429,7 @@ static void display_main(void *arg) {
         while (!D.count) plat_cond_wait(&D.cv, &D.mu);
         const int si = D.jobs[D.at_head];
         const int64_t at = D.job_at[D.at_head];
+        const uint64_t gen = D.gen;
         D.at_head = (D.at_head + 1) % SETS, D.count--;
         plat_mutex_unlock(&D.mu);
         Set *st = &S.sets[si];
@@ -463,7 +465,10 @@ static void display_main(void *arg) {
             wait_until(due);
             const int64_t t = (int64_t)kern_now_ns();
             vk_present_lock();   // the release frees the images under this lock and sets D.dead first
-            if (!D.dead) {
+            plat_mutex_lock(&D.mu);   // g_pl, then D.mu: the release's order
+            const int live = !D.dead && gen == D.gen;
+            plat_mutex_unlock(&D.mu);
+            if (live) {
                 if (st->game[k] && st->frame_no) vk_thumbs_frame(st->frame_no);   // the thumbnail and the dump name the game's frame
                 vk_present_image(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
             }
@@ -696,6 +701,7 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], ui
     plat_mutex_lock(&D.mu);
     if (!D.started) {
         if (!plat_thread_spawn(display_main, NULL, "vk fg display", 0)) {
+            st->busy = 0;
             plat_mutex_unlock(&D.mu);   // fail waits on the display queue under this lock
             return fail(c, "cannot start the display thread");
         }
@@ -749,6 +755,7 @@ void vk_fg_show(int (*pending)(void), uint64_t frame) {
 
 void vk_fg_release(void) {   // under the present lock, device idle
     plat_mutex_lock(&D.mu);
+    D.gen++;
     D.dead = 1;   // first: the display thread presents nothing more, and nothing waits on it
     for (int s = 0; s < SETS; s++) S.sets[s].busy = 0;
     D.count = 0;
