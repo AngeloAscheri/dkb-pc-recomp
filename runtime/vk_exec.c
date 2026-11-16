@@ -2019,7 +2019,7 @@ static int par_take(VkExec *ex, const op_hdr *h, const void *a) {
         // DLSS takes the scene's depth and camera from the first scene draw of a pass, in draw order. The slices are
         // recorded at once, so the collection notes it here from ex, which has the draw's targets and binds: a draw
         // the slice later skips (a pipeline still building) may note it, with the same targets and camera.
-        if (ex->depth.image && vk_dlss_wanted()) vk_dlss_scene_draw(ex);
+        if (ex->depth.image && vk_temporal_wanted()) vk_dlss_scene_draw(ex);
         break;
     default:
         return 0;

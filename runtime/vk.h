@@ -511,6 +511,38 @@ int vk_dlss_warm(VkCommandBuffer cb, uint64_t fence);   // once, at the first co
                                                       // load; 1 when it recorded into cb (rebind after it)
 void vk_dlss_release(void);   // device idle, before it goes away
 
+// The inputs both temporal upscalers take, DLSS above and FSR 3.1 below (vk_dlss.c): the scene's jitter, depth and camera
+// motion vectors, made from what the replay noted at the scene's draws. vk_temporal_inputs fills t for one frame of
+// inputs w x h upscaled to ow x oh and records the vector pass into cb; fresh: the upscaler has no history. 1 = filled
+// in, 0 = the vector image could not be made. temporal: a scene was noted at the input size (otherwise no depth, zero
+// vectors, reset). reset: the history is not to be used. depth is a sampled view in GENERAL; mv holds the motion in
+// render pixels (previous position minus this one, jitter taken off); proj is the scene's projection, row-major, as the
+// game fills it. vk_temporal_done after the evaluation moves the jitter and the camera on to the next frame.
+typedef struct {
+    int temporal, reset;
+    float jx, jy;                 // pixels, the viewport offset the scene was drawn with
+    uint32_t phases;              // the jitter sequence's length
+    VkImageView depth, mv;
+    VkImage depth_image;
+    VkFormat depth_format;
+    uint32_t depth_level, depth_layer;
+    float proj[16];
+    double vp[16];                // for vk_temporal_done
+} VkTemporalIn;
+int vk_temporal_inputs(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int fresh, VkTemporalIn *t);
+void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow);
+
+// FSR 3.1 in place of the game's upscaler (vk_fsr3.c, upscaler = fsr3), over the inputs above. vk_fsr3_wanted: the
+// setting asks for it (read once a frame) and nothing has failed. vk_fsr3_record is vk_dlss_record's counterpart with
+// the same results: 1 = recorded (the caller forgets the bound state and puts a full barrier after it), 0 = nothing
+// recorded, the game's upscaler runs (no scene at the input size, an unsupported size or GPU), -1 = it failed after
+// recording some of its work. vk_fsr3_release: device idle, before it goes away (logs the summary).
+int vk_fsr3_wanted(void);
+int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
+void vk_fsr3_release(void);
+// Either temporal upscaler is chosen: the scene's draws are jittered and noted for it.
+static inline int vk_temporal_wanted(void) { return vk_dlss_wanted() || vk_fsr3_wanted(); }
+
 // ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c)
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.

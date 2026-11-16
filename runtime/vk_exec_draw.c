@@ -3457,10 +3457,10 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
 static void record_fixed(VkExec *ex) {
     DrawCtx *const dc = DC_OF(ex);
     VkCommandBuffer cb = ex->cb;
-    // upscaler = dlss: the scene's draws are moved by DLSS's sub-pixel jitter (vk_dlss.c); a change of it, entering or
+    // upscaler = dlss or fsr3: the scene's draws are moved by the sub-pixel jitter (vk_dlss.c); a change of it, entering or
     // leaving the scene's passes included, records the viewport again.
     float j[2] = {0, 0};
-    if (ex->depth.image && vk_dlss_wanted()) vk_dlss_jitter(ex->depth.image, j);
+    if (ex->depth.image && vk_temporal_wanted()) vk_dlss_jitter(ex->depth.image, j);
     if (j[0] != dc->B.jit[0] || j[1] != dc->B.jit[1]) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
     if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
         float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
@@ -4085,7 +4085,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
         dc->B.st = s, dc->B.st_valid = 1;
     }
     // Before the jitter in record_fixed. A slice's draws were noted when the pass was collected (vk_exec.c par_take).
-    if (ex->depth.image && !IN_SLICE(dc) && vk_dlss_wanted()) vk_dlss_scene_draw(ex);
+    if (ex->depth.image && !IN_SLICE(dc) && vk_temporal_wanted()) vk_dlss_scene_draw(ex);
     record_fixed(ex);
     repeat_stats(ex, info);
     DP_MARK(DP_STATE);
@@ -4381,12 +4381,13 @@ static int mvk_upscale_blit(VkExec *ex, const GfxShader *cs) {
 }
 
 // upscaler = dlss (experimental): the same dispatch of the game's upscaler is replaced by NVIDIA DLSS on its input
-// (texture slot 0) and output (image slot 1), whole images as above (vk_dlss.c). 0 when DLSS is off or failed, or the
-// images do not fit it: the shader then runs. NGX binds its own pipelines and descriptors into the command buffer, so
-// the caller forgets the bound state (vk_exec_draw_new_cb) after it; -1 (NGX failed after it may have bound its own):
-// the caller also binds the game's pipeline and resources again before its dispatch.
+// (texture slot 0) and output (image slot 1), whole images as above (vk_dlss.c). upscaler = fsr3 takes the same place
+// with AMD FSR 3.1 (vk_fsr3.c). 0 when the upscaler is off or failed, or the images do not fit it: the shader then
+// runs. NGX binds its own pipelines and descriptors into the command buffer (FSR 3.1 its own pushes), so the caller
+// forgets the bound state (vk_exec_draw_new_cb) after it; -1 (it failed after it may have bound its own): the caller
+// also binds the game's pipeline and resources again before its dispatch.
 static int dlss_upscale(VkExec *ex, const GfxShader *cs) {
-    if (!vk_dlss_wanted()) return 0;
+    if (!vk_temporal_wanted()) return 0;
     if (!mvk_upscale_cs(gfx_shader_spirv_fnv(cs))) {
         // The upscaler is matched by hash, which a translator change moves: with DLSS on, list the compute shaders
         // seen (the first 48 distinct) so a run that never reaches DLSS shows which hash to add.
@@ -4420,7 +4421,7 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs) {
                               "the game's upscaler runs for them");
         return 0;
     }
-    return vk_dlss_record(ex->cb, ex->fence, s, t);
+    return vk_fsr3_wanted() ? vk_fsr3_record(ex->cb, ex->fence, s, t) : vk_dlss_record(ex->cb, ex->fence, s, t);
 }
 
 // Tells the HUD (resolution.c res_note_upscaler) the sizes of every dispatch of the game's upscaler, whatever replaces
