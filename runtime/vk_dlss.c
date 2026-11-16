@@ -33,8 +33,11 @@
 #include "vk_exec.h"
 #include "vk_spec.h"
 
-#ifdef _WIN32
 #include "dlss_mv_spv.h"
+
+typedef struct NgxHandle NgxHandle;   // F.h below; only NGX (Windows) ever sets it
+
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -45,7 +48,6 @@ enum { Q_MAX_PERF, Q_BALANCED, Q_MAX_QUALITY, Q_ULTRA_PERF, Q_ULTRA_QUALITY, Q_D
 enum { F_MV_LOW_RES = 1 << 1, F_AUTO_EXPOSURE = 1 << 6 };
 enum { PRESET_K = 11, PRESET_L = 12, PRESET_M = 13 };   // NGX render preset hints
 typedef struct NgxParam NgxParam;
-typedef struct NgxHandle NgxHandle;
 typedef struct {   // NVSDK_NGX_Resource_VK holding an image view (the larger member of its union)
     VkImageView view;
     VkImage image;
@@ -76,8 +78,13 @@ static PfnShutdown ngx_shutdown;
 static PfnDestroy ngx_destroy;
 static const char **inst_ext, **dev_ext;
 static unsigned n_inst_ext, n_dev_ext;
-static int state;   // 0 not tried, 1 ready, -1 failed (the game's upscaler from then on)
 static NgxParam *params;
+#define STATE_INIT 0
+#else
+#define STATE_INIT -1   // no NGX here: the temporal inputs below serve FSR 3.1 only
+#endif
+
+static int state = STATE_INIT;   // 0 not tried, 1 ready, -1 failed (the game's upscaler from then on)
 
 // The feature and its own inputs, made for one input and output size: the motion vectors (written by the motion pass,
 // or cleared to zero) and a zero depth image for frames without the scene's, both in GENERAL.
@@ -136,6 +143,7 @@ static struct {
 
 // The motion-vector compute pass.
 static struct { int ok; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe; VkSampler samp; } MV = {.ok = -1};
+#ifdef _WIN32
 // Features replaced while the GPU may still run them: released once their submission's fence is done.
 #define GRAVE 8
 static struct { NgxHandle *h; uint64_t fence; } grave[GRAVE];
@@ -263,6 +271,8 @@ static void reap(void) {
         if (grave[i].h && grave[i].fence <= done) ngx_release(grave[i].h), grave[i].h = NULL;
 }
 
+#endif   // _WIN32
+
 static void drop_inputs(void) {
     vk_defer_view(F.mv_v), vk_defer_view(F.depth_v);
     vk_defer_image(F.mv, F.mv_a), vk_defer_image(F.depth, F.depth_a);
@@ -366,7 +376,7 @@ static int mv_init(void) {
     if (r != VK_SUCCESS) goto fail;
     return MV.ok = 1;
 fail:
-    rt_log("dlss: the motion-vector pass could not be set up: DLSS stays spatial (no jitter or motion vectors)");
+    rt_log("temporal: the motion-vector pass could not be set up: the upscaler stays spatial (no jitter or motion vectors)");
     return 0;
 }
 
@@ -537,6 +547,7 @@ void vk_dlss_image_gone(VkImage image) {
     if (image == jdepth()) jdepth_set(VK_NULL_HANDLE), J.prev_ok = 0;
 }
 
+#ifdef _WIN32
 // The mode follows the scale: 1.5x quality, 1.7x balanced, 2x performance, 3x ultra performance, 1x DLAA.
 static int quality(uint32_t w, uint32_t ow) {
     float s = (float)ow / (float)w;
@@ -650,6 +661,8 @@ int vk_dlss_warm(VkCommandBuffer cb, uint64_t fence) {
     return 1;
 }
 
+#endif   // _WIN32
+
 // The inputs of a temporal upscaler for this frame (DLSS in vk_dlss_record, FSR 3.1 in vk_fsr3.c): the jitter the
 // scene was drawn with, the scene's depth view and projection, and the camera motion vectors, recorded into cb through
 // the recorder. For inputs of w x h upscaled to ow x oh. fresh: the upscaler has no history of its own (a new feature).
@@ -712,6 +725,7 @@ void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow
     next_jitter(w, ow);
 }
 
+#ifdef _WIN32
 int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out) {
     // The setting is live: fsr or bilinear chosen while the game runs turns DLSS off here (the extensions stay).
     if (!vk_dlss_wanted() || strcmp(cfg_value("TOTK_UPSCALER"), "dlss") || !init()) return 0;
@@ -789,31 +803,38 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     return 1;
 }
 
+#endif   // _WIN32
+
 void vk_dlss_release(void) {   // device idle
-    if (!params) return;   // NGX never initialised
+#ifdef _WIN32
     for (int i = 0; i < GRAVE; i++)
         if (grave[i].h) ngx_release(grave[i].h), grave[i].h = NULL;
     if (F.h) ngx_release(F.h), F.h = NULL;
+#endif
     VkCtx *c = vk_ctx();
-    if (c) {
+    if (c) {   // the temporal inputs exist for FSR 3.1 too, whether or not NGX started
         if (F.mv_v) vkDestroyImageView(c->device, F.mv_v, NULL);
         if (F.depth_v) vkDestroyImageView(c->device, F.depth_v, NULL);
         if (F.mv) vmaDestroyImage(c->vma, F.mv, F.mv_a);
         if (F.depth) vmaDestroyImage(c->vma, F.depth, F.depth_a);
         mv_release(c->device);
-        if (ngx_destroy) ngx_destroy(params);
-        if (ngx_shutdown) ngx_shutdown(c->device);
+#ifdef _WIN32
+        if (params && ngx_destroy) ngx_destroy(params);
+        if (params && ngx_shutdown) ngx_shutdown(c->device);
+#endif
     }
     memset(&F, 0, sizeof F);
     memset(&S, 0, sizeof S);
     memset(&SH, 0, sizeof SH);
     memset(used_h, 0, sizeof used_h);
     memset(&J, 0, sizeof J);
+#ifdef _WIN32
     params = NULL;
+#endif
     if (state > 0) state = 0;   // a new device initialises NGX again; a failure stays a failure
 }
 
-#else   // NGX is Windows-only here
+#ifndef _WIN32   // NGX is Windows-only here
 
 int vk_dlss_wanted(void) { return 0; }
 int vk_dlss_instance_exts(const char **out, int max) { (void)out, (void)max; return 0; }
@@ -823,17 +844,5 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     return 0;
 }
 int vk_dlss_warm(VkCommandBuffer cb, uint64_t fence) { (void)cb, (void)fence; return 0; }
-int vk_temporal_inputs(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int fresh, VkTemporalIn *t) {
-    (void)cb, (void)w, (void)h, (void)ow, (void)oh, (void)fresh;
-    memset(t, 0, sizeof *t);
-    return 0;
-}
-void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow) { (void)t, (void)w, (void)h, (void)ow; }
-void vk_dlss_release(void) {}
-void vk_dlss_jitter(VkImage depth, float j[2]) { (void)depth, (void)j; }
-void vk_dlss_scene_draw(const VkExec *ex) { (void)ex; }
-void vk_dlss_part_begin(int k) { (void)k; }
-void vk_dlss_part_taken(int k) { (void)k; }
-void vk_dlss_image_gone(VkImage image) { (void)image; }
 
 #endif

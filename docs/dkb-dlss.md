@@ -74,4 +74,4 @@ It takes DLSS's inputs from `vk_dlss.c` (`vk_temporal_inputs`: the jitter, the s
 vectors), the near and far distances from the scene's projection, and the game's depth as it is (the passes are built
 for a forward depth). A frame without a scene at the input size, or an unsupported GPU, leaves the dispatch to the game's
 upscaler; `dkb.log` gets `fsr3:` lines (the passes ready, the sizes, a summary every 1800 frames, and
-`fsr3: N frames, T temporal, R resets` at exit). RCAS is not used.
+`fsr3: N frames, T temporal, R resets` at exit). RCAS is not used. The temporal inputs do not depend on NGX, so `fsr3` also builds and runs off Windows; only DLSS is Windows-only.

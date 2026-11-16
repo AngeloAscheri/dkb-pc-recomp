@@ -153,13 +153,16 @@ int vk_fsr3_wanted(void) {
     static uint64_t seen = ~0ull;
     static int chosen;
     uint64_t f = frames_now();
-    if (f != seen) seen = f, chosen = !strcmp(cfg_value("TOTK_UPSCALER"), "fsr3");
-    return chosen && !G.failed;
+    if (f != __atomic_load_n(&seen, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&chosen, !strcmp(cfg_value("TOTK_UPSCALER"), "fsr3"), __ATOMIC_RELAXED);
+        __atomic_store_n(&seen, f, __ATOMIC_RELAXED);
+    }
+    return __atomic_load_n(&chosen, __ATOMIC_RELAXED) && !__atomic_load_n(&G.failed, __ATOMIC_RELAXED);
 }
 
 static int fail(const char *why) {
-    if (!G.failed) rt_log("fsr3: %s; the game's upscaler runs", why);
-    G.failed = 1;
+    if (!__atomic_load_n(&G.failed, __ATOMIC_RELAXED)) rt_log("fsr3: %s; the game's upscaler runs", why);
+    __atomic_store_n(&G.failed, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -678,21 +681,18 @@ int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
         return 0;
     }
     if (!make_pipelines()) return fail("this GPU lacks what the FSR 3.1 passes need, or a pass could not be made");
-    VkTemporalIn t;
-    if (!vk_temporal_inputs(cb, w, h, ow, oh, 0, &t)) return fail("its motion-vector image could not be made");
-    float dtv[4];
-    // Without a scene at the input size (a menu, a cutscene's own passes) the game's upscaler runs this frame, and the
-    // next temporal one starts from a reset.
-    if (!t.temporal || !camera_factors(t.proj, dtv)) {
-        vk_temporal_done(&t, w, h, ow);
+    // Everything that can fail without a scene comes before vk_temporal_inputs, so a 0 never follows recorded commands
+    // (the motion pass binds its own pipeline, and on 0 the game's upscaler would dispatch on it).
+    int slot = ring_take(fence);   // all in flight: the game's upscaler this frame
+    if (slot < 0) {
+        VkTemporalIn none = {0};   // records nothing; clears the jitter and the noted scene
+        vk_temporal_done(&none, w, h, ow);
         G.spatial++;
         return 0;
     }
-    int slot = ring_take(fence);   // all in flight: the game's upscaler this frame
-    if (slot < 0 || !make_images(w, h, ow, oh)) {
-        if (slot >= 0) G.ring_fence[slot] = 0;
-        vk_temporal_done(&t, w, h, ow);
-        return slot < 0 ? 0 : fail("its internal images could not be made");
+    if (!make_images(w, h, ow, oh)) {
+        G.ring_fence[slot] = 0;
+        return fail("its internal images could not be made");
     }
     VkImageView iv = color_view(in->image, in->format, VK_IMAGE_USAGE_SAMPLED_BIT);
     VkImageView ov = color_view(out->image, out->format, VK_IMAGE_USAGE_STORAGE_BIT);
@@ -700,6 +700,25 @@ int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
         vk_defer_view(iv), vk_defer_view(ov);
         G.ring_fence[slot] = 0;
         return fail("no sampled view of the input or storage view of the output");
+    }
+    VkTemporalIn t;
+    if (!vk_temporal_inputs(cb, w, h, ow, oh, 0, &t)) {
+        vk_defer_view(iv), vk_defer_view(ov);
+        G.ring_fence[slot] = 0;
+        return fail("its motion-vector image could not be made");
+    }
+    float dtv[4];
+    // Without a scene at the input size (a menu, a cutscene's own passes) the game's upscaler runs this frame, and the
+    // next temporal one starts from a reset. A scene whose projection FSR cannot use is the same, but the motion pass
+    // may have bound its own pipeline: -1, and the caller binds the game's again.
+    if (!t.temporal || !camera_factors(t.proj, dtv)) {
+        int bound = t.temporal;
+        t.temporal = 0;   // no jitter for the next frame either
+        vk_temporal_done(&t, w, h, ow);
+        vk_defer_view(iv), vk_defer_view(ov);
+        G.ring_fence[slot] = 0;
+        G.spatial++;
+        return bound ? -1 : 0;
     }
     evaluate(cb, iv, &t, dtv, (unsigned)slot);
     // FSR's picture into the game's output image.
