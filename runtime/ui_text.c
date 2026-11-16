@@ -72,8 +72,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "Choose which graphics card runs the game. Use Automatic unless you need to select a specific card.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Full also shows a frame time graph and hardware statistics. Press F10 to cycle through the modes.",
-    [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Full also shows a frame time graph and hardware statistics. "
+                                  "Breakdown splits each frame in the graph into its parts: the game's own work, the GPU frame prep, "
+                                  "the waits by what was waited for, and the frame rate limit. Press F10 to cycle through the modes.",
+    [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full", [UI_MENU_PERF_BREAKDOWN] = "Breakdown",
     // printf format of the overlay line in FPS mode: the frame rate
     [UI_PERF_LINE_FPS] = "%.0f fps",
     [UI_MENU_RESOLUTION_GROUP] = "Resolution",
@@ -371,6 +373,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OV_REPLAY] = "GPU frame prep", [UI_MENU_OV_GPU_TIME] = "GPU busy per frame",
     [UI_MENU_OV_PIPE_WAIT] = "Pipeline waits",
     [UI_MENU_OV_SHADER_WAIT] = "Shader waits", [UI_MENU_OV_TEX_UPLOADS] = "Texture uploads",
+    [UI_MENU_OV_PART_GAME] = "Game", [UI_MENU_OV_PART_TEX] = "Texture waits", [UI_MENU_OV_PART_FENCE] = "GPU waits",
+    [UI_MENU_OV_PART_PRESENT] = "Present waits", [UI_MENU_OV_PART_PACE] = "Frame limit",
     [UI_MENU_OV_FMT_PCT] = "%.0f%%", [UI_MENU_OV_FMT_TEMP] = "%.0f °C", [UI_MENU_OV_FMT_POWER] = "%.0f W",
     [UI_MENU_OV_FMT_MHZ] = "%.0f MHz", [UI_MENU_OV_FMT_GB] = "%.1f GB", [UI_MENU_OV_FMT_GB_OF] = "/ %.1f GB",
     [UI_MENU_OV_GAME_GB] = "game %.1f GB", [UI_MENU_OV_FMT_MS] = "%.2f ms", [UI_MENU_OV_PER_FRAME] = "%.1f per frame",
@@ -416,8 +420,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
     [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Полный» добавляет время кадров с графиком, "
                                   "загрузку ЦП, GPU и памяти, температуры и ожидания потока отрисовки. F10 переключает "
-                                  "режимы.",
-    [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
+                                  "режимы. «Разбивка» делит каждый кадр на графике на части: работа самой игры, подготовка "
+                                  "кадра для GPU, ожидания по причинам и ограничение кадров.",
+    [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный", [UI_MENU_PERF_BREAKDOWN] = "Разбивка",
     [UI_PERF_LINE_FPS] = "%.0f к/с",
     [UI_MENU_RESOLUTION_GROUP] = "Разрешение",
     [UI_MENU_DISPLAY_OUTPUT] = "Вывод изображения",
@@ -729,6 +734,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_REPLAY] = "Подготовка кадра для GPU", [UI_MENU_OV_GPU_TIME] = "Занятость GPU за кадр",
     [UI_MENU_OV_PIPE_WAIT] = "Ожидания конвейеров",
     [UI_MENU_OV_SHADER_WAIT] = "Ожидания шейдеров", [UI_MENU_OV_TEX_UPLOADS] = "Загрузки текстур",
+    [UI_MENU_OV_PART_GAME] = "Игра", [UI_MENU_OV_PART_TEX] = "Ожидания текстур", [UI_MENU_OV_PART_FENCE] = "Ожидания GPU",
+    [UI_MENU_OV_PART_PRESENT] = "Ожидания вывода", [UI_MENU_OV_PART_PACE] = "Ограничение кадров",
     [UI_MENU_OV_FMT_PCT] = "%.0f%%", [UI_MENU_OV_FMT_TEMP] = "%.0f °C", [UI_MENU_OV_FMT_POWER] = "%.0f Вт",
     [UI_MENU_OV_FMT_MHZ] = "%.0f МГц", [UI_MENU_OV_FMT_GB] = "%.1f ГБ", [UI_MENU_OV_FMT_GB_OF] = "/ %.1f ГБ",
     [UI_MENU_OV_GAME_GB] = "игра %.1f ГБ", [UI_MENU_OV_FMT_MS] = "%.2f мс", [UI_MENU_OV_PER_FRAME] = "%.1f за кадр",

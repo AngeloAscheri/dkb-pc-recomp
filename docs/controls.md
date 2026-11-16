@@ -93,7 +93,7 @@ Every prompt is a glyph of one font, `scft/NinDev-HardKey.bfotf`, the same in ea
 | Key | Gamepad | Action |
 |---|---|---|
 | F1 or Esc | Guide / Home button, or Minus + Plus together (default) | open or close the settings menu; the game gets no input while it is open |
-| F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
+| F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel, full panel with the frame time broken into its parts |
 | F11 | Hold Start + Back for 0.5 seconds (opt-in) | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
 
 By default, the original immediate Minus + Plus settings shortcut remains available and follows the current bindings.
