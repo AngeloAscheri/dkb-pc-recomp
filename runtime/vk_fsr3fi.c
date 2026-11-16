@@ -725,7 +725,7 @@ int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView col
     k.optical_flow_half_res_mode = 0;
     k.num_instances = 1;
     k.interpolation_rect_size[0] = uw, k.interpolation_rect_size[1] = uh;
-    k.back_buffer_transfer_function = 0;   // the SDR picture (vk_framegen.c makes no frames from the HDR one)
+    k.back_buffer_transfer_function = 0;   // the SDR picture (vk_framegen.c makes frames from the HDR one too, but its record skips this AMD path for PQ)
     k.min_max_luminance[0] = 0.0f, k.min_max_luminance[1] = 1.0f;
     // fTanHalfFOV is the horizontal half angle's tangent, as ffxFrameInterpolationDispatch builds it from the vertical
     // field of view and the render aspect: 1 / p[0][0] of the scene's projection
