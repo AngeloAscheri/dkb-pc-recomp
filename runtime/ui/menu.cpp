@@ -676,6 +676,25 @@ static const char *present_note(void) {
     return note;
 }
 
+// Frame generation (vk_framegen.c, Bananza only): off, Auto (a frame for each of the display's refreshes) or a fixed
+// 2x to 8x, live; the names follow the order of cfg.c's list of values. It makes no frames in VSync (fifo) mode, which
+// the note under the value says while both are chosen. "Made by" (frame_gen_by, vk_fsr3fi.c) is shown at 2x only, the
+// one multiplier AMD's interpolation makes frames for; its note says what AMD's needs while it is chosen.
+static void rows_frame_gen(void) {
+    static const UiTextId names[] = {UI_MENU_OFF, UI_MENU_AUTO, UI_MENU_FRAME_GEN_2X, UI_MENU_FRAME_GEN_3X,
+                                     UI_MENU_FRAME_GEN_4X, UI_MENU_FRAME_GEN_5X, UI_MENU_FRAME_GEN_6X,
+                                     UI_MENU_FRAME_GEN_7X, UI_MENU_FRAME_GEN_8X};
+    const char *mode = cfg_value("TOTK_FRAME_GEN");
+    bool idle = strcmp(mode, "off") && !strcmp(gfx_window_present_mode(), "fifo");
+    opt_choice("TOTK_FRAME_GEN", UI_MENU_FRAME_GEN, names, 9, UI_MENU_FRAME_GEN_DESC,
+               idle ? menu_text(UI_MENU_FRAME_GEN_VSYNC) : nullptr);
+    if (!strcmp(mode, "2x")) {
+        static const UiTextId by[] = {UI_MENU_FRAME_GEN_BUILTIN, UI_MENU_FRAME_GEN_FSR3};
+        opt_choice("TOTK_FRAME_GEN_BY", UI_MENU_FRAME_GEN_BY, by, 2, UI_MENU_FRAME_GEN_BY_DESC,
+                   !strcmp(cfg_value("TOTK_FRAME_GEN_BY"), "fsr3") ? menu_text(UI_MENU_FRAME_GEN_BY_NEEDS) : nullptr);
+    }
+}
+
 // ---- the tabs
 // Colour adjustment (vk_color.c): a profile writes the four values (STS78721's presets, issue #136); moving one of them
 // makes the profile Custom.
@@ -780,6 +799,7 @@ static void tab_display(float scale) {
     if (!rt_game_version && settings_section(UI_MENU_FRAME_RATE_GROUP, "frame_rate")) {
         row_fps_limit();
         opt_toggle("TOTK_REALTIME", UI_MENU_DKB_REALTIME, UI_MENU_DKB_REALTIME_DESC);
+        rows_frame_gen();
     }
     if (!rt_game_version && settings_section(UI_MENU_ULTRAWIDE, "ultrawide")) {
         row_dkb_ultrawide();
