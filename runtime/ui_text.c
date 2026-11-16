@@ -196,6 +196,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_DKB_REALTIME] = "Allow higher frame rates",
     [UI_MENU_DKB_REALTIME_DESC] = "Unlocks the Frame rate limit setting, including rates above 60 FPS. "
                                 "Game timing adapts as FPS changes. This mode is experimental.",
+    [UI_MENU_ANTILAG] = "AMD Anti-Lag 2 (experimental)",
+    [UI_MENU_ANTILAG_DESC] = "AMD GPUs: each frame starts as late as it can, for less input delay. Shown only where the "
+                             "driver supports it.",
     [UI_MENU_CLOTH_REALTIME] = "Cloth on the clock",
     [UI_MENU_CLOTH_REALTIME_DESC] = "Steps cloth and hair by real time as well.",
     [UI_MENU_HIGHFPS_FIX] = "High frame rate fixes",
@@ -572,6 +575,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DKB_REALTIME] = "Разрешить высокий FPS",
     [UI_MENU_DKB_REALTIME_DESC] = "Позволяет выбрать лимит кадров, в том числе выше 60 FPS. "
                                 "Игровое время подстраивается под частоту кадров. Режим экспериментальный.",
+    [UI_MENU_ANTILAG] = "AMD Anti-Lag 2 (экспериментально)",
+    [UI_MENU_ANTILAG_DESC] = "Видеокарты AMD: каждый кадр начинается как можно позже, задержка ввода меньше. "
+                             "Показывается только там, где это поддерживает драйвер.",
     [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",
     [UI_MENU_CLOTH_REALTIME_DESC] = "Ткань и волосы тоже идут по реальному времени.",
     [UI_MENU_HIGHFPS_FIX] = "Исправления для высокого FPS",

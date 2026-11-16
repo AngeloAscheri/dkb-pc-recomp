@@ -17,6 +17,12 @@
 # cloth_realtime = 1
 # Fix for physics that bounce at high frame rates.
 # highfps_fix = 1
+# AMD Anti-Lag 2 (experimental, off by default): on an AMD GPU whose driver has VK_AMD_anti_lag, the driver starts each
+# frame as late as it can, for less delay from input to the screen. The row appears in Display > Frame rate only where
+# the device has it. On Linux, Mesa's RADV has it through the layer VK_LAYER_MESA_anti_lag, which the game loads when
+# antilag = 1 at start (so on RADV, turning it on needs a restart), unless you set ENABLE_LAYER_MESA_ANTI_LAG or
+# DISABLE_LAYER_MESA_ANTI_LAG yourself. Elsewhere changes while the game runs take effect at once.
+# antilag = 0
 
 [performance]
 # The keys of this section and of [diagnostics] are for testing and troubleshooting, and take effect at the next start.

@@ -75,6 +75,7 @@ typedef struct {
     int64_t due[FG_MAX_MULT];
     uint32_t w, h;
     uint64_t frame_no;          // the game frame for the thumbnails and the dump (vk_thumbs_frame), 0 none
+    uint64_t antilag;           // the game frame's AMD Anti-Lag 2 index (vk_antilag.c), 0 none
     int busy;                   // made and not yet all shown (D.mu)
 } Set;
 
@@ -476,6 +477,9 @@ static void display_main(void *arg) {
             plat_mutex_unlock(&D.mu);
             if (live) {
                 if (st->game[k] && st->frame_no) vk_thumbs_frame(st->frame_no);   // the thumbnail and the dump name the game's frame
+                // AMD Anti-Lag 2: only the game's own frame of the set has a present stage, not the made ones; the set
+                // keeps the game frame's index from when it was recorded
+                if (st->game[k]) vk_antilag_present(st->antilag);
                 vk_present_image_held(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
             }
             vk_present_unlock();
@@ -494,7 +498,8 @@ static void display_main(void *arg) {
     }
 }
 
-static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no) {
+static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no,
+                  uint64_t antilag) {
     VkCtx *c = vk_ctx();
     if (S.dead || !c) return 0;
     if (gfx_window_closing()) return 0;   // the exit is about to free everything below
@@ -614,7 +619,7 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
             n = 1, st->game[0] = 1, t[0] = 1.0f, st->due[0] = (int64_t)now + S.interval;
             S.slot_next = (int64_t)now + (int64_t)(1e9 / (hz > 0 ? hz : 60.0));
         }
-        st->n = n, st->w = (uint32_t)cw, st->h = (uint32_t)ch, st->frame_no = frame_no;
+        st->n = n, st->w = (uint32_t)cw, st->h = (uint32_t)ch, st->frame_no = frame_no, st->antilag = antilag;
         any_made = 0;
         for (int k = 0; k < n; k++) any_made |= !st->game[k];
     }
@@ -734,16 +739,17 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     return 2;   // Auto: also a set of no frames, when the game outruns the display and this frame has no refresh
 }
 
-int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no) {
+int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no,
+                 uint64_t antilag) {
     plat_mutex_lock(&fgl);
-    int r = record(src, fmt, w, h, crop, fi, frame_no);
+    int r = record(src, fmt, w, h, crop, fi, frame_no, antilag);
     // a frame the display thread does not get is presented by the caller (or by vk_fg_show): the sets before it go out first
     if (r != 2) display_idle();
     plat_mutex_unlock(&fgl);
     return r;
 }
 
-void vk_fg_show(int (*pending)(void), uint64_t frame) {
+void vk_fg_show(int (*pending)(void), uint64_t frame, uint64_t antilag) {
     plat_mutex_lock(&fgl);
     VkImage made = S.made.img, real = S.hist[S.shown].img;
     int w = (int)S.w, h = (int)S.h;
@@ -766,6 +772,7 @@ void vk_fg_show(int (*pending)(void), uint64_t frame) {
         uint64_t step = due - now;
         plat_wait_ns(step > 1000000 ? 1000000 : step);
     }
+    vk_antilag_present(antilag);   // AMD Anti-Lag 2: only the game's own frame has a present stage, not the made one
     vk_present_flip();
     plat_mutex_lock(&fgl);
     S.cut += cut;

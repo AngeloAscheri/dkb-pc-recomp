@@ -120,6 +120,14 @@ The set-up line says the mode: `fg: frame generation Auto on (experimental): a f
 - Extra GPU cost: a blit, luma, block matching and median pass per game frame, and a full-size synthesis pass per made frame.
 - Experimental: artifacts around fast or occluded motion are expected.
 
+## AMD Anti-Lag 2
+
+`antilag = 1` (`TOTK_ANTILAG=1`; Display > Frame rate > AMD Anti-Lag 2, off by default, experimental), independent of frame generation. Code: `runtime/vk_antilag.c`. The row is shown only where the device has `VK_AMD_anti_lag` with its `antiLag` feature. The extension is enabled whenever it is there, so the setting applies at once.
+
+On Linux, RADV has no `VK_AMD_anti_lag` of its own: Mesa ships it as the implicit layer `VK_LAYER_MESA_anti_lag`, which the Vulkan loader loads only with `ENABLE_LAYER_MESA_ANTI_LAG=1`. `vk_device.c` sets that variable before the instance when `antilag = 1` at start, unless the player set it either way (`DISABLE_LAYER_MESA_ANTI_LAG=1` still keeps the layer out). With `antilag = 0` at start the layer is not loaded, so on RADV turning Anti-Lag 2 on takes a restart, and its menu row appears only after one.
+
+Each game frame gives the driver two stages with the same index through `vkAntiLagUpdateAMD`: the input stage right after the game presented the frame before (`vk_backend.c` `vk_be_present`), where the driver may wait so the frame starts later, and the present stage right before that frame's present on the present thread (`present_main`). Each present job carries its frame's index. With frame generation only the game's own frame gives a present stage and the made frames give none, so the driver sees one present stage per game frame at every mode: at 2x `vk_fg_show` gives it right before the game frame's flip, and at Auto and 3x to 8x the set keeps the game frame's index from when it was recorded (`vk_fg_record`) and the display thread (`display_main`) gives it right before it presents the set's own game frame, under the present lock and only when the set is still live (the dead flag and the generation counter), as for the present itself. A set that is dropped or released gives no present stage. The game frame comes last in its set, so the stage lands after the made frames of that set have gone out. The log has `vk: AMD Anti-Lag 2: available (VK_AMD_anti_lag)`, `on` and `off` lines. The input stage is given on the thread that presents, which under asynchronous replay is up to a frame behind the game's simulation.
+
 ## Attribution
 
 The shaders and the approach come from Hookshot (<https://github.com/NotRexed/Hookshot>, GPL-3.0); Auto, the multipliers above 2x, the sets and the display thread from <https://git.notrexed.dev/Hookshot/Hookshot>. AMD FSR 3.1 frame interpolation: the passes are AMD's FidelityFX SDK (MIT), the dispatches follow Hookshot's `vk_fsr3fi.cpp` (<https://git.notrexed.dev/Hookshot/Hookshot>). See `THIRD_PARTY_NOTICES.md`.
