@@ -3460,7 +3460,11 @@ static void record_fixed(VkExec *ex) {
     // upscaler = dlss or fsr3: the scene's draws are moved by the sub-pixel jitter (vk_dlss.c); a change of it, entering or
     // leaving the scene's passes included, records the viewport again.
     float j[2] = {0, 0};
-    if (ex->depth.image && vk_temporal_wanted()) vk_dlss_jitter(ex->depth.image, j);
+    // Only draws that test or write depth: the game also binds the scene depth to full-screen passes that neither test
+    // nor write it (its tone mapping pass among them), and moving those shifts the finished picture a second time, so
+    // the colour ended up displaced by twice the offset the upscaler is told while the depth had it once (measured on
+    // 3.2.0 from consecutive inputs with a still camera: colour 1.9 to 2.0 times the offset, depth 1.0).
+    if (ex->depth.image && (ex->pipe.ds.dt || ex->pipe.ds.dw) && vk_temporal_wanted()) vk_dlss_jitter(ex->depth.image, j);
     if (j[0] != dc->B.jit[0] || j[1] != dc->B.jit[1]) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
     if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
         float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
