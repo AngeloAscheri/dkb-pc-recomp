@@ -755,8 +755,9 @@ static void rows_display_output(void) {
     opt_choice("TOTK_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("TOTK_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC, present_note());
-    static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
-    opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
+    static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL,
+                                     UI_MENU_PERF_BREAKDOWN};
+    opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 4, UI_MENU_PERF_OVERLAY_DESC);
     row_gpu();
 }
 
@@ -1274,19 +1275,23 @@ static int g_save_pending;   // a changed setting still waits for its write to t
 // ---- the performance overlay (TOTK_PERF_OVERLAY), in the top right corner. "fps": the frame rate over the presents of
 // the last half second. "full": a panel of perfmon.c's numbers, in the style of SavageWindRecomp's perf_overlay_draw
 // (menu.mm): the machine's load and temperatures, the frame rate and frame times with a graph, the render thread's waits.
+// "breakdown": the full panel with each frame's parts stacked in the graph's columns (perfmon.h PERF_PART_*), and a
+// legend of the parts' means.
 // Off, it costs a cfg_version load per present.
 static unsigned g_perf_ver = ~0u;
-static int g_perf_mode;                  // 0 off, 1 fps, 2 full
+static int g_perf_mode;                  // 0 off, 1 fps, 2 full, 3 breakdown
 static std::atomic<int> g_perf_save;     // F10 changed the mode: totk.ini is written on the present thread
 static uint64_t g_perf_last_ns, g_perf_win_ns, g_perf_max_ns;
 static int g_perf_frames;
 static char g_perf_text[96];
 
-static int perf_mode_of(const char *s) { return !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0; }
+static int perf_mode_of(const char *s) {
+    return !strcmp(s, "breakdown") ? 3 : !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0;
+}
 
 extern "C" void menu_perf_cycle(void) {
-    static const char *const modes[] = {"off", "fps", "full"};
-    cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 3]);
+    static const char *const modes[] = {"off", "fps", "full", "breakdown"};
+    cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 4]);
     g_perf_save.store(1);
 }
 
@@ -1322,7 +1327,7 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
         int m = perf_mode_of(cfg_value("TOTK_PERF_OVERLAY"));
         if (m != g_perf_mode) {
             g_perf_last_ns = 0, g_perf_text[0] = 0;
-            if (m == 2) perf_gpu_once(t);
+            if (m >= 2) perf_gpu_once(t);
             perfmon_mode(m);
         }
         g_perf_mode = m;
@@ -1425,6 +1430,46 @@ static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
     ImGui::EndTable();
 }
 
+// The Breakdown's colours, bottom to top (perfmon.h PERF_PART_*): blue the game's work and the frame prep, warm colours
+// the waits on the renderer's own work, red the GPU, grey the present and the frame limit.
+static const ImU32 perf_part_col[PERF_PARTS] = {
+    IM_COL32(46, 150, 204, 255),  IM_COL32(120, 190, 240, 255), IM_COL32(237, 194, 84, 255), IM_COL32(242, 140, 51, 255),
+    IM_COL32(178, 115, 217, 255), IM_COL32(230, 77, 77, 255),   IM_COL32(150, 150, 150, 255), IM_COL32(95, 95, 95, 255)};
+static const UiTextId perf_part_label[PERF_PARTS] = {UI_MENU_OV_PART_GAME, UI_MENU_OV_REPLAY,    UI_MENU_OV_SHADER_WAIT,
+                                                     UI_MENU_OV_PIPE_WAIT, UI_MENU_OV_PART_TEX,  UI_MENU_OV_PART_FENCE,
+                                                     UI_MENU_OV_PART_PRESENT, UI_MENU_OV_PART_PACE};
+
+// Each frame of the history a column of its parts, stacked from the bottom, and the frame time as a line over them; as
+// wide as the panel, which it does not widen (as PlotLines in perf_full_draw)
+static void perf_breakdown_graph(const PerfStats &s, float top, float height) {
+    ImGuiWindow *win = ImGui::GetCurrentWindow();
+    const float max_x = win->DC.CursorMaxPos.x;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImGui::Dummy(ImVec2(w, height));
+    win->DC.CursorMaxPos.x = max_x;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + height), IM_COL32(0, 0, 0, 90));
+    const float cw = w / PERF_HISTORY, bottom = p.y + height;
+    for (int i = 0; i < PERF_HISTORY; i++) {
+        const float x0 = p.x + i * cw, x1 = x0 + cw;
+        float y = bottom;
+        for (int k = 0; k < PERF_PARTS && y > p.y; k++) {
+            const float hh = s.frame_part[i][k] / top * height;
+            if (hh <= 0) continue;
+            const float y1 = y - hh > p.y ? y - hh : p.y;
+            dl->AddRectFilled(ImVec2(x0, y1), ImVec2(x1, y), perf_part_col[k]);
+            y = y1;
+        }
+    }
+    for (int i = 1; i < PERF_HISTORY; i++) {
+        if (s.frame_ms[i - 1] <= 0 || s.frame_ms[i] <= 0) continue;
+        const float ya = bottom - (s.frame_ms[i - 1] < top ? s.frame_ms[i - 1] : top) / top * height;
+        const float yb = bottom - (s.frame_ms[i] < top ? s.frame_ms[i] : top) / top * height;
+        dl->AddLine(ImVec2(p.x + (i - 0.5f) * cw, ya), ImVec2(p.x + (i + 0.5f) * cw, yb), IM_COL32(140, 212, 79, 255));
+    }
+}
+
 static void perf_full_draw(const MenuTarget *t, float scale) {
     float w = (float)t->width;
     PerfStats s;
@@ -1479,11 +1524,25 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     // as wide as the panel the tables size; the plot does not count toward that width, so the panel can still shrink
     ImGuiWindow *win = ImGui::GetCurrentWindow();
     float max_x = win->DC.CursorMaxPos.x;
-    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(-FLT_MIN, 48 * scale));
+    if (g_perf_mode == 3) perf_breakdown_graph(s, top, 64 * scale);
+    else ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(-FLT_MIN, 48 * scale));
     win->DC.CursorMaxPos.x = max_x;
+    // Breakdown: the parts' means over the last second, each label in its colour, under the graph
+    if (g_perf_mode == 3 && ImGui::BeginTable("##perfb", 2, ImGuiTableFlags_SizingFixedFit)) {
+        static const PerfCol c1[] = {{UI_MENU_OV_FMT_MS, 888.88f}};
+        ImGui::TableSetupColumn("##b0", ImGuiTableColumnFlags_WidthStretch);
+        perf_column("##b1", c1, 1);
+        for (int k = PERF_PARTS - 1; k >= 0; k--) {   // the legend in the graph's order, top first
+            perf_label(perf_part_label[k], ImGui::ColorConvertU32ToFloat4(perf_part_col[k]));
+            perf_cell(UI_MENU_OV_FMT_MS, s.part_ms[k]);
+        }
+        perf_label(UI_MENU_OV_GPU_TIME, gpu_c);
+        perf_cell(UI_MENU_OV_FMT_MS, s.gpu_ms);
+        ImGui::EndTable();
+    }
     // per frame, averaged over the last half second; the labels' column stretches, so the numbers end at the panel's
     // right edge, and the table still asks for no more than its widest label and number
-    if (ImGui::BeginTable("##perfw", 2, ImGuiTableFlags_SizingFixedFit)) {
+    if (g_perf_mode == 2 && ImGui::BeginTable("##perfw", 2, ImGuiTableFlags_SizingFixedFit)) {
         static const PerfCol c1[] = {{UI_MENU_OV_FMT_MS, 888.88f}, {UI_MENU_OV_PER_FRAME, 888.8f}};
         ImGui::TableSetupColumn("##w0", ImGuiTableColumnFlags_WidthStretch);
         perf_column("##w1", c1, 2);
@@ -1506,7 +1565,7 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
 }
 
 static void perf_draw(const MenuTarget *t, float scale) {
-    if (g_perf_mode == 2) return perf_full_draw(t, scale);
+    if (g_perf_mode >= 2) return perf_full_draw(t, scale);
     float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
     // with the menu open: under its window, over the dimming layout_menu drew before

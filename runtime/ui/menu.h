@@ -25,7 +25,7 @@ extern "C" {
 // ---- state, any thread
 int menu_is_open(void);
 void menu_toggle(void);                   // F1 / Esc, Guide/Home, or the default mapped Plus+Minus combo
-void menu_perf_cycle(void);               // F10: the performance overlay off, fps, full
+void menu_perf_cycle(void);               // F10: the performance overlay off, fps, full, breakdown
 
 // ---- events from the window adapter, used only while the menu is open. key: an ImGuiKey; coordinates in pixels of the
 // window's client area, which is the swapchain image.
