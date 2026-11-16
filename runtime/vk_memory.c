@@ -1401,16 +1401,10 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
     qsort(w, (size_t)m, sizeof *w, wb_cmp);
     pool_lock_shared();
     plat_mutex_lock(&shadow_lock);
-    // Runs of pages the copies will write: neighbours and ranges on one page become one thaw and one prewrite.
-    for (int i = 0; i < m;) {
-        uint64_t lo = w[i][0] & ~0xfffull, hi = (w[i][1] + 0xfff) & ~0xfffull;
-        int j = i + 1;
-        for (; j < m && (w[j][0] & ~0xfffull) <= hi; j++)
-            if (((w[j][1] + 0xfff) & ~0xfffull) > hi) hi = (w[j][1] + 0xfff) & ~0xfffull;
-        mem_thaw(lo, hi - lo);
-        plat_mem_prewrite(lo, hi - lo);
-        i = j;
-    }
+    // Look each range's pool up first: only a range the copy below takes (the pool has a shadow map covering it) has
+    // its pages thawed and prewritten, so a range outside every pool leaves its pages as they are.
+    PoolRec **pr = calloc((size_t)m, sizeof *pr);
+    if (!pr) rt_fatal("vk: out of memory for a write-back batch");
     PoolRec *r = NULL;
     for (int i = 0; i < m; i++) {
         uint64_t a = w[i][0], size = w[i][1] - a;
@@ -1418,10 +1412,27 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
             const pidx_ent *e = pidx_find(&pool_index, a, size);
             r = e ? e->buf : NULL;
         }
-        if (r && r->smap && a >= r->import_lo && w[i][1] <= r->import_hi) {
-            memcpy((void *)(uintptr_t)a, r->smap + (a - r->import_lo), size);
-            s_wb_bytes += size;
+        if (r && r->smap && a >= r->import_lo && w[i][1] <= r->import_hi) pr[i] = r;
+    }
+    // Runs of pages the copies will write: neighbours and ranges on one page become one thaw and one prewrite.
+    for (int i = 0; i < m;) {
+        if (!pr[i]) {
+            i++;
+            continue;
         }
+        uint64_t lo = w[i][0] & ~0xfffull, hi = (w[i][1] + 0xfff) & ~0xfffull;
+        int j = i + 1;
+        for (; j < m && (!pr[j] || (w[j][0] & ~0xfffull) <= hi); j++)
+            if (pr[j] && ((w[j][1] + 0xfff) & ~0xfffull) > hi) hi = (w[j][1] + 0xfff) & ~0xfffull;
+        mem_thaw(lo, hi - lo);
+        plat_mem_prewrite(lo, hi - lo);
+        i = j;
+    }
+    for (int i = 0; i < m; i++) {
+        if (!pr[i]) continue;
+        uint64_t a = w[i][0], size = w[i][1] - a;
+        memcpy((void *)(uintptr_t)a, pr[i]->smap + (a - pr[i]->import_lo), size);
+        s_wb_bytes += size;
     }
     // Each range leaves the pending list once, as vk_gpu_written removes one entry per call: equal ranges are
     // neighbours in w, and gone[] marks the ones that found their entry.
@@ -1447,6 +1458,7 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
         if (!nvn_gpu_only(w[i][0])) stamp_range(w[i][0] & ~0xfffull, (w[i][1] + 0xfff) & ~0xfffull, g);
     plat_mutex_unlock(&gen_lock);
     free(gone);
+    free(pr);
     free(w);
 }
 
