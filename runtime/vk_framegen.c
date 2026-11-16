@@ -102,7 +102,7 @@ static struct {
     uint64_t last_at;     // when the previous job reached vk_fg_record; 0 = none
     int64_t interval;     // the game's frame interval, fg_pace_interval
     // the 5 s log
-    uint64_t t0, real, made_n, by_fsr, no_hist, hitch, over, crop, cut, late;
+    uint64_t t0, real, made_n, by_fsr, no_hist, hitch, over, crop, cut, late, set_waits;
 } S;
 // S and the images are touched by vk_fg_record (the present thread) and vk_fg_release (the exit, under vk_present.c's g_pl
 // first: that order everywhere), so each holds this lock for its whole run; vk_fg_show copies what it needs and presents
@@ -403,22 +403,15 @@ static void log_stats(uint64_t now) {
     double s = (double)(now - S.t0) / 1e9;
     if (S.frames)   // Auto and 3x to 8x: the display thread shows the frames and counts what it shows (display_main)
         rt_log("fg: %.1f s: real %.1f fps, made %u (%.1f a second); game frames without made ones: no history %u, hitch %u, "
-               "over refresh %u, crop %u", s, (double)S.real / s, (unsigned)S.made_n, (double)S.made_n / s,
-               (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop);
+               "over refresh %u, crop %u; waited for a set %u", s, (double)S.real / s, (unsigned)S.made_n,
+               (double)S.made_n / s, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
+               (unsigned)S.set_waits);
     else
         rt_log("fg: %.1f s: real %.1f fps, shown %.1f fps, made %u (by AMD FSR 3.1 %u); skipped: no history %u, "
                "hitch %u, over refresh %u, crop %u; real cut short %u; late >2 ms %u", s, (double)S.real / s,
                (double)(S.real + S.made_n) / s, (unsigned)S.made_n, (unsigned)S.by_fsr, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
                (unsigned)S.cut, (unsigned)S.late);
-    S.t0 = now, S.real = S.made_n = S.by_fsr = S.no_hist = S.hitch = S.over = S.crop = S.cut = S.late = 0;
-}
-
-// Waits until at: a sleep to 1 ms before it, then yields (the sleep alone wakes up to ~0.5 ms late), as Hookshot's
-// display thread waits (vk_framegen.cpp wait_until_near).
-static void wait_until(int64_t at) {
-    int64_t now = (int64_t)kern_now_ns();
-    if (at > now + 1500000) plat_wait_ns((uint64_t)(at - now - 1000000));
-    while ((int64_t)kern_now_ns() < at) plat_yield();
+    S.t0 = now, S.real = S.made_n = S.by_fsr = S.no_hist = S.hitch = S.over = S.crop = S.cut = S.late = S.set_waits = 0;
 }
 
 // The display thread (Hookshot vk_framegen.cpp display_main): takes the sets in the order they were made and shows
@@ -450,6 +443,11 @@ static void display_main(void *arg) {
             on_time = late = skipped = 0, since = at;
         }
         const int timed = st->timed, shown = st->n;
+        // The flight thumbnail names the game's frame (vk_thumbs_frame): its own frame when the set shows it, else the
+        // set's last frame, the one nearest it (Auto shows the game's frame only when a refresh falls on it).
+        int tag = shown - 1;
+        for (int k = 0; k < shown; k++)
+            if (st->game[k]) tag = k;
         const int64_t step = interval / (shown > 1 ? shown : 1);
         for (int k = 0; k < shown; k++) {
             // A made frame is left out when the next set is already waiting: the display thread behind the game holds
@@ -465,7 +463,7 @@ static void display_main(void *arg) {
             }
             const int64_t now = (int64_t)kern_now_ns();
             const int64_t due = fg_pace_show_due(timed, st->due[k], next_show, now, at, interval, step);
-            wait_until(due);
+            vk_wait_until((uint64_t)due);
             const int64_t t = (int64_t)kern_now_ns();
             // The start lock (gfx_window_start) before the present lock, never under it: the exit holds the start lock
             // while vk_present_release waits for the present lock (vk_present_image_held).
@@ -475,7 +473,7 @@ static void display_main(void *arg) {
             const int live = !D.dead && gen == D.gen;
             plat_mutex_unlock(&D.mu);
             if (live) {
-                if (st->game[k] && st->frame_no) vk_thumbs_frame(st->frame_no);   // the thumbnail and the dump name the game's frame
+                if (k == tag && st->frame_no) vk_thumbs_frame(st->frame_no);
                 vk_present_image_held(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
             }
             vk_present_unlock();
@@ -582,6 +580,7 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     if (frames) {
         plat_mutex_lock(&D.mu);
         const uint64_t wait0 = kern_now_ns();
+        S.set_waits += S.sets[S.next_set].busy && !D.dead;   // the game frame waits for the display thread
         while (S.sets[S.next_set].busy && !D.dead) plat_cond_wait_ms(&D.cv, &D.mu, 100);
         const uint64_t waited = kern_now_ns() - wait0;
         const int dead = D.dead;

@@ -26,7 +26,7 @@ Each refresh of the display between two game frames gets a frame made at its pla
 
 ### Two threads, as in Hookshot (Auto and 3x to 8x)
 
-The design is Hookshot's (`gpu/vk/vk_framegen.cpp`: `framegen_record`, `display_main`). The present thread (`vk_backend.c` `present_main`) calls `vk_fg_record` in place of its blit: it makes the game frame's set (the made frames and a copy of the game's own, since the history image is written again two frames on) into one of three sets, submits it and queues it, and is free for the next game frame at once. It waits only when all three sets are still being shown, which holds the game back as Hookshot's sets do.
+The design is Hookshot's (`gpu/vk/vk_framegen.cpp`: `framegen_record`, `display_main`). The present thread (`vk_backend.c` `present_main`) calls `vk_fg_record` in place of its blit: it makes the game frame's set (the made frames and a copy of the game's own, since the history image is written again two frames on) into one of three sets, submits it and queues it, and is free for the next game frame at once. It waits only when all three sets are still being shown, which holds the game back as Hookshot's sets do (`waited for a set` in its 5 s line). Each set has images for the most frames the mode may make (Auto's cap, or the multiplier's), at the window texture's crop size in RGBA8, made when the mode or the size changes: 8x keeps 24 of them, about 800 MB at 3840x2160, even when the display lets fewer be made.
 
 The display thread (`display_main`) takes the sets in order and presents each frame through the whole present chain on an even line (`fg_pace_show_due`): the game's frame time divided by the set's frames apart, never more than one game frame behind what the game handed over, and from now again when it fell behind; Auto's frames go out at their own refreshes' times. A made frame is left out only when the next set is already waiting. A frame the display thread does not get (frame generation turned off, a skip) is presented by the present thread once every set before it was shown.
 
@@ -81,7 +81,7 @@ If set-up fails (missing push descriptors, format support, pipeline or image cre
 - No history: the first frame, after a hitch, a crop change, or after a skip for the reasons above.
 - Hitch: more than 100 ms since the previous game frame (loading, pause). The history starts again.
 - Crop change: the window texture crop size changed; images are rebuilt and the history starts again.
-- Over refresh: at 2x, 2 / interval exceeds the monitor refresh by more than 5% (60 Hz is assumed if the refresh is unknown); at a fixed multiplier, the display shows one frame per game frame.
+- Over refresh: at 2x, 2 / interval exceeds the monitor refresh by more than 5% (60 Hz is assumed if the refresh is unknown); at a fixed multiplier, the display shows one frame per game frame. Auto and 3x to 8x make as many frames as the display can show, so they make none only when it shows one a game frame.
 - Left out (Auto and 3x to 8x): the next set was already waiting when a made frame's turn came (the display thread is a set behind).
 
 A skipped frame is shown as the game's frame alone.
@@ -101,13 +101,14 @@ At 2x, every 5 seconds:
 
 With Auto and 3x to 8x, from the present thread:
 
-`fg: 5.0 s: real R fps, made N (M a second); game frames without made ones: no history A, hitch B, over refresh C, crop D`
+`fg: 5.0 s: real R fps, made N (M a second); game frames without made ones: no history A, hitch B, over refresh C, crop D; waited for a set W`
 
 and from the display thread, worded as Hookshot's line so the two logs compare directly:
 
 `fg: frame interpolation: N frames shown on time, L late (over 2 ms), S made ones left out (the game's next frame waiting); shown apart: <7 ms a, 7-9 b, 9-12 c, 12-17 d, 17-25 e, over 25 f`
 
-- on time and late: presented within 2 ms of the frame's due time, or later.
+- waited for a set: game frames whose set had to wait for the display thread to finish showing an older one (the present thread, and the game behind it, wait then).
+- on time and late: presented within 2 ms of the frame's due time, or later. After a held-up present the line's due time can be past, and the set's frames then go out at once and count as late, as in Hookshot.
 - left out: made frames not shown because the next set was already waiting.
 - shown apart: the time between two presents, counted by range.
 

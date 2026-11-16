@@ -190,6 +190,8 @@ void vk_present_lock(void);     // the lock vk_present_release runs under (vk_fr
 // vk_present_image under vk_present_lock, gfx_window_start called before the lock was taken (the start lock is never
 // taken under the present lock)
 void vk_present_image_held(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+// vk_backend.c: until kern_now_ns() reaches at: a sleep to 1 ms before it, then yields
+void vk_wait_until(uint64_t at);
 void vk_present_unlock(void);
 // TOTK_FLIGHT thumbnails (GfxBackend.thumbs_enable, thumbs_read; flight.c): the present thread blits every presented
 // frame into a host-visible ring of n thumbnails.
