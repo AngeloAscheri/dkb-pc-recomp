@@ -67,6 +67,7 @@ typedef struct PoolRec {
     struct KeptRange { uint64_t lo, hi; } *kept;   // mirror_lock: whole pages of GPU writes kept in the mirror (vk_mem_gpu_kept),
     int nkept, ckept;                  // as offsets from import_lo, sorted and disjoint; mirror_sync leaves them out of a flush
     uint64_t fl_lo, fl_hi;             // flush_lock: nvnMemoryPoolFlushMappedRange bytes not copied yet (fl_hi 0: none)
+    PlatMutex sync_lock;               // mirror_sync of this pool, one thread at a time (zero is unlocked)
     // Shadow storage (POOL_IMPORT in shadow mode, "shadow storage" below): buf is a host-visible copy of the guest pages.
     VmaAllocation salloc;
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
@@ -1684,9 +1685,12 @@ static PlatMutex mirror_lock = PLAT_MUTEX_INIT;
 // the mirrors alone and takes no lock, as before the helpers. Returns whether it took the lock, for mirror_unlock:
 // vk_spec_count is set once, by the replay thread, so a caller reads it once and pairs the two on that reading.
 static int mem_workers;   // vk_mem_threads: the workers of sliced passes (vk_exec.c) bind mirrors too
+// TOTK_MEMORY=verify reads r->kept on the completion thread (kept_page), so it always takes the lock.
+static int mirror_shared(void) {
+    return mirror_verify || vk_spec_count() || __atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE);
+}
 static int mirror_lock_if_shared(void) {
-    // TOTK_MEMORY=verify reads r->kept on the completion thread (kept_page), so it always takes the lock.
-    if (!mirror_verify && !vk_spec_count() && !__atomic_load_n(&mem_workers, __ATOMIC_ACQUIRE)) return 0;
+    if (!mirror_shared()) return 0;
     if (plat_mutex_trylock(&mirror_lock)) return 1;
     uint64_t t0 = kern_now_ns();   // contended: TOTK_TRACE=perf counts the long waits (perf_lock_wait)
     plat_mutex_lock(&mirror_lock);
@@ -2192,12 +2196,20 @@ static void kept_cut(PoolRec *r, const MRange *run, int n) {
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
+// The page scan, the long part (up to 1.9 ms for one pool on Hill, where the replay thread and the slice workers reach
+// the same pools at the start of a submission), runs under the pool's own lock into a list of the thread's; mirror_lock, which every pool's sync,
+// the write-back ranges and the prologue share, is taken only to move that list into pend and to update the kept list.
+// Threads syncing other pools no longer wait for it; a thread that needs this pool waits for its sync, as before.
 static void mirror_sync(PoolRec *r) {
-    int locked = mirror_lock_if_shared();
+    const int shared = mirror_shared();
+    if (shared) plat_mutex_lock(&r->sync_lock);
     if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) == msub) {   // the other thread did it meanwhile
-        mirror_unlock(locked);
+        if (shared) plat_mutex_unlock(&r->sync_lock);
         return;
     }
+    static _Thread_local MRange *loc;
+    static _Thread_local int nloc, cloc;
+    nloc = 0;
     uint64_t t0 = qpc();
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -2205,13 +2217,13 @@ static void mirror_sync(PoolRec *r) {
     plat_mutex_lock_shared(&gen_lock);
     for (uint64_t k = r0; k <= r1; k++)
         if (snap_at[k] != mepoch) { excl = 1; break; }
+    uint64_t queries = 0;
     if (excl) {
         plat_mutex_unlock_shared(&gen_lock);
         plat_mutex_lock(&gen_lock);
-        mrep.sync_queries += snap_regions(r0, r1, mepoch);
+        queries = snap_regions(r0, r1, mepoch);
     }
     uint32_t since = r->mgen;
-    int p0 = npend > 0 && pend[npend - 1].r == r ? npend - 1 : npend;   // range_add may extend the last entry
     uint64_t own = 0;
     int skip_own = RT_KNOB_ON(mirror_own);
     for (uint64_t k = r0; k <= r1; k++) {
@@ -2229,16 +2241,21 @@ static void mirror_sync(PoolRec *r) {
                 own++;
                 continue;
             }
-            range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
+            range_add(&loc, &nloc, &cloc, r, x - lo, 1ull << GEN_PAGE_SHIFT);
         }
     }
-    mrep.own_bytes += own << GEN_PAGE_SHIFT;
-    // The pages the CPU rewrote get the guest's bytes in the mirror: they are no longer GPU-only. A kept page whose
-    // newest stamp is the GPU write that kept it is left out above, so it stays kept.
-    if (r->nkept && npend > p0) kept_cut(r, pend + p0, npend - p0);
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
     else plat_mutex_unlock_shared(&gen_lock);
+
+    int locked = mirror_lock_if_shared();   // paired with mirror_unlock on its own reading, as everywhere
+    mrep.sync_queries += queries;
+    mrep.own_bytes += own << GEN_PAGE_SHIFT;
+    int p0 = npend > 0 && pend[npend - 1].r == r ? npend - 1 : npend;   // range_add may extend the last entry
+    for (int i = 0; i < nloc; i++) range_add(&pend, &npend, &cpend, r, loc[i].off, loc[i].size);
+    // The pages the CPU rewrote get the guest's bytes in the mirror: they are no longer GPU-only. A kept page whose
+    // newest stamp is the GPU write that kept it is left out above, so it stays kept.
+    if (r->nkept && npend > p0) kept_cut(r, pend + p0, npend - p0);
     if (__atomic_load_n(&r->fl_hi, __ATOMIC_ACQUIRE)) {
         plat_mutex_lock(&flush_lock);
         uint64_t a = r->fl_lo, b = r->fl_hi;
@@ -2266,6 +2283,7 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
     __atomic_store_n(&r->acc_sub, msub, __ATOMIC_RELEASE);
     mirror_unlock(locked);
+    if (shared) plat_mutex_unlock(&r->sync_lock);
 }
 
 
