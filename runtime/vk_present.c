@@ -191,7 +191,18 @@ static int build_swapchain(void) {
     VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
     if (r != VK_SUCCESS) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
-        g_sc = old;
+        // A failed create still retires the swapchain it was given as oldSwapchain: that one can neither be acquired
+        // from nor passed as oldSwapchain again (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933). It goes with its
+        // views and semaphores, and vk_present_frame builds a new one from nothing on a later frame. Hookshot does the
+        // same (gpu/vk/vk_main.cpp create_swapchain, db35b122: "Passing oldSwapchain retires it even when creation fails").
+        for (uint32_t i = 0; i < g_sc_n; i++) {
+            vkDestroySemaphore(c->device, g_render_done[i], NULL);
+            if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
+            g_sc_view[i] = VK_NULL_HANDLE;
+        }
+        if (old) vkDestroySwapchainKHR(c->device, old, NULL);
+        g_sc = VK_NULL_HANDLE;
+        g_sc_n = 0;
         vk_queue_unlock();
         if (hdr) {   // once: vk_hdr_off makes the next pick SDR
             rt_log("hdr: the HDR10 swapchain could not be created; trying SDR");
