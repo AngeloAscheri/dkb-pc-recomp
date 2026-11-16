@@ -95,11 +95,37 @@ upscaler; `dkb.log` gets `fsr3:` lines (the passes ready, the sizes, a summary e
 
 ## FSR 4 (`upscaler = fsr4`, issue #270)
 
-`upscaler = fsr4` (read each frame) is the same replacement with AMD's FSR 4 upscaler (4.x, the newest the loader lists), `runtime/vk_fsr4.c`. It
-needs AMD's signed DLLs, which this project does not ship: take `amd_fidelityfx_loader_vk.dll` and
-`amd_fidelityfx_upscaler_vk.dll` from the FidelityFX SDK v2.4.0 release (`Kits/FidelityFX/signedbin` in
-<https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>) and put both next to `dkb.exe`. The loader lists the
-upscalers the GPU can run (FSR 4 is for Radeon GPUs the loader lists a 4.x upscaler for, RDNA 4 at least); the inputs are the same as the other temporal
-upscalers' (`vk_temporal_inputs`). With no DLLs, a failed load, or no 4.x provider (as on NVIDIA), `dkb.log` gets one
-`fsr4:` line saying why and the FSR 3.1 path above runs instead, as does a dispatch that fails. FSR 4 is Windows only; the
-API headers are in `runtime/third_party/ffx_api`.
+`upscaler = fsr4` (read each frame) is the same replacement with AMD's FSR 4 upscaler (4.x, the newest the library lists), `runtime/vk_fsr4.c`. It
+needs AMD's library, which this project does not ship:
+
+- Windows: take `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from the FidelityFX SDK v2.4.0 release
+  (`Kits/FidelityFX/signedbin` in <https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>) and put both in one folder.
+  The loader lists the upscalers the GPU can run (FSR 4 is for Radeon GPUs the loader lists a 4.x upscaler for, RDNA 4 at least).
+- Linux: AMD publishes no Linux library; a Vulkan FSR 4 build that exports the same entry points (`ffxCreateContext`,
+  `ffxDestroyContext`, `ffxQuery`, `ffxDispatch`), such as fsr4-vk, is named `amd_fidelityfx_upscaler_vk.so` and put in
+  one folder. Set `upscaler = fsr4` in `totk.ini` before the start: such a library records with descriptor buffers, so the
+  device enables `VK_EXT_descriptor_buffer` (only when the GPU has it, and only for this setting with the library found).
+  Without the extension the library refuses its context and `dkb.log` says so.
+
+The folder is the one `fsr_dir` names (in `totk.ini`), and when the library is not there the folder of the program (`dkb.exe`
+or `dkb`). `dkb.log` has `fsr4: loaded <path>` for the file that was taken.
+
+The inputs are the same as the other temporal upscalers' (`vk_temporal_inputs`), but the library cannot take them as the game
+has them: the scene depth is a D24S8 image and the colour may hold a NaN, which would stay in its history. One small pass
+(`runtime/shaders/fsr4_prep.comp`) makes, at the render size, the colour as RGBA16F (a NaN is 0, nothing is negative or above
+64000), the depth as `1 - d` in R32F and the camera motion vectors cropped to the render size. The library is told the depth is
+reversed (`FFX_UPSCALE_ENABLE_DEPTH_INVERTED`) and, when the projection's far plane is at infinity, as the game's is,
+`FFX_UPSCALE_ENABLE_DEPTH_INFINITE`, with the true near and far distances from the projection; the context is made again if
+that changes. A reversed projection is not used (the game's upscaler runs for it). The library writes an RGBA16F picture at
+the output size and FSR 3.1's output pass writes it into the game's output image. On Linux a 1x1 exposure texture of 1 is given
+to the library, as a Vulkan FSR 4 build wants one when AMD's own exposure is not used. `dkb.log` has `fsr4: input pass in use:
+...` at the first frame, naming the formats, the sizes, the near and far distances and whether the far plane is infinite.
+
+The colour is taken as perceptual when it is not a float or sRGB format; the setting `FSR4_LDR = 1` (`DKB_FSR4_LDR` in the
+environment, read at start) takes it as perceptual up to 1 whatever its format, for diagnosing a washed-out or too dark picture.
+
+A context is never destroyed while a submission may still use it: when the output size changes and no slot for the old context
+is free, FSR 4 skips that frame (the game's upscaler runs) and tries again on the next.
+
+With no library, a failed load, or no 4.x provider (as on NVIDIA), `dkb.log` gets one `fsr4:` line saying why and the FSR 3.1
+path above runs instead, as does a dispatch that fails. The API headers are in `runtime/third_party/ffx_api`.

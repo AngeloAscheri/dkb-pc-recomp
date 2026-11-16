@@ -295,6 +295,7 @@ typedef struct {
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pei;
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT lrs;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT dbuf;
 } FeatureChain;
 
 static int create_device(void) {
@@ -346,6 +347,18 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
+    // upscaler = fsr4 on Linux with a Vulkan FSR 4 library in place (vk_fsr4.c): such a library records with descriptor
+    // buffers, so the extension and its feature are enabled, and only where the device has them. Nothing of ours uses
+    // them. Without them the library refuses its context and vk_fsr4.c falls back with a log line that says so.
+    int has_dbuf = 0;
+    if (vk_fsr4_wants_descriptor_buffer()) {
+        if (has_ext(ep, ne, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) {
+            has_dbuf = 1;
+            ext[n_ext++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+            CHAIN(dbuf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
+        }
+        else vk_fsr4_descriptor_buffer(0);
+    }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     if (vk_hdr_wanted() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
         g_vk.has_hdr_metadata = 1;
@@ -384,6 +397,10 @@ static int create_device(void) {
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
+    if (has_dbuf) {
+        c->dbuf.descriptorBufferCaptureReplay = VK_FALSE;   // a capture tool's feature: never needed, costly where on
+        vk_fsr4_descriptor_buffer(c->dbuf.descriptorBuffer && c->f12.bufferDeviceAddress);
+    }
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
