@@ -213,6 +213,12 @@ site fontk main 49ebd8 bd001560 1e2c1001 1e210800 bd001560
 # Per-font pixel tables used with glyph widths (1c10, 1c28 of the cache): store them doubled. The registers are dead after.
 site fontk main 49e75c 7837796a 531f794a 7837796a
 site fontk main 49e794 78377928 531f7908 78377928
-# Glyph cache width and height (descriptor +0/+4, stored at +0x28/+0x2c, where the texture and the packer read them): x2.
-site fontk main 49e4a0 b9400288 b9400288 531f7908
-site fontk main 49e4ac b9400688 b9400688 531f7908
+# Raster work buffer of the engine that fills the cache (ScalableFontEngine::Initialize at 49e594, size from descriptor
+# +0x88, which the config default f_70004739e0 sets to 0x80000 and nothing overrides): x4, as a glyph bitmap at 2x is
+# four times larger. With 512 KiB AcquireGlyphmap (6f85e0) returns null and the fill reads glyph +0x1e off it. The
+# buffer comes from the FontHeap (HeapDef "Font", 30720 KiB); w9 is reloaded at 473d0c.
+site fontk main 473cf0 52a00109 52a00409
+# The glyph cache keeps its size. The cache is a shelf packer (line heights 16..1024 from f_700086fa30, lines up to the
+# cache width at +0x28 and height at +0x2c), so 2x glyphs fit and only fewer stay resident. Doubling it (descriptor +0/+4
+# at 49e4a0/49e4ac) makes the R8 texture 32 MiB, more than the whole 30 MiB FontHeap: the allocation at 49eebc returns
+# null and the memset at 49eecc writes to 0. That needs the Font heap grown in the HeapDef table first.
