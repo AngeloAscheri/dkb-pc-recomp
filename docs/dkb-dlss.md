@@ -89,3 +89,14 @@ vectors), the near and far distances from the scene's projection, and the game's
 for a forward depth). A frame without a scene at the input size, or an unsupported GPU, leaves the dispatch to the game's
 upscaler; `dkb.log` gets `fsr3:` lines (the passes ready, the sizes, a summary every 1800 frames, and
 `fsr3: N frames, T temporal, R resets` at exit). RCAS is not used. The temporal inputs do not depend on NGX, so `fsr3` also builds and runs off Windows; only DLSS is Windows-only.
+
+## FSR 4 (`upscaler = fsr4`, issue #270)
+
+`upscaler = fsr4` (read each frame) is the same replacement with AMD's FSR 4 upscaler (4.x, the newest the loader lists), `runtime/vk_fsr4.c`. It
+needs AMD's signed DLLs, which this project does not ship: take `amd_fidelityfx_loader_vk.dll` and
+`amd_fidelityfx_upscaler_vk.dll` from the FidelityFX SDK v2.4.0 release (`Kits/FidelityFX/signedbin` in
+<https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>) and put both next to `dkb.exe`. The loader lists the
+upscalers the GPU can run (FSR 4 is for AMD Radeon RDNA 2, 3 and 4); the inputs are the same as the other temporal
+upscalers' (`vk_temporal_inputs`). With no DLLs, a failed load, or no 4.x provider (as on NVIDIA), `dkb.log` gets one
+`fsr4:` line saying why and the FSR 3.1 path above runs instead, as does a dispatch that fails. FSR 4 is Windows only; the
+API headers are in `runtime/third_party/ffx_api`.

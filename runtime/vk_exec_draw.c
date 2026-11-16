@@ -4425,6 +4425,7 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs) {
                               "the game's upscaler runs for them");
         return 0;
     }
+    if (vk_fsr4_wanted()) return vk_fsr4_record(ex->cb, ex->fence, s, t);   // AMD FSR 4 (vk_fsr4.c)
     return vk_fsr3_wanted() ? vk_fsr3_record(ex->cb, ex->fence, s, t) : vk_dlss_record(ex->cb, ex->fence, s, t);
 }
 

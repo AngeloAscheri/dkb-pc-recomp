@@ -498,7 +498,7 @@ static void jdepth_set(VkImage v) { __atomic_store_n(&J.depth, v, __ATOMIC_RELAX
 
 void vk_dlss_jitter(VkImage depth, float j[2]) {
     VkImage d = jdepth();
-    if (!d || depth != d || (state <= 0 && !vk_fsr3_wanted())) return;
+    if (!d || depth != d || (state <= 0 && !vk_fsr_wanted())) return;
     if (frames_now() - J.frame > 2) {   // DLSS has stopped running (a menu without the upscaler, a failure)
         if (!vk_spec_helper()) jdepth_set(VK_NULL_HANDLE);
         return;
@@ -509,7 +509,7 @@ void vk_dlss_jitter(VkImage depth, float j[2]) {
 }
 
 void vk_dlss_scene_draw(const VkExec *ex) {
-    if (state < 0 && !vk_fsr3_wanted()) return;
+    if (state < 0 && !vk_fsr_wanted()) return;
     // DLSS on and the scene drawn, but no upscale of the game's for half a minute: the game draws its 3D scene at the
     // output size (its dynamic resolution at full on a fast GPU), so DLSS has nothing to replace. One line per run,
     // where the log would otherwise show only that NGX started.
@@ -690,7 +690,7 @@ int vk_temporal_inputs(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, 
     if (!inputs_images(cb, ow, oh)) return 0;
     t->jx = J.used ? J.jx : 0.0f, t->jy = J.used ? J.jy : 0.0f;
     t->phases = jitter_phases(w, ow);
-    t->mv = F.mv_v;
+    t->mv = F.mv_v, t->mv_image = F.mv;
     // The texture lock keeps the noted depth image from going (vk_dlss_image_gone) between the checks and its view;
     // once the view exists the image's destruction waits for this submission (vk_defer_image).
     vk_texture_lock();

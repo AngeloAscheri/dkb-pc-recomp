@@ -523,7 +523,7 @@ typedef struct {
     float jx, jy;                 // pixels, the viewport offset the scene was drawn with
     uint32_t phases;              // the jitter sequence's length
     VkImageView depth, mv;
-    VkImage depth_image;
+    VkImage depth_image, mv_image;
     VkFormat depth_format;
     uint32_t depth_level, depth_layer;
     float proj[16];
@@ -540,8 +540,16 @@ void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow
 int vk_fsr3_wanted(void);
 int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
 void vk_fsr3_release(void);
-// Either temporal upscaler is chosen: the scene's draws are jittered and noted for it.
-static inline int vk_temporal_wanted(void) { return vk_dlss_wanted() || vk_fsr3_wanted(); }
+// FSR 4 through AMD's own DLLs (vk_fsr4.c, upscaler = fsr4), over the same inputs. vk_fsr4_wanted: the setting asks for it,
+// the DLLs and a 4.x provider are there and nothing has failed; when not, upscaler = fsr4 runs vk_fsr3.c instead
+// (vk_fsr3_wanted). vk_fsr4_record and vk_fsr4_release as the FSR 3.1 ones.
+int vk_fsr4_wanted(void);
+int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
+void vk_fsr4_release(void);
+// An FSR upscaler (3.1 or 4) is chosen: the scene's draws are jittered and noted for it.
+static inline int vk_fsr_wanted(void) { return vk_fsr3_wanted() || vk_fsr4_wanted(); }
+// Any temporal upscaler is chosen.
+static inline int vk_temporal_wanted(void) { return vk_dlss_wanted() || vk_fsr_wanted(); }
 
 // ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c)
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
