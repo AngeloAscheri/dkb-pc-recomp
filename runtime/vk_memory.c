@@ -2375,12 +2375,18 @@ typedef struct { uint32_t sub; int n; VkBuffer buf; VmaAllocation alloc; const u
 static int ver_i;
 static uint64_t ver_off;
 
-// The CPU wrote the page since the mirror's sync that mgen records: stamped later, or its write-watch bit is set.
+// The CPU wrote the page since the mirror's sync that mgen records: stamped later, or its write-watch bit is set. Read
+// under gen_lock: a write-watch query (snap_regions, vk_mem_changed) clears the OS bits before it stamps the pages, both
+// under the lock held exclusively, and a page read between the two had neither, so a page the CPU had just rewritten
+// counted as a mismatch.
 static int page_dirty(uint64_t a, uint32_t mgen) {
+    plat_mutex_lock_shared(&gen_lock);
     uint32_t *s = gen_slot(a, 0);
-    if (s && __atomic_load_n(s, __ATOMIC_RELAXED) > mgen) return 1;
     uint64_t p[1];
-    return mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
+    int dirty = (s && *s > mgen) ||
+                mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
+    plat_mutex_unlock_shared(&gen_lock);
+    return dirty;
 }
 
 static int kept_page(PoolRec *r, uint64_t off) {   // completion thread: takes mirror_lock whatever the replay's mode
