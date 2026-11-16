@@ -378,7 +378,8 @@ typedef struct { uint64_t addr, size; VkBuffer buf; } VkGpuWrite;
 // pool, the mirror's next sync does not copy the pages in again while that write is their newest.
 void vk_gpu_written_into(uint64_t addr, uint64_t size, VkBuffer buf);
 // vk_gpu_written_into for the n ranges of one submission, in one pass. With the shadow storage: one lock hold, the pages
-// made writable in runs before the copies, and the pending list searched once. Without it, one call per range.
+// made writable in runs before the copies, and the pending list searched once. Without it, the page stamps are taken in
+// batches of ranges under one hold of the locks (TOTK_STAMP_BATCH; 0: one vk_gpu_written_into per range).
 void vk_gpu_written_many(const VkGpuWrite *w, int n);
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
