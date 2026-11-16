@@ -138,14 +138,31 @@ void vk_fsr_release(void);   // before the device goes away
 // swapchain image dst, which is in TRANSFER_DST and holds the scaled picture, and leaves it there; 0 = nothing recorded.
 int vk_smaa_record(VkCommandBuffer cb, VkImage dst, const int to[4]);
 void vk_smaa_release(void);   // before the device goes away
-// Frame generation (vk_framegen.c, TOTK_FRAME_GEN = 2x), called by the present thread. vk_fg_record: before the game's
-// frame is presented, copies the crop of src (the window texture, in GENERAL, fmt its format, w x h) into its history and,
-// when the frame before is there, makes the frame between them; returns 1 when a made frame exists (then the caller
-// calls vk_fg_show in place of the blit), 0 for the plain present (off, no history, a hitch, a failure). The game's
-// texture is read only by the command buffer it submits. vk_fg_show: presents the made frame, then the game's, whose
-// flip waits half a frame interval, or until pending() says another job is waiting; frame (0: none) goes to
-// vk_thumbs_frame for the game's frame.
-int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4]);
+// The scene inputs of one frame for AMD FSR 3.1's frame interpolation (vk_fsr3fi.c), as a temporal upscaler was given
+// them (VkTemporalIn, below): depth, a sampled view of the game's depth image, and motion, a sampled view of the motion
+// vector image in render pixels (previous position minus this one, no jitter), both in GENERAL at the render size, and
+// the camera factors of the scene's projection (the upscaler's, vk_fsr3_camera_factors).
+typedef struct {
+    int valid;
+    VkImageView depth, motion;
+    uint32_t render_width, render_height;
+    float device_to_view_depth[4], tan_half_fov_x;
+    float jitter[2];   // pixels, the viewport offset the scene was drawn with
+    float frame_ms;    // since the frame before
+    int reset;         // the upscaler's own history started again this frame
+    uint64_t sequence; // set by vk_fsr3fi_note: its count of the frames noted
+} VkFiInputs;
+// Frame generation (vk_framegen.c, TOTK_FRAME_GEN = auto or 2x to 8x), called by the present thread. vk_fg_record:
+// before the game's frame is presented, copies the crop of src (the window texture, in GENERAL, fmt its format, w x h)
+// into its history and, when the frame before is there, makes the frames between them; frame_no (0: none) goes to
+// vk_thumbs_frame for the game's frame. fi: the scene's depth and motion of this frame (vk_fsr3fi_take), NULL or not
+// valid for none: at 2x with frame_gen_by = fsr3, AMD FSR 3.1's interpolation makes the frame from them (vk_fsr3fi.c).
+// Returns 1 at 2x when a made frame exists (then the caller calls vk_fg_show in place of the blit), 2 when the frames go
+// to the display thread, which presents them (the caller neither blits nor flips), 0 for the plain present (off, no
+// history, a hitch, a failure). The game's texture is read only by the command buffer it submits. vk_fg_show: presents
+// the made frame, then the game's, whose flip waits half a frame interval, or until pending() says another job is
+// waiting.
+int vk_fg_record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], const VkFiInputs *fi, uint64_t frame_no);
 void vk_fg_show(int (*pending)(void), uint64_t frame);
 void vk_fg_release(void);   // before the device goes away
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
@@ -169,6 +186,11 @@ void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, u
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
 void vk_hdr_release(void);   // before the device goes away
 void vk_present_flip(void);
+void vk_present_lock(void);     // the lock vk_present_release runs under (vk_framegen.c display_main)
+// vk_present_image under vk_present_lock, gfx_window_start called before the lock was taken (the start lock is never
+// taken under the present lock)
+void vk_present_image_held(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+void vk_present_unlock(void);
 // TOTK_FLIGHT thumbnails (GfxBackend.thumbs_enable, thumbs_read; flight.c): the present thread blits every presented
 // frame into a host-visible ring of n thumbnails.
 void vk_thumbs_enable(int n);            // before the first present; n slots of FLIGHT_THUMB_W x FLIGHT_THUMB_H
@@ -301,6 +323,7 @@ void vk_usnap_quiet(int on);   // the calling thread's finds are not counted whi
 uint64_t vk_usnap_drops(void);
 void vk_usnap_view(uint64_t upto);
 const void *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy's bytes for the CPU; NULL: not copied or dropped
+void vk_usnap_cpu_reads(void);   // vk_usnap_bytes is read often: keep each copy in cached host memory too
 int vk_usnap_covers(uint64_t addr, uint64_t n);   // a copy of this submission overlaps the range
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_arena_bytes(void);                 // arenas created so far (all kept until shutdown)
@@ -316,6 +339,14 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb);
 void vk_mem_shadow_sync(void);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
+// One range of a submission's GPU writes: {address, size, buffer the GPU wrote or VK_NULL_HANDLE}.
+typedef struct { uint64_t addr, size; VkBuffer buf; } VkGpuWrite;
+// As vk_gpu_written for a write into buffer buf (VK_NULL_HANDLE: unknown). When buf is the VRAM mirror of the range's
+// pool, the mirror's next sync does not copy the pages in again while that write is their newest.
+void vk_gpu_written_into(uint64_t addr, uint64_t size, VkBuffer buf);
+// vk_gpu_written_into for the n ranges of one submission, in one pass. With the shadow storage: one lock hold, the pages
+// made writable in runs before the copies, and the pending list searched once. Without it, one call per range.
+void vk_gpu_written_many(const VkGpuWrite *w, int n);
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
@@ -476,7 +507,7 @@ int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
 uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size);   // newest recorded writer of such a texture; 0: none
 void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those images back into their storage (waits)
-// The replay's deferred-read write-back (TOTK_WB_ASYNC, default off): copies recorded and submitted without waiting,
+// The replay's deferred-read write-back (TOTK_WB_ASYNC, default on): copies recorded and submitted without waiting,
 // written to the storage by a later vk_texture_wb_poll once they completed. TOTK_WB_ASYNC=0: vk_texture_write_back.
 void vk_texture_write_back_async(uint64_t addr, uint64_t size);
 void vk_texture_wb_poll(void);                      // finishes the asynchronous write-backs whose copies completed
@@ -506,6 +537,61 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
 int vk_dlss_warm(VkCommandBuffer cb, uint64_t fence);   // once, at the first compute dispatch: NGX and the model
                                                       // load; 1 when it recorded into cb (rebind after it)
 void vk_dlss_release(void);   // device idle, before it goes away
+
+// The inputs both temporal upscalers take, DLSS above and FSR 3.1 below (vk_dlss.c): the scene's jitter, depth and camera
+// motion vectors, made from what the replay noted at the scene's draws. vk_temporal_inputs fills t for one frame of
+// inputs w x h upscaled to ow x oh and records the vector pass into cb; fresh: the upscaler has no history. 1 = filled
+// in, 0 = the vector image could not be made. temporal: a scene was noted at the input size (otherwise no depth, zero
+// vectors, reset). reset: the history is not to be used. depth is a sampled view in GENERAL; mv holds the motion in
+// render pixels (previous position minus this one, jitter taken off); proj is the scene's projection, row-major, as the
+// game fills it. vk_temporal_done after the evaluation moves the jitter and the camera on to the next frame.
+typedef struct {
+    int temporal, reset;
+    float jx, jy;                 // pixels, the viewport offset the scene was drawn with
+    uint32_t phases;              // the jitter sequence's length
+    VkImageView depth, mv;
+    VkImage depth_image, mv_image;
+    VkFormat depth_format;
+    uint32_t depth_level, depth_layer;
+    float proj[16];
+    double vp[16];                // for vk_temporal_done
+} VkTemporalIn;
+int vk_temporal_inputs(VkCommandBuffer cb, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, int fresh, VkTemporalIn *t);
+void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow);
+// AMD FSR 3.1 frame interpolation (vk_fsr3fi.c, frame_gen_by = fsr3), over the inputs above. vk_fsr3fi_wanted: the
+// setting asks for it and the device can run it. vk_fsr3fi_note: vk_temporal_done's hand-over of this frame's inputs
+// (w x h: the render size) for the frame's present. vk_fsr3fi_take: the inputs noted since the last take, once
+// (vk_backend.c present_image, on the thread that recorded the frame); 0 when none. vk_fsr3fi_generate: records the
+// frame between `previous` and `color` (sampled views of width x height images in GENERAL) into `out` (a storage and
+// sampled view, 8-bit UNORM, GENERAL), on a command buffer whose earlier use is done; 1 when it made it, 0 when it did
+// not (not wanted, no inputs, a reset), which leaves the frame to the caller. vk_fsr3_camera_factors (vk_fsr3.c): the
+// camera factors of a projection for the passes, 0 for one they cannot use.
+int vk_fsr3fi_wanted(void);
+void vk_fsr3fi_note(const VkTemporalIn *t, uint32_t w, uint32_t h);
+int vk_fsr3fi_take(VkFiInputs *out);
+int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView color, VkImageView previous,
+                       VkImageView out, uint32_t width, uint32_t height);
+void vk_fsr3fi_release(void);   // device idle, before it goes away
+int vk_fsr3_camera_factors(const float p[16], float f[4]);
+
+// FSR 3.1 in place of the game's upscaler (vk_fsr3.c, upscaler = fsr3), over the inputs above. vk_fsr3_wanted: the
+// setting asks for it (read once a frame) and nothing has failed. vk_fsr3_record is vk_dlss_record's counterpart with
+// the same results: 1 = recorded (the caller forgets the bound state and puts a full barrier after it), 0 = nothing
+// recorded, the game's upscaler runs (no scene at the input size, an unsupported size or GPU), -1 = it failed after
+// recording some of its work. vk_fsr3_release: device idle, before it goes away (logs the summary).
+int vk_fsr3_wanted(void);
+int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
+void vk_fsr3_release(void);
+// FSR 4 through AMD's own DLLs (vk_fsr4.c, upscaler = fsr4), over the same inputs. vk_fsr4_wanted: the setting asks for it,
+// the DLLs and a 4.x provider are there and nothing has failed; when not, upscaler = fsr4 runs vk_fsr3.c instead
+// (vk_fsr3_wanted). vk_fsr4_record and vk_fsr4_release as the FSR 3.1 ones.
+int vk_fsr4_wanted(void);
+int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
+void vk_fsr4_release(void);
+// An FSR upscaler (3.1 or 4) is chosen: the scene's draws are jittered and noted for it.
+static inline int vk_fsr_wanted(void) { return vk_fsr3_wanted() || vk_fsr4_wanted(); }
+// Any temporal upscaler is chosen.
+static inline int vk_temporal_wanted(void) { return vk_dlss_wanted() || vk_fsr_wanted(); }
 
 // ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c)
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done

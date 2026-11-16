@@ -1,6 +1,6 @@
 # DLSS (experimental)
 
-`upscaler = dlss` in `totk.ini` (or `DKB_UPSCALER=dlss`) replaces the game's own upscaler, the compute dispatch that
+`upscaler = dlss` in `dkb.ini` (or `DKB_UPSCALER=dlss`) replaces the game's own upscaler, the compute dispatch that
 scales the rendered frame to the output resolution, with NVIDIA DLSS Super Resolution (`runtime/vk_dlss.c`). FSR still
 scales the output to the window when the window is larger. The setting is read at start.
 
@@ -10,6 +10,21 @@ Needs:
   (`_nvngx.dll`); the runtime finds it through the driver's registry keys.
 - `nvngx_dlss.dll`, the DLSS model, next to `dkb.exe`. DKB Recomp does not ship it. Take it from a game or from
   NVIDIA's DLSS SDK release (310.5 or later for preset M, which `dlss_preset = m` asks for).
+
+## Turning it on
+
+1. Put `nvngx_dlss.dll` next to `dkb.exe` (not in a subfolder; the log line names the path it looked for).
+2. Pick NVIDIA DLSS in the F1 menu's upscaler row, or write `upscaler = dlss` under `[display]` in `dkb.ini`.
+3. Restart the game: NGX adds its Vulkan extensions when the device is made, so DLSS starts only with a run that
+   began with `upscaler = dlss`.
+4. Keep `scene_res = auto`, or choose `full` for DLAA (native anti-aliasing, update 3.2.0 only, `docs/dkb-testing.md`).
+   Without that patch `full` draws the 3D scene at the output size and the game runs no upscale to replace.
+5. Read `logs/dkb.log` next to `dkb.exe`. A run with DLSS on has `dlss: NGX core loaded`, then
+   `dlss: NGX initialised ...` and, once the game upscales, `dlss: Quality WxH -> WxH, preset K`. Every way it can
+   stop logs one `dlss:` line with the reason; a `cfg: ... upscaler = '...' is not one of ...` line means the value
+   was misspelt. `dlss: the game ran no upscale in the last 1800 frames` means the game draws its 3D scene at the
+   output size, which a fast GPU reaches at the default `output_res`; a larger `output_res` (3840x2160) gives DLSS
+   an upscale to replace.
 
 The model: `dlss_preset` in `dkb.ini` (`DKB_DLSS_PRESET`, `auto|k|m`, applies at the next upscale). `auto`, the
 default, asks for DLSS 4's transformer model (preset K) in every quality mode but Ultra Performance, which has its own
@@ -49,7 +64,9 @@ as before this change: zero motion vectors, a zero depth image, a new history. T
 output to input (DLAA at 1:1).
 
 DLSS only runs where the game runs its own upscaler. `scene_res = full` (`docs/dkb-testing.md`) draws the scene at
-the whole render resolution on purpose, so neither the game's upscaler nor DLSS runs then. When the game draws the scene at the output size (in 150 s
+the whole render resolution on purpose, so neither the game's upscaler nor DLSS runs then, except on update 3.2.0,
+where the patch set `dkbnative` makes the game run its upscale step at that size and DLSS runs as DLAA (the same
+setting runs FSR 3.1 and FSR 4 as native anti-aliasing). When the game draws the scene at the output size (in 150 s
 replays on 1.0.0 with a 1920x1080 output it switched to that partway through the play, at a different point in each
 run), there is no upscaler dispatch to replace and the game's picture is shown as it is.
 
@@ -64,3 +81,25 @@ vectors, how many ran spatially, and how many started a new history.
 When anything is missing or fails (no NVIDIA GPU, no NGX core, no `nvngx_dlss.dll`, NGX initialisation or feature
 creation fails, an input larger than the output), `dkb.log` gets one line starting with `dlss:` that says why, and
 the game's own upscaler runs for the rest of the run.
+
+## FSR 3.1 instead (`upscaler = fsr3`, issue #270)
+
+`upscaler = fsr3` (read each frame, any GPU with push descriptors and the extended storage image formats) replaces the
+same dispatch with AMD's FSR 3.1 temporal upscaler, `runtime/vk_fsr3.c`: the FidelityFX SDK's passes
+(`runtime/third_party/fidelityfx`, built by `tools/build_shaders.py`) recorded as dispatches of our own, no AMD library.
+It takes DLSS's inputs from `vk_dlss.c` (`vk_temporal_inputs`: the jitter, the scene depth and the camera motion
+vectors), the near and far distances from the scene's projection, and the game's depth as it is (the passes are built
+for a forward depth). A frame without a scene at the input size, or an unsupported GPU, leaves the dispatch to the game's
+upscaler; `dkb.log` gets `fsr3:` lines (the passes ready, the sizes, a summary every 1800 frames, and
+`fsr3: N frames, T temporal, R resets` at exit). RCAS is not used. The temporal inputs do not depend on NGX, so `fsr3` also builds and runs off Windows; only DLSS is Windows-only.
+
+## FSR 4 (`upscaler = fsr4`, issue #270)
+
+`upscaler = fsr4` (read each frame) is the same replacement with AMD's FSR 4 upscaler (4.x, the newest the loader lists), `runtime/vk_fsr4.c`. It
+needs AMD's signed DLLs, which this project does not ship: take `amd_fidelityfx_loader_vk.dll` and
+`amd_fidelityfx_upscaler_vk.dll` from the FidelityFX SDK v2.4.0 release (`Kits/FidelityFX/signedbin` in
+<https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>) and put both next to `dkb.exe`. The loader lists the
+upscalers the GPU can run (FSR 4 is for Radeon GPUs the loader lists a 4.x upscaler for, RDNA 4 at least); the inputs are the same as the other temporal
+upscalers' (`vk_temporal_inputs`). With no DLLs, a failed load, or no 4.x provider (as on NVIDIA), `dkb.log` gets one
+`fsr4:` line saying why and the FSR 3.1 path above runs instead, as does a dispatch that fails. FSR 4 is Windows only; the
+API headers are in `runtime/third_party/ffx_api`.
