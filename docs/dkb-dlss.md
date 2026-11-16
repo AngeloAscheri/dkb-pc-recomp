@@ -64,3 +64,14 @@ vectors, how many ran spatially, and how many started a new history.
 When anything is missing or fails (no NVIDIA GPU, no NGX core, no `nvngx_dlss.dll`, NGX initialisation or feature
 creation fails, an input larger than the output), `dkb.log` gets one line starting with `dlss:` that says why, and
 the game's own upscaler runs for the rest of the run.
+
+## FSR 3.1 instead (`upscaler = fsr3`, issue #270)
+
+`upscaler = fsr3` (read each frame, any GPU with push descriptors and the extended storage image formats) replaces the
+same dispatch with AMD's FSR 3.1 temporal upscaler, `runtime/vk_fsr3.c`: the FidelityFX SDK's passes
+(`runtime/third_party/fidelityfx`, built by `tools/build_shaders.py`) recorded as dispatches of our own, no AMD library.
+It takes DLSS's inputs from `vk_dlss.c` (`vk_temporal_inputs`: the jitter, the scene depth and the camera motion
+vectors), the near and far distances from the scene's projection, and the game's depth as it is (the passes are built
+for a forward depth). A frame without a scene at the input size, or an unsupported GPU, leaves the dispatch to the game's
+upscaler; `dkb.log` gets `fsr3:` lines (the passes ready, the sizes, a summary every 1800 frames, and
+`fsr3: N frames, T temporal, R resets` at exit). RCAS is not used.

@@ -153,6 +153,9 @@
 # upscaler = dlss (experimental, NVIDIA RTX only, read at start) also replaces the game's own upscaler with NVIDIA DLSS
 # and keeps FSR for the window; it needs nvngx_dlss.dll next to dkb.exe (docs/dkb-dlss.md) and falls back to the
 # game's upscaler, with a "dlss:" line in the log, when anything is missing.
+# upscaler = fsr3 (experimental, any GPU with push descriptors and extended storage formats, read each frame) does the same
+# with AMD FSR 3.1's temporal upscaler, from the same jitter, scene depth and camera motion DLSS gets; frames without a scene
+# at the input size go to the game's upscaler. The log has "fsr3:" lines (a summary every 1800 frames and at exit).
 # upscaler = fsr
 # Bananza only: auto keeps the game's dynamic 3D resolution (usually two thirds of output_res on each side), full draws
 # the 3D scene at output_res (sharper, more GPU cost; no upscaler or DLSS then), a ratio from 1.0 to 3.0 draws it at
