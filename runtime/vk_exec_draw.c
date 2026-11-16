@@ -4413,6 +4413,8 @@ static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info
     int hvs = 0, hvd = 0;
     const VkTexImage *a = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
     const VkTexImage *b = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
+    // The output must be strictly larger: with equal sizes this shape (one B10G11R11 texture in, one written image out,
+    // 256 or more wide) is also any same-size post-process compute pass, so it could not be told from the upscaler.
     if (!a || !b || a->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || b->format != a->format || a->samples > 1 ||
         b->samples > 1 || a->type != VK_IMAGE_TYPE_2D || b->type != VK_IMAGE_TYPE_2D || a->width < 256 ||
         a->height < 256 || b->width <= a->width || b->height <= a->height)
@@ -4441,7 +4443,7 @@ static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info
 static int dlss_upscale(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
     if (!vk_temporal_wanted()) return 0;
     if (!game_upscaler(ex, cs, info, d)) {
-        // The upscaler is matched by hash or shape (game_upscaler): with DLSS or FSR 3.1 on, list the compute shaders
+        // The upscaler is matched by hash or shape (game_upscaler): with DLSS, FSR 3.1 or FSR 4 on, list the compute shaders
         // seen (the first 48 distinct) so a run that never reaches the upscaler shows which dispatch it missed.
         static uint64_t seen[48];
         static int nseen;
@@ -4455,7 +4457,7 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info,
             int hws = 0, hwd = 0;
             const VkTexImage *a = ds ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(ds), &ws, &hws) : NULL;
             const VkTexImage *b = dd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(dd), &wd, &hwd) : NULL;
-            rt_log("dlss: compute shader %016llx is not the game's upscaler (tex0 %ux%u fmt %d, img1 %ux%u fmt %d)",
+            rt_log("dlss: (DLSS, FSR 3.1 and FSR 4) compute shader %016llx is not the game's upscaler (tex0 %ux%u fmt %d, img1 %ux%u fmt %d)",
                    (unsigned long long)h, a ? a->width : 0, a ? a->height : 0, a ? (int)a->format : 0,
                    b ? b->width : 0, b ? b->height : 0, b ? (int)b->format : 0);
         }
