@@ -218,7 +218,11 @@ site fontk main 49e794 78377928 531f7908 78377928
 # four times larger. With 512 KiB AcquireGlyphmap (6f85e0) returns null and the fill reads glyph +0x1e off it. The
 # buffer comes from the FontHeap (HeapDef "Font", 30720 KiB); w9 is reloaded at 473d0c.
 site fontk main 473cf0 52a00109 52a00409
-# The glyph cache keeps its size. The cache is a shelf packer (line heights 16..1024 from f_700086fa30, lines up to the
-# cache width at +0x28 and height at +0x2c), so 2x glyphs fit and only fewer stay resident. Doubling it (descriptor +0/+4
-# at 49e4a0/49e4ac) makes the R8 texture 32 MiB, more than the whole 30 MiB FontHeap: the allocation at 49eebc returns
-# null and the memset at 49eecc writes to 0. That needs the Font heap grown in the HeapDef table first.
+# Glyph cache texture (descriptor +0/+4, stored at cache +0x28/+0x2c): x2 each way, as a 2x glyph covers four times the
+# area and the shelf packer (line heights 16..1024 from f_700086fa30, lines up to the cache size) would evict glyphs
+# still on screen. Every reader takes the size from +0x28/+0x2c (texture builder 49ed30, packer 86be48, glyph records
+# 86e490/86e754). The R8 texture becomes 32 MiB, more than the stock 30 MiB FontHeap (the allocation at 49eebc would
+# return null and the memset at 49eecc write to 0): resolution.c grows the HeapDef's "Font" by 28 MiB while fontk is on,
+# and turns fontk off when it cannot serve that table.
+site fontk main 49e4a0 b9400288 b9400288 531f7908
+site fontk main 49e4ac b9400688 b9400688 531f7908
