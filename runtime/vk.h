@@ -152,6 +152,13 @@ typedef struct {
     int reset;         // the upscaler's own history started again this frame
     uint64_t sequence; // set by vk_fsr3fi_note: its count of the frames noted
 } VkFiInputs;
+// CRT filters on the present (vk_crt.c): with TOTK_CRT_FILTER = lottes_grille|lottes_tv|hyllian|zfast, records the
+// filter over the rectangle {x, y, w, h} of the swapchain image dst, which is in TRANSFER_DST and holds the scaled SDR
+// picture, and leaves it there; 0 = nothing recorded. vk_crt_idle: this frame's picture is the game's own HDR one,
+// which the filter skips (logged once); it hands the filter's images back. vk_crt_release: before the device goes away.
+int vk_crt_record(VkCommandBuffer cb, VkImage dst, const int to[4]);
+void vk_crt_idle(void);
+void vk_crt_release(void);
 // Frame generation (vk_framegen.c, TOTK_FRAME_GEN = auto or 2x to 8x), called by the present thread. vk_fg_record:
 // before the game's frame is presented, copies the crop of src (the window texture, in GENERAL, fmt its format, w x h)
 // into its history and, when the frame before is there, makes the frames between them; frame_no (0: none) goes to
