@@ -161,9 +161,12 @@
 # with AMD FSR 3.1's temporal upscaler, from the same jitter, scene depth and camera motion DLSS gets; frames without a scene
 # at the input size go to the game's upscaler. The log has "fsr3:" lines (a summary every 1800 frames and at exit).
 # upscaler = fsr4 (experimental) runs AMD FSR 4 from the same inputs, through AMD's own signed DLLs
-# (amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to dkb.exe, docs/dkb-dlss.md); without them, or on
-# a GPU with no FSR 4 (NVIDIA), the log has one "fsr4:" line saying why and FSR 3.1 runs instead.
+# (amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll next to dkb.exe, docs/dkb-dlss.md) or, on Linux, a Vulkan
+# FSR 4 library named amd_fidelityfx_upscaler_vk.so (set upscaler = fsr4 before the start there); without them, or on a GPU
+# with no FSR 4 (NVIDIA), the log has one "fsr4:" line saying why and FSR 3.1 runs instead.
 # upscaler = fsr
+# The folder AMD's FSR 4 library is looked for in first (upscaler = fsr4); the game's program's folder comes after it.
+# fsr_dir =
 # Bananza only: auto keeps the game's dynamic 3D resolution (usually two thirds of output_res on each side), full draws
 # the 3D scene at output_res (sharper, more GPU cost; no upscaler or DLSS then), a ratio from 1.0 to 3.0 draws it at
 # output_res divided by that ratio and upscales it to output_res (1.5 with upscaler = dlss: DLSS Quality at output_res).

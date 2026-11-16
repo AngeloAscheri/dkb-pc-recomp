@@ -582,11 +582,22 @@ int vk_fsr3_camera_factors(const float p[16], float f[4]);
 int vk_fsr3_wanted(void);
 int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
 void vk_fsr3_release(void);
-// FSR 4 through AMD's own DLLs (vk_fsr4.c, upscaler = fsr4), over the same inputs. vk_fsr4_wanted: the setting asks for it,
-// the DLLs and a 4.x provider are there and nothing has failed; when not, upscaler = fsr4 runs vk_fsr3.c instead
-// (vk_fsr3_wanted). vk_fsr4_record and vk_fsr4_release as the FSR 3.1 ones.
+// The output pass of vk_fsr3.c, which upscaler = fsr4 (vk_fsr4.c) shares so both end the same way. vk_fsr3_io_init:
+// makes it (1 when it can be used; 0 without push descriptors or when it cannot be made). vk_fsr3_io_out: the
+// upscaler's picture src (sampled view of an image in GENERAL, the output size) into the game's output image, ov (a
+// storage view).
+int vk_fsr3_io_init(void);
+void vk_fsr3_io_out(VkCommandBuffer cb, VkImageView src, VkImageView ov, uint32_t ow, uint32_t oh);
+// FSR 4 through AMD's own library (vk_fsr4.c, upscaler = fsr4: the DLLs on Windows, a Vulkan FSR 4 build on Linux),
+// over the same inputs. vk_fsr4_wanted: the setting asks for it, the library and a 4.x provider are there and nothing
+// has failed; when not, upscaler = fsr4 runs vk_fsr3.c instead (vk_fsr3_wanted). vk_fsr4_record and vk_fsr4_release as
+// the FSR 3.1 ones. vk_fsr4_wants_descriptor_buffer: before the device is made, whether VK_EXT_descriptor_buffer should
+// be enabled for the library (Linux, upscaler = fsr4 at the start, the library found); vk_fsr4_descriptor_buffer:
+// whether it was.
 int vk_fsr4_wanted(void);
 int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, const VkTexImage *out);
+int vk_fsr4_wants_descriptor_buffer(void);
+void vk_fsr4_descriptor_buffer(int enabled);
 void vk_fsr4_release(void);
 // An FSR upscaler (3.1 or 4) is chosen: the scene's draws are jittered and noted for it.
 static inline int vk_fsr_wanted(void) { return vk_fsr3_wanted() || vk_fsr4_wanted(); }
