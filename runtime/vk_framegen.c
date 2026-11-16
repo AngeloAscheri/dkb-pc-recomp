@@ -14,7 +14,9 @@
 // vk_present_blit, and its flip waits until half an interval after the made one. With frame_gen_by = fsr3
 // (TOTK_FRAME_GEN_BY) the made frame comes from AMD FSR 3.1's frame interpolation instead of steps 2 and 3
 // (vk_fsr3fi.c), over the depth and motion of the frame's temporal upscaler (vk_fg_record's fi); a frame it cannot
-// make gets the built-in one.
+// make gets the built-in one. AMD's passes are also given the game's frames without their HUD, so the HUD is not moved
+// with the scene: the upscaler's output is copied before the game draws its HUD into it (vk_fsr3fi_note_picture), and
+// shaders/fg_hudless.comp makes from that copy the frame as the window texture would hold it without the HUD.
 //
 // Auto and 3x to 8x (vk_fg_record returns 2), two threads as in Hookshot. A fixed multiplier m gives each game frame as
 // many frames as the display can show, m at most (fg_pace_fixed_frames): the made ones at t = k / n, then the game's own.
@@ -33,12 +35,14 @@
 // Any failure turns the pass off for the session with one log line, and the present goes on as without it.
 #include "vk.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
 #include "fg_flow_spv.h"
+#include "fg_hudless_spv.h"
 #include "fg_luma_spv.h"
 #include "fg_median_spv.h"
 #include "fg_pace.h"
@@ -81,12 +85,16 @@ typedef struct {
 static struct {
     int tried, dead, said;   // said: bits of the reasons already logged (SAY_*)
     PFN_vkCmdPushDescriptorSetKHR push;
-    Pipe luma, flow, median, synth;
+    Pipe luma, flow, median, synth, hudless;
     VkSampler nearest, linear;
     VkCommandPool pool;
     VkCommandBuffer cb;
     VkFence fence;
     Image hist[2], luma_img[2], flow_img[2], made;   // made: the 2x frame
+    // The frame without the game's HUD, for AMD FSR 3.1's interpolation (shaders/fg_hudless.comp), beside the history
+    // image of the same index; hudless_ok: made for the frame that history image holds. Made at their first use.
+    Image hudless_img[2];
+    int hudless_ok[2];
     Set sets[SETS];
     int frames;           // 0: the 2x path (made); else the images of each set: Auto's cap, or the multiplier
     int next_set;         // the set the next record fills
@@ -102,7 +110,7 @@ static struct {
     uint64_t last_at;     // when the previous job reached vk_fg_record; 0 = none
     int64_t interval;     // the game's frame interval, fg_pace_interval
     // the 5 s log
-    uint64_t t0, real, made_n, by_fsr, no_hist, hitch, over, crop, cut, late;
+    uint64_t t0, real, made_n, by_fsr, hudless_used, no_hist, hitch, over, crop, cut, late;
 } S;
 // S and the images are touched by vk_fg_record (the present thread) and vk_fg_release (the exit, under vk_present.c's g_pl
 // first: that order everywhere), so each holds this lock for its whole run; vk_fg_show copies what it needs and presents
@@ -206,6 +214,8 @@ static int make_image(VkCtx *c, Image *i, VkFormat fmt, uint32_t w, uint32_t h, 
 static void free_images(VkCtx *c) {
     for (int i = 0; i < 2; i++) free_image(c, &S.hist[i]), free_image(c, &S.luma_img[i]), free_image(c, &S.flow_img[i]);
     free_image(c, &S.made);
+    free_image(c, &S.hudless_img[0]), free_image(c, &S.hudless_img[1]);
+    S.hudless_ok[0] = S.hudless_ok[1] = 0;
     for (int s = 0; s < SETS; s++)
         for (int i = 0; i < FG_MAX_MULT; i++) free_image(c, &S.sets[s].frame[i]);
     S.w = S.h = 0;
@@ -216,7 +226,8 @@ static void free_images(VkCtx *c) {
 // Everything the pass made, for the session's end or a failed set-up. The device is idle or nothing was submitted.
 static void free_all(VkCtx *c) {
     free_images(c);
-    free_pipe(c, &S.luma), free_pipe(c, &S.flow), free_pipe(c, &S.median), free_pipe(c, &S.synth);
+    free_pipe(c, &S.luma), free_pipe(c, &S.flow), free_pipe(c, &S.median), free_pipe(c, &S.synth),
+        free_pipe(c, &S.hudless);
     if (S.nearest) vkDestroySampler(c->device, S.nearest, NULL);
     if (S.linear) vkDestroySampler(c->device, S.linear, NULL);
     if (S.fence) vkDestroyFence(c->device, S.fence, NULL);
@@ -261,6 +272,7 @@ static int init(VkCtx *c) {
         {&S.flow, "flow", fg_flow_spv, sizeof fg_flow_spv, 2, 0},
         {&S.median, "median", fg_median_spv, sizeof fg_median_spv, 1, 0},
         {&S.synth, "synth", fg_synth_spv, sizeof fg_synth_spv, 3, 4},
+        {&S.hudless, "hudless", fg_hudless_spv, sizeof fg_hudless_spv, 2, 4},
     };
     for (size_t i = 0; i < sizeof pipes / sizeof *pipes; i++) {
         VkResult r = make_pipe(c, pipes[i].p, pipes[i].code, pipes[i].size, pipes[i].samplers, pipes[i].push);
@@ -397,6 +409,33 @@ static void pass(VkCommandBuffer cb, const Pipe *p, const VkDescriptorImageInfo 
     full_barrier(cb);
 }
 
+// The two images of the frame without its HUD, at the crop size, made at their first use; the command buffer being
+// recorded moves them to GENERAL.
+static int hudless_images(VkCtx *c, VkCommandBuffer cb) {
+    if (S.hudless_img[1].img) return 1;
+    for (int i = 0; i < 2; i++)
+        if (!make_image(c, &S.hudless_img[i], HIST_FMT, S.w, S.h,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+            free_image(c, &S.hudless_img[0]), free_image(c, &S.hudless_img[1]);
+            return 0;
+        }
+    VkImageMemoryBarrier2 b[2];
+    for (int i = 0; i < 2; i++)
+        b[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                       .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = S.hudless_img[i].img,
+                                       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2,
+                          .pImageMemoryBarriers = b};
+    vkCmdPipelineBarrier2(cb, &d);
+    S.hudless_ok[0] = S.hudless_ok[1] = 0;
+    return 1;
+}
+
 static void log_stats(uint64_t now) {
     if (!S.t0) S.t0 = now;
     if (now - S.t0 < 5000000000ull) return;
@@ -406,11 +445,14 @@ static void log_stats(uint64_t now) {
                "over refresh %u, crop %u", s, (double)S.real / s, (unsigned)S.made_n, (double)S.made_n / s,
                (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop);
     else
-        rt_log("fg: %.1f s: real %.1f fps, shown %.1f fps, made %u (by AMD FSR 3.1 %u); skipped: no history %u, "
-               "hitch %u, over refresh %u, crop %u; real cut short %u; late >2 ms %u", s, (double)S.real / s,
-               (double)(S.real + S.made_n) / s, (unsigned)S.made_n, (unsigned)S.by_fsr, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
+        rt_log("fg: %.1f s: real %.1f fps, shown %.1f fps, made %u (by AMD FSR 3.1 %u, %u of them with the frames "
+               "without their HUD); skipped: no history %u, hitch %u, over refresh %u, crop %u; real cut short %u; "
+               "late >2 ms %u",
+               s, (double)S.real / s, (double)(S.real + S.made_n) / s, (unsigned)S.made_n, (unsigned)S.by_fsr,
+               (unsigned)S.hudless_used, (unsigned)S.no_hist, (unsigned)S.hitch, (unsigned)S.over, (unsigned)S.crop,
                (unsigned)S.cut, (unsigned)S.late);
-    S.t0 = now, S.real = S.made_n = S.by_fsr = S.no_hist = S.hitch = S.over = S.crop = S.cut = S.late = 0;
+    S.t0 = now, S.real = S.made_n = S.by_fsr = S.hudless_used = S.no_hist = S.hitch = S.over = S.crop = S.cut = 0;
+    S.late = 0;
 }
 
 // Waits until at: a sleep to 1 ms before it, then yields (the sleep alone wakes up to ~0.5 ms late), as Hookshot's
@@ -655,10 +697,28 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     // The flow and synthesis passes below then run only for a frame it did not make (the luma above always runs: the
     // built-in flow of a later frame reads it).
     int by_amd = 0;
+    S.hudless_ok[cur] = 0;   // set below when this frame's picture without its HUD is made
     if (!frames && any_made && vk_fsr3fi_wanted()) {
-        if (fi && fi->valid)
-            by_amd = vk_fsr3fi_generate(cb, fi, S.hist[cur].view, S.hist[prev].view, S.made.view, uw, uh);
-        else
+        if (fi && fi->valid) {
+            // The frame without its HUD (shaders/fg_hudless.comp), from the upscaled picture copied before the game
+            // drew its HUD into it (vk_fsr3fi_note_picture). The game's last draw scales that picture to the whole
+            // window texture, so it is made only for an uncropped frame of the picture's shape. With it for this frame
+            // and the one before, AMD's passes interpolate the scene alone and put the HUD back as it is shown;
+            // without, they take the frames as shown.
+            VkImageView hl = VK_NULL_HANDLE, hl_prev = VK_NULL_HANDLE;
+            if (fi->picture && cx == 0 && cy == 0 && cw == w && ch == h &&
+                fabs((double)fi->picture_w * ch - (double)fi->picture_h * cw) <= 0.01 * (double)fi->picture_w * ch &&
+                hudless_images(c, cb)) {
+                const float tol = 3.0f / 255.0f;   // the last draw's own rounding against this pass's
+                in[0] = (VkDescriptorImageInfo){S.linear, fi->picture, G};
+                in[1] = (VkDescriptorImageInfo){S.nearest, S.hist[cur].view, G};
+                pass(cb, &S.hudless, in, S.hudless_img[cur].view, uw, uh, &tol, sizeof tol);
+                S.hudless_ok[cur] = 1;
+                if (S.hudless_ok[prev]) hl = S.hudless_img[cur].view, hl_prev = S.hudless_img[prev].view;
+            }
+            by_amd = vk_fsr3fi_generate(cb, fi, S.hist[cur].view, S.hist[prev].view, hl, hl_prev, S.made.view, uw, uh);
+            if (by_amd && hl) S.hudless_used++;
+        } else
             say(SAY_NOFI, "fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler (upscaler = dlss, "
                           "fsr3 or fsr4, with the 3D drawn below the output size): the built-in interpolation makes this "
                           "frame", 0);
