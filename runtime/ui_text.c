@@ -126,6 +126,22 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SMAA] = "Anti-aliasing (SMAA)",
     [UI_MENU_SMAA_DESC] = "Smooths jagged edges in the game image and HUD. Higher settings use more GPU time.",
     [UI_MENU_SMAA_LOW] = "Low", [UI_MENU_SMAA_MEDIUM] = "Medium", [UI_MENU_SMAA_HIGH] = "High",
+    [UI_MENU_CRT] = "CRT filter",
+    [UI_MENU_CRT_DESC] = "Gives the finished picture, the game's HUD included, the look of a CRT screen. This menu and the overlay stay clean. "
+                         "Changes at once.\n\n"
+                         "Off: no extra passes and no extra memory. Lottes aperture grille: Timothy Lottes' crt-lottes, a flat aperture grille "
+                         "(a PVM-like look, not a calibrated model). Lottes consumer TV: the same shader, curved, with a shadow mask and beam "
+                         "bloom. Hyllian Fast: Hyllian's crt-hyllian-fast, scanlines and a magenta and green mask. zfast CRT: Greg Hogan's "
+                         "zfast, softer scanlines and a monochrome aperture mask.\n\n"
+                         "These are SDR filters: with the game's own HDR they are bypassed, and the choice is kept.",
+    [UI_MENU_CRT_LOTTES_GRILLE] = "Lottes aperture grille", [UI_MENU_CRT_LOTTES_TV] = "Lottes consumer TV",
+    [UI_MENU_CRT_HYLLIAN] = "Hyllian Fast", [UI_MENU_CRT_ZFAST] = "zfast CRT",
+    [UI_MENU_CRT_NATIVE_HDR] = "bypassed with the game's own HDR",
+    [UI_MENU_CRT_LINES] = "CRT lines",
+    [UI_MENU_CRT_LINES_DESC] = "The lines of the virtual CRT screen the picture is drawn on, not the render resolution. At most half "
+                               "the window's height; the width follows the picture's shape. A window height that is not a whole "
+                               "multiple of the lines can show moire.",
+    [UI_MENU_CRT_LINES_240] = "240", [UI_MENU_CRT_LINES_480] = "480", [UI_MENU_CRT_LINES_720] = "720",
     [UI_MENU_COLOR] = "Color",
     [UI_MENU_COLOR_PRESET] = "Color profile",
     [UI_MENU_COLOR_PRESET_DESC] = "Game default uses the original colors.\nVivid (OLED) boosts contrast and color.\n"
@@ -473,6 +489,21 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SMAA_DESC] = "Сглаживает лесенки на готовой картинке после масштабирования под окно и до отрисовки этого "
                           "меню. Интерфейс игры тоже сглаживается. Чем выше качество, тем больше нагрузка на GPU.",
     [UI_MENU_SMAA_LOW] = "Низкое", [UI_MENU_SMAA_MEDIUM] = "Среднее", [UI_MENU_SMAA_HIGH] = "Высокое",
+    [UI_MENU_CRT] = "Фильтр ЭЛТ",
+    [UI_MENU_CRT_DESC] = "Придаёт готовой картинке вместе с интерфейсом игры вид экрана с кинескопом. Это меню и оверлей остаются "
+                         "чистыми. Меняется сразу.\n\n"
+                         "Выкл.: без дополнительных проходов и памяти. Lottes aperture grille: crt-lottes Тимоти Лоттса, плоская "
+                         "апертурная решётка. Lottes consumer TV: тот же шейдер, выпуклый, с теневой маской. Hyllian Fast: "
+                         "crt-hyllian-fast от Hyllian, строки развёртки и пурпурно-зелёная маска. zfast CRT: zfast Грега Хогана, мягкие "
+                         "строки и монохромная маска.\n\n"
+                         "Это фильтры для SDR: с собственным HDR игры они не применяются, выбор сохраняется.",
+    [UI_MENU_CRT_LOTTES_GRILLE] = "Lottes aperture grille", [UI_MENU_CRT_LOTTES_TV] = "Lottes consumer TV",
+    [UI_MENU_CRT_HYLLIAN] = "Hyllian Fast", [UI_MENU_CRT_ZFAST] = "zfast CRT",
+    [UI_MENU_CRT_NATIVE_HDR] = "не применяется с собственным HDR игры",
+    [UI_MENU_CRT_LINES] = "Строки ЭЛТ",
+    [UI_MENU_CRT_LINES_DESC] = "Число строк виртуального экрана с кинескопом, а не разрешение рендера. Не больше половины высоты "
+                               "окна; ширина следует форме картинки. Если высота окна не кратна числу строк, возможен муар.",
+    [UI_MENU_CRT_LINES_240] = "240", [UI_MENU_CRT_LINES_480] = "480", [UI_MENU_CRT_LINES_720] = "720",
     [UI_MENU_COLOR] = "Цвет",
     [UI_MENU_COLOR_PRESET] = "Цветовой профиль",
     [UI_MENU_COLOR_PRESET_DESC] = "Задаёт четыре значения ниже. «Яркий»: больше контраста и насыщенности, тени немного "

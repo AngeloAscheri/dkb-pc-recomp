@@ -511,12 +511,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = g_sc_img[idx];
-    // Native HDR (DKB_HDR_NATIVE, ov_gfx.c hdr_native_on): in its HDR mode the game writes Rec. 2020 PQ
-    // code values into an A2B10G10R10 window texture, which is what an HDR10 swapchain takes, so the picture is blitted
-    // to it as it is. Colour adjustment, FSR and SMAA are skipped: they expect a display-referred SDR picture, and PQ is
-    // not one. The format alone does not say PQ (TotK presents through here too), hence the setting. The blit needs
-    // BLIT_DST on the swapchain's format, which Vulkan does not require of A2R10G10B10; without it the output falls back
-    // to SDR, the game is told so (gfx_window_hdr10) and switches back to its SDR picture.
+    // Native HDR (DKB_HDR_NATIVE, ov_gfx.c hdr_native_on): in its HDR mode the game writes Rec. 2020 PQ code values
+    // into an A2B10G10R10 window texture, which is what an HDR10 swapchain takes, so the picture is blitted to it as it
+    // is. Colour adjustment, FSR, SMAA and the CRT filter are skipped: they expect a display-referred SDR picture, and
+    // PQ is not one. The format alone does not say PQ (TotK presents through here too), hence the setting. The blit
+    // needs BLIT_DST on the swapchain's format, which Vulkan does not require of A2R10G10B10; without it the output
+    // falls back to SDR, the game is told so (gfx_window_hdr10) and switches back to its SDR picture.
     int native_hdr = g_sc_hdr && hdr_native_on() && fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     if (native_hdr && !(sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
         static int logged;
@@ -571,11 +571,14 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     // SMAA (TOTK_SMAA, vk_smaa.c) on the scaled picture, before the menu overlay; it leaves the image in TRANSFER_DST
     if (!native_hdr) vk_smaa_record(cb, tgt, to);
+    // CRT filters (TOTK_CRT_FILTER, vk_crt.c) after SMAA, on the same picture, also SDR only; same layout contract
+    if (!native_hdr) vk_crt_record(cb, tgt, to);
+    else vk_crt_idle();   // the game's own HDR picture skips the SDR filter: no images kept for it meanwhile
     // last: dst's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     VkAccessFlags2 last_write = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    // HDR pass (vk_hdr.c) after FSR and SMAA, before the menu: hdr_img onto dst as PQ code values
+    // HDR pass (vk_hdr.c) after FSR, SMAA and the CRT filter, before the menu: hdr_img onto dst as PQ code values
     if (hdr_img) {
         if (vk_hdr_record(cb, dst, g_sc_view[idx], g_sc_fmt, g_sc_ext.width, g_sc_ext.height)) {
             last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -726,6 +729,7 @@ void vk_present_release(void) {
         menu_vk_release();
         vk_fsr_release();
         vk_smaa_release();
+        vk_crt_release();
         vk_fg_release();
         vk_fsr3fi_release();
         vk_color_release();

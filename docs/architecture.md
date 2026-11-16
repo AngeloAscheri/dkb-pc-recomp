@@ -94,8 +94,12 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 - Resolution. Patch sets make the game read its output, swapchain and scene sizes from the patch page
   (MacNativeGames' sites); `resolution.c` sets them from `output_res` and `render_scale` and grows the texture heap
   and the application pool to match. When the window is larger than the output, `vk_fsr.c` runs AMD FSR 1 (EASU,
-  RCAS) on the present, then `vk_smaa.c` runs SMAA 1x on the finished picture when `TOTK_SMAA` asks for it, before the
-  overlay is drawn. An `output_res` that is not 16:9 (more than 1% off, `res_is_16x9`) also switches on the
+  RCAS) on the present, then `vk_smaa.c` runs SMAA 1x on the finished picture when `TOTK_SMAA` asks for it, then
+  `vk_crt.c` a CRT filter when `TOTK_CRT_FILTER` asks for one (Hookshot's: the picture reduced by area to a virtual
+  raster of `TOTK_CRT_LINES` lines, then drawn back at full size as scanlines and a mask by Lottes', Hyllian's or
+  zfast's shader), before the overlay is drawn. SMAA and the CRT filter are SDR passes: the game's own HDR picture
+  skips them, and with the lifted HDR output they run on the 8-bit picture before the HDR pass. An `output_res`
+  that is not 16:9 (more than 1% off, `res_is_16x9`) also switches on the
   `aspect` patch set, which hands the output's ratio to the camera, and `romfs.c` `overlay_init` loads the
   `romfs-patches-<w>x<h>` overlay for it when it exists (`tools/make_romfs_patches.py --aspect`, laid out by
   `tools/ultrawide_layout.py`; the installer builds ten sizes: 21:9 2560x1080, 3440x1440, 3840x1600, 5120x2160, 32:9
@@ -106,7 +110,8 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   stretched.
 - HDR (`hdr = 1`, experimental, `vk_hdr.c`). The game's window texture is 8-bit sRGB, so HDR is an inverse tonemap of
   it, not the scene's real range. On an HDR10 swapchain (A2B10G10R10, ST 2084; `VK_EXT_swapchain_colorspace`,
-  `VK_EXT_hdr_metadata`) the present chain is game, FSR, SMAA, the HDR pass, the menu. FSR and SMAA write an 8-bit
+  `VK_EXT_hdr_metadata`) the present chain is game, FSR, SMAA, the CRT filter, the HDR pass, the menu. FSR, SMAA and the CRT
+  filter write an 8-bit
   image of the swapchain's size; `shaders/hdr_encode.frag` then linearises it, stretches the largest channel above a
   knee towards `hdr_peak_nits` (all channels scaled together, so hue is kept), puts white at `hdr_game_nits`, converts
   Rec. 709 to Rec. 2020 and PQ-encodes into the swapchain image. The in-game menu is drawn into an RGBA8 image and
@@ -116,7 +121,8 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   `nn::vi::QueryDisplayHdrStatus` with "on" and `hdr_peak_nits`, and `QueryDisplayHdrPaperWhite` with
   `hdr_game_nits`. The game then switches to its own HDR mode: its window texture becomes A2B10G10R10 holding
   Rec. 2020 PQ, which `vk_present.c` `present_image` copies onto the HDR10 swapchain as it is (no colour adjustment,
-  FSR or SMAA, which expect an SDR picture). The game's tonemap stops its highlights at about 1.36 times paper white,
+  FSR, SMAA or CRT filter, which expect an SDR picture). The game's tonemap stops its highlights at about 1.36 times
+  paper white,
   whatever peak it is told; `spirv_hdr_shoulder.c` (`DKB_HDR_SHOULDER=0` turns it off) rewrites its composite stage
   so they reach the peak, leaving everything below the shoulder's knee as the game grades it. Findings and
   measurements: [hdr-native-plan.md](hdr-native-plan.md).

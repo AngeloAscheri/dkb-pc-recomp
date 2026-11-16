@@ -53,6 +53,8 @@ int frame_step_realtime(void);
 int rt_patch_set(const char *name);
 extern const int rt_game_version;
 extern const char rt_game_target[];   // build target: dkb100, dkb458752 or a TotK one
+int hdr_native_on(void);       // ov_gfx.c: the game's own HDR picture is in effect (3.2.0, hdr and hdr_native)
+int gfx_window_hdr10(void);    // gfx.h: the swapchain is HDR10 now (the CRT row's bypass note)
 // fs.h (romfs.c): romfs-patches-xbox was next to romfs-index.bin at start, and was loaded.
 int romfs_xbox_prompts_ready(void);
 int romfs_xbox_prompts_active(void);
@@ -737,6 +739,17 @@ static void rows_render_options(const MenuTarget &target) {
     opt_slider("TOTK_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     static const UiTextId smaa[] = {UI_MENU_OFF, UI_MENU_SMAA_LOW, UI_MENU_SMAA_MEDIUM, UI_MENU_SMAA_HIGH};
     opt_choice("TOTK_SMAA", UI_MENU_SMAA, smaa, 4, UI_MENU_SMAA_DESC);
+    // CRT filter and CRT lines after SMAA, the order of the present chain (vk_crt.c); the game's own HDR picture
+    // bypasses them (SDR shaders), which the note says
+    static const UiTextId crt[] = {UI_MENU_OFF, UI_MENU_CRT_LOTTES_GRILLE, UI_MENU_CRT_LOTTES_TV, UI_MENU_CRT_HYLLIAN,
+                                   UI_MENU_CRT_ZFAST};
+    const bool crt_bypassed = hdr_native_on() && gfx_window_hdr10();
+    opt_choice("TOTK_CRT_FILTER", UI_MENU_CRT, crt, 5, UI_MENU_CRT_DESC,
+               crt_bypassed && strcmp(cfg_value("TOTK_CRT_FILTER"), "off") ? menu_text(UI_MENU_CRT_NATIVE_HDR) : nullptr);
+    if (strcmp(cfg_value("TOTK_CRT_FILTER"), "off")) {
+        static const UiTextId lines[] = {UI_MENU_CRT_LINES_240, UI_MENU_CRT_LINES_480, UI_MENU_CRT_LINES_720};
+        opt_choice("TOTK_CRT_LINES", UI_MENU_CRT_LINES, lines, 3, UI_MENU_CRT_LINES_DESC);
+    }
     if (rt_patch_set("fov") >= 0)
         opt_slider("TOTK_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
 }
