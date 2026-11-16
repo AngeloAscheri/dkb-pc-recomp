@@ -131,7 +131,16 @@ int main(void) {
     CHECK(sizes_after(z, zn, "GSys", "Font", 0) == 518144 + 307200 && sizes_after(z, zn, "GSys", "Font", 1) == 30720 + 28672);
     CHECK(res_heap_extra_kib() == 307200 + 28672);
     free(z);
-    n = build(raw, "GSys", "Stationed", 518144, 0);   // no Font heap: the game's table stays
+    res_heapdef_served();
+    CHECK(R.font_ok);
+    // No Font heap: GSys still grows, and the served table leaves fontk off (R.font_ok); with no GSys extra the game's
+    // table stays.
+    n = build(raw, "GSys", "Stationed", 518144, 0x7fffffff);
+    CHECK(run(raw, n, &z, &zn) == 1 && sizes_after(z, zn, "GSys", "Stationed", 0) == 518144 + 307200);
+    free(z);
+    res_heapdef_served();
+    CHECK(R.heapdef_ok && !R.font_ok);
+    extra_kib = 0;
     z = NULL;
     CHECK(run(raw, n, &z, &zn) == 0 && z == NULL);
     printf("res_heapdef: %u checks, %u failures\n", checks, failures);
