@@ -129,3 +129,30 @@ is free, FSR 4 skips that frame (the game's upscaler runs) and tries again on th
 
 With no library, a failed load, or no 4.x provider (as on NVIDIA), `dkb.log` gets one `fsr4:` line saying why and the FSR 3.1
 path above runs instead, as does a dispatch that fails. The API headers are in `runtime/third_party/ffx_api`.
+
+## When an upscaler is not chosen
+
+An upscaler the Upscaler row (or `upscaler` in `dkb.ini`) no longer chooses gives back what it holds about 120 frames
+(2 s at 60 fps) after it was last chosen, once the GPU is done with it (`runtime/temporal_idle.h` for the rule,
+`vk_dlss.c` `vk_temporal_idle_tick` for where each upscaler is asked; the rule is Longshot's, commit `e314e2b7`). One
+`dkb.log` line says what went, and the next upscale with that upscaler makes it again:
+
+- `dlss: not used for 120 frames: its feature let go; ...`: NGX's feature, with its model memory and history (making it
+  again takes about 80 ms of one frame).
+- `fsr3: not used for 120 frames: its images let go; ...`: FSR 3.1's internal images (about 40 to 60 MB at 1280x800, some
+  320 MB at 4K). Its pipelines and constants stay, so no shader is built again.
+- `fsr4: not used for 120 frames: its images and AMD's context let go; ...`: the input pass's colour, depth and motion
+  images, the output image and the exposure image (freed once the GPU is done with them), and AMD's context with the
+  library's own images, destroyed as a change of the output size destroys it. The DLLs (or the library) stay loaded and so
+  does the input pass's pipeline; the images and the context are made again at the next FSR 4 frame, and the
+  `fsr4: FSR ... made for outputs of WxH` line shows the context.
+- `temporal: no upscaler chosen for 120 frames: the motion-vector and depth images let go; ...`: the images the three
+  upscalers share, once none of them is chosen.
+
+An upscaler that is still chosen keeps everything, however long the game runs no upscale (loading screens, or a 3D scene
+drawn at the output size): making it again at each area's first frame would stall every entry. Frame interpolation
+(`frame_gen_by = fsr3`, `vk_fsr3fi.c`) keeps its images: it is made and used on the present thread, which a release from
+the replay thread would race, and it is not covered by this.
+
+To check it, set `upscaler = fsr3`, play a few seconds, then choose `fsr` (or the game's own upscaler) in the menu or with
+`TOTK_MENU_TEST_SET`: about two seconds later the `fsr3: not used ...` line and the `temporal: ...` one follow.

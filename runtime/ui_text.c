@@ -69,15 +69,35 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                              "Immediate sends frames as soon as they are ready and can cause tearing.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
     [UI_MENU_PRESENT_IN_USE] = "in use: %s",
+    [UI_MENU_FRAME_GEN] = "Frame generation (experimental)",
+    [UI_MENU_FRAME_GEN_DESC] = "Shows generated frames between each two of the game's frames for smoother motion, at the cost of some input delay. "
+                               "Fast motion and camera cuts can show artifacts.\n\n"
+                               "Off: only the game's own frames, no added delay. Automatic: a frame for each refresh of the display, "
+                               "shown one game frame later. 2x to 8x: that many frames for each of the game's, and no more than the display can show.\n\n"
+                               "It needs Frame sync set to Mailbox or Immediate. "
+                               "Generated frames are left out after a hitch and when the game's next frame is already waiting.",
+    [UI_MENU_FRAME_GEN_2X] = "2x", [UI_MENU_FRAME_GEN_3X] = "3x", [UI_MENU_FRAME_GEN_4X] = "4x", [UI_MENU_FRAME_GEN_5X] = "5x",
+    [UI_MENU_FRAME_GEN_6X] = "6x", [UI_MENU_FRAME_GEN_7X] = "7x", [UI_MENU_FRAME_GEN_8X] = "8x",
+    [UI_MENU_FRAME_GEN_VSYNC] = "inactive with VSync",
+    [UI_MENU_FRAME_GEN_BY] = "Frame generation made by",
+    [UI_MENU_FRAME_GEN_BY_DESC] = "Built-in makes the frames from the picture alone. AMD FSR 3.1 also uses the scene's depth and motion "
+                                  "and an optical flow, which takes more GPU time. It makes the 2x frames only.\n\n"
+                                  "AMD's needs a temporal upscaler (DLSS, FSR 3.1 or FSR 4) with the 3D drawn below the output size; "
+                                  "a frame it cannot make gets the built-in one.",
+    [UI_MENU_FRAME_GEN_BUILTIN] = "Built-in", [UI_MENU_FRAME_GEN_FSR3] = "AMD FSR 3.1",
+    [UI_MENU_FRAME_GEN_BY_NEEDS] = "needs DLSS, FSR 3.1 or FSR 4 with the 3D below the output size",
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "Choose which graphics card runs the game. Use Automatic unless you need to select a specific card.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Full also shows a frame time graph and hardware statistics. "
+    [UI_MENU_PERF_OVERLAY_DESC] = "Shows FPS in the top right. Counter shows it as a large number with no background. Full also shows a frame time graph and hardware statistics. "
                                   "Breakdown splits each frame in the graph into its parts: the game's own work, the GPU frame prep, "
                                   "the waits by what was waited for, and the frame rate limit. Press F10 to cycle through the modes.",
     [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full", [UI_MENU_PERF_BREAKDOWN] = "Breakdown",
+    [UI_MENU_PERF_COUNTER] = "Counter",
     // printf format of the overlay line in FPS mode: the frame rate
     [UI_PERF_LINE_FPS] = "%.0f fps",
+    // the small label beside the number in Counter mode
+    [UI_PERF_FPS_LABEL] = "FPS",
     [UI_MENU_RESOLUTION_GROUP] = "Resolution",
     [UI_MENU_DISPLAY_OUTPUT] = "Display output",
     [UI_MENU_RENDER_OPTIONS] = "Render Options",
@@ -196,6 +216,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_DKB_REALTIME] = "Allow higher frame rates",
     [UI_MENU_DKB_REALTIME_DESC] = "Unlocks the Frame rate limit setting, including rates above 60 FPS. "
                                 "Game timing adapts as FPS changes. This mode is experimental.",
+    [UI_MENU_ANTILAG] = "AMD Anti-Lag 2 (experimental)",
+    [UI_MENU_ANTILAG_DESC] = "AMD GPUs: each frame starts as late as it can, for less input delay. Shown only where the "
+                             "driver supports it.",
     [UI_MENU_CLOTH_REALTIME] = "Cloth on the clock",
     [UI_MENU_CLOTH_REALTIME_DESC] = "Steps cloth and hair by real time as well.",
     [UI_MENU_HIGHFPS_FIX] = "High frame rate fixes",
@@ -441,15 +464,34 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
     [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
     [UI_MENU_PRESENT_IN_USE] = "сейчас: %s",
+    [UI_MENU_FRAME_GEN] = "Генерация кадров (экспериментально)",
+    [UI_MENU_FRAME_GEN_DESC] = "Показывает сгенерированные кадры между кадрами игры: движение плавнее ценой небольшой задержки ввода. "
+                               "При быстром движении и смене планов возможны артефакты.\n\n"
+                               "Выкл.: только собственные кадры игры, без дополнительной задержки. Автоматически: кадр на каждое обновление экрана, "
+                               "с задержкой в один кадр игры. От 2x до 8x: столько кадров на каждый кадр игры, но не больше, чем показывает экран.\n\n"
+                               "В строке «Синхронизация кадров» нужен режим Mailbox или «Без ожидания». "
+                               "Сгенерированные кадры пропускаются после рывка и когда следующий кадр игры уже ждёт.",
+    [UI_MENU_FRAME_GEN_2X] = "2x", [UI_MENU_FRAME_GEN_3X] = "3x", [UI_MENU_FRAME_GEN_4X] = "4x", [UI_MENU_FRAME_GEN_5X] = "5x",
+    [UI_MENU_FRAME_GEN_6X] = "6x", [UI_MENU_FRAME_GEN_7X] = "7x", [UI_MENU_FRAME_GEN_8X] = "8x",
+    [UI_MENU_FRAME_GEN_VSYNC] = "не работает с вертикальной синхронизацией",
+    [UI_MENU_FRAME_GEN_BY] = "Кадры создаёт",
+    [UI_MENU_FRAME_GEN_BY_DESC] = "Встроенный способ делает кадры только по картинке. AMD FSR 3.1 использует ещё глубину и движение сцены "
+                                  "и оптический поток, на что уходит больше времени видеокарты. Он делает только кадры режима 2x.\n\n"
+                                  "Для AMD нужен временной апскейлер (DLSS, FSR 3.1 или FSR 4), при котором 3D рисуется в разрешении ниже выходного; "
+                                  "кадр, который он не может сделать, получается встроенным способом.",
+    [UI_MENU_FRAME_GEN_BUILTIN] = "Встроенный", [UI_MENU_FRAME_GEN_FSR3] = "AMD FSR 3.1",
+    [UI_MENU_FRAME_GEN_BY_NEEDS] = "нужен DLSS, FSR 3.1 или FSR 4 и 3D ниже выходного разрешения",
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Полный» добавляет время кадров с графиком, "
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Счётчик» показывает её крупным числом без фона. «Полный» добавляет время кадров с графиком, "
                                   "загрузку ЦП, GPU и памяти, температуры и ожидания потока отрисовки. F10 переключает "
                                   "режимы. «Разбивка» делит каждый кадр на графике на части: работа самой игры, подготовка "
                                   "кадра для GPU, ожидания по причинам и ограничение кадров.",
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный", [UI_MENU_PERF_BREAKDOWN] = "Разбивка",
+    [UI_MENU_PERF_COUNTER] = "Счётчик",
     [UI_PERF_LINE_FPS] = "%.0f к/с",
+    [UI_PERF_FPS_LABEL] = "к/с",
     [UI_MENU_RESOLUTION_GROUP] = "Разрешение",
     [UI_MENU_DISPLAY_OUTPUT] = "Вывод изображения",
     [UI_MENU_RENDER_OPTIONS] = "Настройки рендеринга",
@@ -572,6 +614,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DKB_REALTIME] = "Разрешить высокий FPS",
     [UI_MENU_DKB_REALTIME_DESC] = "Позволяет выбрать лимит кадров, в том числе выше 60 FPS. "
                                 "Игровое время подстраивается под частоту кадров. Режим экспериментальный.",
+    [UI_MENU_ANTILAG] = "AMD Anti-Lag 2 (экспериментально)",
+    [UI_MENU_ANTILAG_DESC] = "Видеокарты AMD: каждый кадр начинается как можно позже, задержка ввода меньше. "
+                             "Показывается только там, где это поддерживает драйвер.",
     [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",
     [UI_MENU_CLOTH_REALTIME_DESC] = "Ткань и волосы тоже идут по реальному времени.",
     [UI_MENU_HIGHFPS_FIX] = "Исправления для высокого FPS",
