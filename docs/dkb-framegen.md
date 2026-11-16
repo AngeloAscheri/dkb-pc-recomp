@@ -62,9 +62,21 @@ The depth and motion are the temporal upscaler's: `vk_dlss.c` `vk_temporal_input
 - the history is there: the first frame after a gap, a resize or a camera cut is made by the built-in interpolation, as is any frame the passes refuse (a picture whose shape is not the 3D's).
 - the history is an SDR picture: AMD's passes read 8-bit colour, so with the game's own HDR picture (`hdr_native`, a PQ history) the built-in interpolation makes the frame, which works on the PQ code values (`vk_framegen.c` `record`);
 
-Otherwise the built-in frame is made, with no other change to frame generation. The game's HUD is part of the picture the passes read, so it is interpolated with the scene, as it is by the built-in interpolation; AMD's SDK can take the picture without the HUD as well, which this runtime does not make yet.
+Otherwise the built-in frame is made, with no other change to frame generation.
 
-Log lines: `fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU` and `fsr3fi: 17 pass pipelines ready` once the setting is chosen on a capable device, `fsr3fi: making the 2x frames at WxH from RWxRH depth and motion` at the first frame it makes, and `by AMD FSR 3.1 N` in the 2x `fg:` line (below), which counts the made frames AMD's passes made. `fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler ...` says once that a frame had none.
+### The HUD
+
+The game draws its HUD into the same picture the upscaler wrote, so AMD's interpolation, given only the picture as shown, moves the HUD with the scene: smeared hearts and counters, garbled text. The SDK takes the frames without their HUD as well (`HUDLessColor`, `HUDLessAttachedFactor`), for this frame and the one before: the flow and the interpolation then work on the scene alone, and the inpainting pass puts back every pixel where the two pictures differ, the HUD, as it is shown (`ffx_frameinterpolation_inpainting.h` `computeInpainting`). The idea of finding such a picture in a game that gives none is OptiScaler's HUDfix (<https://github.com/optiscaler/OptiScaler>, `hudfix/Hudfix_Vk.cpp`); no code of it is used.
+
+Bananza draws the upscale into a 3D-sized R11G11B10F picture, then draws the HUD into that same image with blended quads, and one last draw reads it with bilinear filtering and writes the window texture, whose sRGB format encodes it (no tone mapping between them). So:
+
+1. `vk_fsr3fi_note_picture` (called by `vk_fsr3.c`, `vk_fsr4.c` and `vk_dlss.c` right after the upscaler wrote the output) copies the output into a ring of three images before the HUD is drawn, and notes the copy with the frame's depth and motion.
+2. `shaders/fg_hudless.comp` (run by `vk_framegen.c` before AMD's passes) does the last draw's work on the copy: bilinear to the window texture's size, sRGB encoded. Where that is within 3 levels of the frame as shown, it keeps the shown pixel exactly, so AMD's test sees no HUD there; elsewhere, the HUD's pixels, it gives the scene behind.
+3. The pictures of this frame and the one before go to `vk_fsr3fi_generate` as its sources, and the frame as shown is the inpainting pass's backbuffer. A frame without them (the first one after a change, a picture of another shape than the window texture, a crop of part of it, a frame whose upscaler did not note a picture) is interpolated from the frames as shown, with the HUD moved as before.
+
+The log says `fsr3fi: the upscaled picture is copied before the game's HUD` when the copies are made, and the 2x `fg:` line counts the made frames that used the frames without their HUD. With FSR 4 (a Windows build, `vk_fsr4.c`) and DLSS (`vk_dlss.c`) the copy is taken the same way, from the same output image; those two were compiled but not run on the machine this was written on.
+
+Log lines: `fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU` and `fsr3fi: 17 pass pipelines ready` once the setting is chosen on a capable device, `fsr3fi: making the 2x frames at WxH from RWxRH depth and motion` at the first frame it makes, and `by AMD FSR 3.1 N, K of them with the frames without their HUD` in the 2x `fg:` line (below), which counts the made frames AMD's passes made and those of them that had the frames without their HUD. `fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler ...` says once that a frame had none.
 
 ## Requirements
 
@@ -101,11 +113,11 @@ A skipped frame is shown as the game's frame alone.
 
 At 2x, every 5 seconds:
 
-`fg: 5.0 s: real R fps, shown S fps, made N (by AMD FSR 3.1 M); skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
+`fg: 5.0 s: real R fps, shown S fps, made N (by AMD FSR 3.1 M, K of them with the frames without their HUD); skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
 
 - real: game frames per second.
 - shown: real plus made frames per second.
-- made: made frames in the period; by AMD FSR 3.1: those AMD's passes made (`frame_gen_by = fsr3`), the rest the built-in interpolation.
+- made: made frames in the period; by AMD FSR 3.1: those AMD's passes made (`frame_gen_by = fsr3`), the rest the built-in interpolation; K: those of M that had the frames without their HUD.
 - skipped: made frames not produced, by reason (see above).
 - real cut short: the game's frame was flipped before its half-interval wait ended because a newer frame was already waiting.
 - late >2 ms: the game's frame flipped more than 2 ms after its due time.

@@ -808,6 +808,7 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     }
     F.fresh = 0;
     vk_temporal_done(&t, w, h, ow);
+    vk_fsr3fi_note_picture(cb, out);   // the picture before the game's HUD, for AMD's frame interpolation
     // A summary at the first evaluation and then every 1800 (half a minute of DLSS at 60 fps; the game skips its
     // upscaler, and DLSS with it, while it renders at the output size). The projection's z column shows an off-centre
     // or jittered frustum of the game's own.

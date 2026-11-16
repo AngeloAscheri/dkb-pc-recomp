@@ -156,6 +156,10 @@ typedef struct {
     float frame_ms;    // since the frame before
     int reset;         // the upscaler's own history started again this frame
     uint64_t sequence; // set by vk_fsr3fi_note: its count of the frames noted
+    // set by vk_fsr3fi_note_picture: the upscaled picture as the upscaler wrote it, before the game drew its HUD into
+    // it (the game's format, a sampled view in GENERAL), for the frame without its HUD; NULL: none
+    VkImageView picture;
+    uint32_t picture_w, picture_h;
 } VkFiInputs;
 // CRT filters on the present (vk_crt.c): with TOTK_CRT_FILTER = lottes_grille|lottes_tv|hyllian|zfast, records the
 // filter over the rectangle {x, y, w, h} of the swapchain image dst, which is in TRANSFER_DST and holds the scaled SDR
@@ -578,14 +582,20 @@ void vk_temporal_done(const VkTemporalIn *t, uint32_t w, uint32_t h, uint32_t ow
 // (w x h: the render size) for the frame's present. vk_fsr3fi_take: the inputs noted since the last take, once
 // (vk_backend.c present_image, on the thread that recorded the frame); 0 when none. vk_fsr3fi_generate: records the
 // frame between `previous` and `color` (sampled views of width x height images in GENERAL) into `out` (a storage and
-// sampled view, 8-bit UNORM, GENERAL), on a command buffer whose earlier use is done; 1 when it made it, 0 when it did
-// not (not wanted, no inputs, a reset), which leaves the frame to the caller. vk_fsr3_camera_factors (vk_fsr3.c): the
-// camera factors of a projection for the passes, 0 for one they cannot use.
+// sampled view, 8-bit UNORM, GENERAL), on a command buffer whose earlier use is done; hudless and hudless_previous: the
+// same two frames before the game's HUD was drawn, in the same size, or NULL for none; 1 when it made it, 0 when it did
+// not (not wanted, no inputs, a reset), which leaves the frame to the caller. vk_fsr3fi_note_picture: after a temporal
+// upscaler (vk_fsr3.c, vk_fsr4.c, vk_dlss.c) wrote the game's upscale output `out` and called vk_temporal_done: with
+// frame_gen_by = fsr3 at 2x, records a copy of it into cb, before the game draws its HUD into that image, and notes the
+// copy with this frame's inputs (VkFiInputs.picture). vk_fsr3_camera_factors (vk_fsr3.c): the camera factors of a
+// projection for the passes, 0 for one they cannot use.
 int vk_fsr3fi_wanted(void);
 void vk_fsr3fi_note(const VkTemporalIn *t, uint32_t w, uint32_t h);
 int vk_fsr3fi_take(VkFiInputs *out);
 int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView color, VkImageView previous,
-                       VkImageView out, uint32_t width, uint32_t height);
+                       VkImageView hudless, VkImageView hudless_previous, VkImageView out, uint32_t width,
+                       uint32_t height);
+void vk_fsr3fi_note_picture(VkCommandBuffer cb, const VkTexImage *out);
 void vk_fsr3fi_release(void);   // device idle, before it goes away
 int vk_fsr3_camera_factors(const float p[16], float f[4]);
 
