@@ -189,3 +189,30 @@ site dkbscene main 3c1624 bd400120 @page:x9 bd411920
 set recguard DKB_FIX_RECORD_GUARD 1
 guard recguard main a37a84 a3a388 ptr x10 3dc00140
 guard recguard main a37a9c a3a388 ptr x11 3dc00160
+
+# #214: text is soft above 1080p. nn::fontll rasterises each glyph at run time from the font's CFF outline, at the
+# layout size, so a larger output only magnifies it. Off by default (DKB_FONT_SCALE=1): raster at k=2 and keep the
+# layout the same. The font cache (f_70049e1d0, filled by f_70006f84a0) holds, per font, a px-to-layout multiplier pair
+# at +0x10/+0x14 of its 0x1c-byte entries, and the glyph record GetGlyph (86e6e0) hands out has layout fields
+# (+0x48..+0x50, raw pixels times that multiplier) and raw cache fields (+0x44/+0x46 size, +0x40/+0x42 position, in cache
+# pixels, which the consumer divides by the cache size at x19+0x28/+0x2c). So: every raster size doubles, every
+# multiplier halves, the per-font pixel padding tables double, the ascent doubles and the cache texture doubles.
+set fontk DKB_FONT_SCALE 0
+# SetScale (PLT 1985530) takes the size as 16.16 fixed point: lsl #16 -> lsl #17. Cache fill, then the width, kerning
+# and advance queries (86f42c, 86f65c), which must measure at the same scale because their results use the halved multiplier.
+site fontk main 6f85a0 53103d01 530f3901
+site fontk main 86f4c4 53103ec1 530f3ac1
+site fontk main 86f7e4 53103e81 530f3a81
+site fontk main 86f860 53103e81 530f3a81
+site fontk main 86f8e8 53103e81 530f3a81
+# Ascent in pixels, size * ratio + 0.5 (fmadd at 6f85d8): double the size read from entry +0x36 (s1 is converted here).
+site fontk main 6f85d0 7e21d821 7e21d821 1e212821
+# Multipliers (str of the file's two floats into the entry): halve. s1 is dead (reloaded at the next 49eb18+ use).
+site fontk main 49ebc8 bd001160 1e2c1001 1e210800 bd001160
+site fontk main 49ebd8 bd001560 1e2c1001 1e210800 bd001560
+# Per-font pixel tables used with glyph widths (1c10, 1c28 of the cache): store them doubled. The registers are dead after.
+site fontk main 49e75c 7837796a 531f794a 7837796a
+site fontk main 49e794 78377928 531f7908 78377928
+# Glyph cache width and height (descriptor +0/+4, stored at +0x28/+0x2c, where the texture and the packer read them): x2.
+site fontk main 49e4a0 b9400288 b9400288 531f7908
+site fontk main 49e4ac b9400688 b9400688 531f7908
