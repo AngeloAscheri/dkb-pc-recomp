@@ -196,6 +196,7 @@ int vk_hdr_record(VkCommandBuffer cb, VkImage dst, VkImageView dst_view, VkForma
 VkImageView vk_hdr_ui_target(VkCommandBuffer cb, uint32_t w, uint32_t h);
 void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h);
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
+float vk_hdr_game_nits(void);   // hdr_game_nits, the paper white (vk_framegen.c compares the HDR picture by it)
 void vk_hdr_release(void);   // before the device goes away
 void vk_present_flip(void);
 void vk_present_lock(void);     // the lock vk_present_release runs under (vk_framegen.c display_main)
