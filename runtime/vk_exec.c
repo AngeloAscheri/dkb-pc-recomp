@@ -55,7 +55,10 @@ enum { PAR_WHY_UNSEEN, PAR_WHY_NONE, PAR_WHY_NEW, PAR_WHY_SMALL, PAR_WHY_BANNED,
        PAR_WHY_NOPASS };
 #define PAR_BAN_AFTER 8   // hazards after which a target set is not sliced again
 
-typedef struct { uint64_t sig; uint32_t draws; uint8_t banned; } ParHist;
+// twin: the texture ids (of the pool the pass sampled them from) whose depth twins par_start copies before the pass
+// begins (vk_exec_draw_twins_copy), learned from the slices that needed one (vk_exec_par_twin).
+#define PAR_TWINS 4
+typedef struct { uint64_t sig; uint32_t draws; uint8_t banned, ntwin; uint32_t twin[PAR_TWINS]; } ParHist;
 static ParHist par_hist[PAR_HIST];
 static int par_mode = -1;                       // DKB_REPLAY_THREADS: 0 off, else the threads (stage A: 1)
 static int par_threads(void);
@@ -94,6 +97,8 @@ static uint64_t par_end_op[OP_COUNT_ + 1];     // collections ended by each op (
 static uint64_t par_no[5];                      // big-pass draws left unsliced: 0 small or new targets, 1 banned,
                                                 // 2 no attachment, 3 hazards in slices, 4 pass did not open
 static _Thread_local int par_slice, par_hazard; // recording a slice; a slice dropped a pass or barrier call
+static _Thread_local uint32_t par_tw[PAR_TWINS];  // the texture ids the slice being recorded needed a twin of
+static _Thread_local int par_ntw;                 // (vk_exec_par_twin), and their count; PAR_TWINS + 1: more
 static int par_restart;                         // par_start ends a pass a clear opened, to open it again for slices
 static int pass_secondary;                      // the next vk_exec_pass_begin opens a pass of secondary command buffers
 static int pass_tried, pass_sliced;             // the open pass: par_start looked at it; it has secondary contents
@@ -200,7 +205,7 @@ static ParHist *par_find(uint64_t sig, int add) {
         if (!low || (!e->sig && low->sig) || (e->sig && low->sig && e->draws < low->draws)) low = e;
     }
     if (!add) return NULL;
-    *low = (ParHist){sig, 0, 0};
+    *low = (ParHist){.sig = sig};
     return low;
 }
 
@@ -239,13 +244,13 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
                                   fw[i].h, fw[i].fmt, fw[i].n);
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
-           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu twin restarts %llu; targets%s",
+           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu twin restarts %llu sliced %llu; targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
            (unsigned long long)f->clears, (unsigned long long)f->copies, (unsigned long long)f->dispatches,
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
-           (unsigned long long)f->fb_layouts, (unsigned long long)f->twin_restarts, list);
+           (unsigned long long)f->fb_layouts, (unsigned long long)f->twin_restarts, (unsigned long long)f->twin_sliced, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
 }
@@ -1818,7 +1823,12 @@ static void par_log(void) {
 static int par_collecting(void) { return PC.on; }
 void vk_exec_par_hazard(void) { if (!par_hazard) par_hazard = 1; }
 void vk_exec_par_order_hazard(void) { if (par_hazard < 2) par_hazard = 2; }
-void vk_exec_par_ban(void) { par_hazard = 3; }
+void vk_exec_par_twin(uint32_t id) {
+    for (int i = 0; i < par_ntw && i < PAR_TWINS; i++)
+        if (par_tw[i] == id) return;
+    if (par_ntw < PAR_TWINS) par_tw[par_ntw++] = id;
+    else par_ntw = PAR_TWINS + 1;
+}
 
 static void par_done(void *arg) {   // completion thread: the secondaries of a finished submission can be reused
     ParDone *d = arg;
@@ -1941,6 +1951,9 @@ static int par_start(VkExec *ex) {
         par_restart = 0;
         par_restarts++;
     }
+    // The depth twins this target set's slices needed before: copied now, outside the pass, since a slice cannot end
+    // the pass to copy them (vk_exec_draw.c twin_prepare). The pass's slices read them from its snapshot below.
+    int twins = e->ntwin ? vk_exec_draw_twins_copy(ex, e->twin, e->ntwin) : 0;
     VkQueryControlFlags qf = 0;
     int qopen = 0, q = vk_exec_oq_begin_outside(ex, &qf, &qopen);
     if (q < 0) return pass_why = PAR_WHY_QUERY, pass_tried = 1, par_skipped_oq++, 0;
@@ -1960,6 +1973,7 @@ static int par_start(VkExec *ex) {
     PC.upd = (int)(par_pass_seq++ % VK_EXEC_UPD_SNAPS);
     par_usd[PC.upd] = vk_usnap_drops();   // the uniform copies as of the pass's start (vk_usnap_view)
     vk_exec_draw_slices_begin(par_nworkers + 1, PC.upd);   // the pass's slices read the inline uniform updates noted so far
+    vk_exec_draw_twins_snap(ex, PC.upd, twins);            // and the depth twins copied above
     uint32_t *x = par_expect(par_piece_key(sig, 0), 0);
     PC.expect = (int)(x && *x ? *x : e->draws);
     PC.on = 1, PC.sig = sig, PC.draws = 0;
@@ -2043,6 +2057,8 @@ typedef struct {
     int recorded, hazard;
     ViewEnt *views;      // views the slice made (freed with the submission)
     int nviews;
+    int ntw;             // the texture ids its draws needed a depth twin of that the pass had none of (par_tw)
+    uint32_t tw[PAR_TWINS];
 } ParOut;
 
 static ParOut par_out[PAR_MAX_SLICES];
@@ -2075,7 +2091,7 @@ static void par_record(int i, ParPool *pp, VkExec *w, struct DrawCtx *dc) {
     vk_exec_draw_rebase(w);   // the context's memos and bindings were made from another slice's copy of the state
     vk_exec_draw_slice_view(dc, PC.supd[i]);
     vk_usnap_view(par_usd[PC.supd[i]] + 1);   // the drops made before the pass began
-    par_slice = 1, par_hazard = 0;
+    par_slice = 1, par_hazard = 0, par_ntw = 0;
     vk_mem_count_quiet(1), vk_usnap_quiet(1);
     int merge = vk_exec_draw_merge_on();   // TOTK_DRAW_MERGE: runs of draws that differ only in c4 go as instances
     for (int k = PC.start[i], end = PC.end[i]; k < end; k++) {
@@ -2086,7 +2102,8 @@ static void par_record(int i, ParPool *pp, VkExec *w, struct DrawCtx *dc) {
     par_slice = 0;
     vk_mem_count_quiet(0), vk_usnap_quiet(0), vk_usnap_view(0);
     if (vkEndCommandBuffer(cb) != VK_SUCCESS) rt_fatal("vk: secondary command buffer end failed");
-    par_out[i] = (ParOut){{pp, cb}, w->fb_dirty, w->recorded, par_hazard, w->views, w->nviews};
+    par_out[i] = (ParOut){{pp, cb}, w->fb_dirty, w->recorded, par_hazard, w->views, w->nviews, par_ntw};
+    memcpy(par_out[i].tw, par_tw, sizeof par_tw);
 }
 
 // ---- workers (DKB_REPLAY_THREADS=N: N-1 of them; the submitting thread records slices too)
@@ -2193,7 +2210,7 @@ static void par_start_workers(void) {
 static int par_defer_ok(const VkExec *ex);
 static void par_defer(VkExec *ex);
 static void par_wait_range(int s0, int s1, uint64_t t1);
-static int par_outputs(VkExec *ex, int s0, int s1, int held, ParDone **done_out, VkCommandBuffer **cbs_out);
+static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, ParDone **done_out, VkCommandBuffer **cbs_out);
 static void par_hazards(int hazard, uint64_t sig);
 
 static void par_flush(VkExec *ex) {
@@ -2258,7 +2275,7 @@ static void par_flush(VkExec *ex) {
     par_wait_range(PC.s0, PC.nslices, t1);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(ex, PC.s0, PC.nslices, 0, &done, &cbs);
+    int hazard = par_outputs(ex, PC.s0, PC.nslices, 0, PC.sig, &done, &cbs);
     uint64_t t3 = kern_now_ns();
     rec_drain();   // the recorder has made every earlier call into the primary
     if (PC.nslices > PC.s0) vkCmdExecuteCommands(ex->cb, (uint32_t)(PC.nslices - PC.s0), cbs);
@@ -2338,7 +2355,7 @@ static void par_spill(void) {
     par_wait_range(d->s0, d->s1, t0);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(&X, d->s0, d->s1, 1, &done, &cbs);
+    int hazard = par_outputs(&X, d->s0, d->s1, 1, d->sig, &done, &cbs);
     rec_drain();
     if (d->s1 > d->s0) vkCmdExecuteCommands(X.cb, (uint32_t)(d->s1 - d->s0), cbs);
     rec_capture_play(X.cb, d->cap_lo, d->cap_hi);
@@ -2420,7 +2437,7 @@ static int par_settle_front(VkExec *ex, int wait) {
     par_wait_range(d.s0, d.s1, t0);
     ParDone *done;
     VkCommandBuffer *cbs;
-    int hazard = par_outputs(ex, d.s0, d.s1, 1, &done, &cbs);
+    int hazard = par_outputs(ex, d.s0, d.s1, 1, d.sig, &done, &cbs);
     ParTail t = {d.s1 - d.s0, cbs, d.cap_lo, d.cap_hi};
     vk_sync_split_finish(par_tail, &t);
     free(cbs);
@@ -2491,10 +2508,13 @@ static void par_wait_range(int s0, int s1, uint64_t t1) {
 }
 
 // Slices [s0, s1) recorded: their command buffers (*cbs, freed by the caller; *done, for the completion), their views
-// into the submission's, and the worst hazard they met. held: the pass has ended already, so what the primary's pass
+// into the submission's, and the worst hazard they met. The texture ids whose depth twins they lacked go to the target
+// set's history (sig), for par_start to copy from the next such pass on; an id it had learned already, or one past
+// PAR_TWINS, is a hazard (1): the copy failed or the set needs more twins than are copied, and the draw sampled the
+// colour image, so a set that keeps missing them is left unsliced (par_hazards). held: the pass has ended already, so what the primary's pass
 // state takes from the slices no longer matters. The recording contexts' frame counters go to vk_exec_frame once no
 // slice is being recorded.
-static int par_outputs(VkExec *ex, int s0, int s1, int held, ParDone **done_out, VkCommandBuffer **cbs_out) {
+static int par_outputs(VkExec *ex, int s0, int s1, int held, uint64_t sig, ParDone **done_out, VkCommandBuffer **cbs_out) {
     par_unmerged = 1;
     if (!held && !pd_n) vk_exec_draw_slices_end(par_nworkers + 1), par_unmerged = 0;
     int n = s1 - s0;
@@ -2509,6 +2529,23 @@ static int par_outputs(VkExec *ex, int s0, int s1, int held, ParDone **done_out,
         cbs[i - s0] = o->cb.cb;
         if (!held) ex->fb_dirty |= o->fb_dirty, ex->recorded += o->recorded;
         if (o->hazard > hazard) hazard = o->hazard;
+        if (o->ntw) {
+            ParHist *e = par_find(sig, 1);
+            int miss = o->ntw > PAR_TWINS;
+            for (int k = 0; k < o->ntw && k < PAR_TWINS; k++) {
+                int j = 0;
+                while (j < e->ntwin && e->twin[j] != o->tw[k]) j++;
+                if (j < e->ntwin) miss = 1;
+                else if (e->ntwin < PAR_TWINS) {
+                    e->twin[e->ntwin++] = o->tw[k];
+                    static int told;
+                    if (told++ < 8)
+                        rt_log("vk: a sliced pass samples texture %u through a depth twin: copied before its targets' next "
+                               "sliced pass", o->tw[k]);
+                } else miss = 1;
+            }
+            if (miss && !hazard) hazard = 1;
+        }
         for (int k = 0; k < o->nviews; k++) {   // the slice's views go with the submission like the primary's
             if (ex->nviews == ex->cap_views) ex->views = par_grow(ex->views, &ex->cap_views, sizeof(ViewEnt));
             ((ViewEnt *)ex->views)[ex->nviews++] = o->views[k];
@@ -2526,12 +2563,10 @@ static void par_hazards(int hazard, uint64_t sig) {
     // the target in the feedback layout, so a few hazards are expected; a set that keeps having them is left alone.
     par_no[3]++;
     if (hazard >= 2 && e->banned < PAR_BAN_AFTER) {
-        // 2: a draw of a slice stored into a range a uniform snapshot copy covers: which later bindings take the copy
-        // follows the draw order, which slices recorded at once do not keep. 3: a draw samples an image that needs a
-        // depth twin, which only the primary can copy (it ends the pass), and will on every frame.
+        // A draw of a slice stored into a range a uniform snapshot copy covers: which later bindings take the copy
+        // follows the draw order, which slices recorded at once do not keep.
         e->banned = PAR_BAN_AFTER;
-        rt_log(hazard == 2 ? "vk: a draw of a sliced pass stores over a uniform snapshot copy: those targets are not sliced again"
-                           : "vk: a draw of a sliced pass samples an image that needs a depth twin: those targets are not sliced again");
+        rt_log("vk: a draw of a sliced pass stores over a uniform snapshot copy: those targets are not sliced again");
     } else if (e->banned < 255 && ++e->banned == PAR_BAN_AFTER)
         rt_log("vk: a sliced pass needed a pass or barrier change inside a slice %d times: those targets are not sliced again",
                PAR_BAN_AFTER);
