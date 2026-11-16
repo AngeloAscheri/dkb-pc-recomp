@@ -19,9 +19,13 @@
 // frame without its inputs, a reset) the built-in interpolation runs exactly as before.
 //
 // FSR 3.1's interpolation has no phase input (ffx_frameinterpolation.h fixes t at 0.5): it makes the midpoint only, so
-// it is used for the one made frame a game frame at 2x. The game draws its HUD into the picture the passes read, so the
-// HUD is interpolated with the scene, as it is by the built-in interpolation. The SDK can be given the picture without
-// the HUD as well (HUDLessColor); this runtime does not make it, so those inputs are left out of the bindings.
+// it is used for the one made frame a game frame at 2x. The game draws its HUD into the same picture the upscaler
+// wrote, which moved the HUD with the scene (smeared hearts and counters) when the passes read only that picture. So
+// the frames are also given without their HUD (the SDK's HUDLessColor): the upscaler's output is copied before the game
+// draws the HUD into it (vk_fsr3fi_note_picture, called by vk_fsr3.c, vk_fsr4.c and vk_dlss.c), vk_framegen.c makes the
+// frame without its HUD from the copy (shaders/fg_hudless.comp), and with those of this frame and the one before the
+// interpolation moves the scene alone while the inpainting pass puts the HUD back as it is shown. A frame without them
+// (a crop of part of the window texture, a picture of another shape, the first frame) is interpolated as it is shown.
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -146,7 +150,7 @@ typedef struct {
     int32_t reset;
     float device_to_view_depth[4];
     float delta_time;
-    int32_t hudless_attached_factor;   // 0: no picture without the HUD is given
+    int32_t hudless_attached_factor;   // 1: the frames without their HUD are the interpolation's sources
     int32_t distortion_field_size[2];
     float optical_flow_scale[2];
     int32_t optical_flow_block_size;
@@ -268,6 +272,18 @@ static const VkImageSubresourceRange ALL_LEVELS = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
 static PlatMutex nl = PLAT_MUTEX_INIT;
 static VkFiInputs noted;
 static uint64_t note_count;
+
+// The upscaled pictures before the HUD (vk_fsr3fi_note_picture), a ring of copies (nl): the present thread reads frame
+// N's copy while the replay thread may already be recording frame N + 1, so the copy is not written again until two
+// more frames have gone. The images change only with the upscale output's size or format, which is fixed for a
+// session (the output resolution is read at start).
+#define PICTURES 3
+static struct {
+    struct { VkImage image; VmaAllocation alloc; VkImageView view; int fresh; } img[PICTURES];
+    uint32_t w, h, next;
+    VkFormat format;
+    int failed;
+} P;
 
 static void memory_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src,
                            VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst) {
@@ -644,6 +660,98 @@ void vk_fsr3fi_note(const VkTemporalIn *t, uint32_t w, uint32_t h) {
     plat_mutex_unlock(&nl);
 }
 
+static void free_pictures(int now) {   // now: device idle; else once the submissions recorded so far are done
+    VkCtx *c = vk_ctx();
+    for (int i = 0; i < PICTURES; i++) {
+        if (now) {
+            if (P.img[i].view) vkDestroyImageView(c->device, P.img[i].view, NULL);
+            if (P.img[i].image) vmaDestroyImage(c->vma, P.img[i].image, P.img[i].alloc);
+        } else {
+            if (P.img[i].view) vk_defer_view(P.img[i].view);
+            if (P.img[i].image) vk_defer_image(P.img[i].image, P.img[i].alloc);
+        }
+        memset(&P.img[i], 0, sizeof P.img[i]);
+    }
+    P.w = P.h = 0, P.format = VK_FORMAT_UNDEFINED;
+}
+
+// With nl held: the ring for pictures of this size and format.
+static int pictures_for(uint32_t w, uint32_t h, VkFormat format) {
+    if (P.w == w && P.h == h && P.format == format) return 1;
+    if (P.failed) return 0;
+    VkCtx *c = vk_ctx();
+    free_pictures(0);
+    for (int i = 0; i < PICTURES; i++) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = format, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vmaCreateImage(c->vma, &ci, &ai, &P.img[i].image, &P.img[i].alloc, NULL) != VK_SUCCESS) {
+            P.img[i].image = VK_NULL_HANDLE;
+            break;
+        }
+        vi.image = P.img[i].image;
+        if (vkCreateImageView(c->device, &vi, NULL, &P.img[i].view) != VK_SUCCESS) {
+            P.img[i].view = VK_NULL_HANDLE;
+            break;
+        }
+        P.img[i].fresh = 1;
+    }
+    if (!P.img[PICTURES - 1].view) {
+        free_pictures(0);
+        P.failed = 1;
+        rt_log("fsr3fi: the copies of the picture before the HUD (%ux%u, format %d) were not made: the HUD is "
+               "interpolated with the scene", w, h, (int)format);
+        return 0;
+    }
+    P.w = w, P.h = h, P.format = format;
+    rt_log("fsr3fi: the upscaled picture is copied before the game's HUD (%ux%u, format %d), so the HUD is not moved "
+           "with the scene", w, h, (int)format);
+    return 1;
+}
+
+void vk_fsr3fi_note_picture(VkCommandBuffer cb, const VkTexImage *out) {
+    if (!out || !out->image || strcmp(cfg_value("TOTK_FRAME_GEN"), "2x") || !vk_fsr3fi_wanted()) return;
+    plat_mutex_lock(&nl);
+    if (noted.valid && pictures_for(out->width, out->height, out->format)) {
+        const uint32_t slot = P.next++ % PICTURES;
+        // the upscaler's writes to the output, and this copy's earlier reads (two frames ago) of the slot
+        VkImageMemoryBarrier2 to_general = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                            .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = P.img[slot].image,
+                                            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkMemoryBarrier2 before = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+                                   .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                               .pMemoryBarriers = &before, .imageMemoryBarrierCount = P.img[slot].fresh ? 1u : 0u,
+                               .pImageMemoryBarriers = &to_general};
+        vkCmdPipelineBarrier2(cb, &di);
+        P.img[slot].fresh = 0;
+        const VkImageCopy region = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                    {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {P.w, P.h, 1}};
+        vkCmdCopyImage(cb, out->image, VK_IMAGE_LAYOUT_GENERAL, P.img[slot].image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        // the copy is read by frame generation's command buffer, later on the same queue, and the game's HUD draws
+        // into the output after it (the caller's full barrier orders those)
+        memory_barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        noted.picture = P.img[slot].view, noted.picture_w = P.w, noted.picture_h = P.h;
+    }
+    plat_mutex_unlock(&nl);
+}
+
 int vk_fsr3fi_take(VkFiInputs *out) {
     plat_mutex_lock(&nl);
     *out = noted;
@@ -653,7 +761,8 @@ int vk_fsr3fi_take(VkFiInputs *out) {
 }
 
 int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView color, VkImageView previous,
-                       VkImageView out, uint32_t width, uint32_t height) {
+                       VkImageView hudless, VkImageView hudless_previous, VkImageView out, uint32_t width,
+                       uint32_t height) {
     if (!vk_fsr3fi_wanted()) return 0;
     if (!in || !in->valid || !in->depth || !in->motion || !color || !previous || !out) return 0;
     if (!width || !height || !in->render_width || !in->render_height) return 0;
@@ -712,9 +821,13 @@ int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView col
     k.reset = reset;
     memcpy(k.device_to_view_depth, in->device_to_view_depth, sizeof k.device_to_view_depth);
     k.delta_time = in->frame_ms;
-    // No picture without the HUD (the SDK's HUDLessColor): the flow and the interpolation work on the picture as it is
-    // shown, and the inpainting pass takes it for its own source.
-    k.hudless_attached_factor = 0;
+    // With the picture before the HUD of both frames (the SDK's HUDLessColor; the idea of finding one for a game that
+    // gives none is OptiScaler's HUDfix, OptiScaler hudfix/Hudfix_Vk.cpp, no code of it used), the flow and the
+    // interpolation work on those, so the HUD is not moved with the scene, and the inpainting pass puts back what
+    // differs between this frame's two pictures (ffx_frameinterpolation_inpainting.h computeInpainting). Without them:
+    // one colour, with whatever the game drew on it.
+    const int has_hudless = hudless && hudless_previous;
+    k.hudless_attached_factor = has_hudless;
     k.distortion_field_size[0] = 1, k.distortion_field_size[1] = 1;
     // GetOpticalFlowSize() in the GLSL reads this back as (1 / scale) / block size, so the scale is the reciprocal of
     // the display size; it is also what turns a flow vector in luma pixels into the UV motion the vector field packs.
@@ -725,7 +838,7 @@ int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView col
     k.optical_flow_half_res_mode = 0;
     k.num_instances = 1;
     k.interpolation_rect_size[0] = uw, k.interpolation_rect_size[1] = uh;
-    k.back_buffer_transfer_function = 0;   // the SDR picture (vk_framegen.c makes no frames from the HDR one)
+    k.back_buffer_transfer_function = 0;   // the SDR picture (vk_framegen.c makes frames from the HDR one too, but its record skips this AMD path for PQ)
     k.min_max_luminance[0] = 0.0f, k.min_max_luminance[1] = 1.0f;
     // fTanHalfFOV is the horizontal half angle's tangent, as ffxFrameInterpolationDispatch builds it from the vertical
     // field of view and the render aspect: 1 / p[0][0] of the scene's projection
@@ -801,7 +914,7 @@ int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView col
     const uint32_t p = G.parity, q = p ^ 1u;
     // col and prev: the interpolation sources of this frame and the one before; shown: the picture as it is presented
     const Res shown = {.view = color}, dst = {.view = out};
-    const Res col = {.view = color}, prev = {.view = previous};
+    const Res col = {.view = has_hudless ? hudless : color}, prev = {.view = has_hudless ? hudless_previous : previous};
     {   // two pixels across and two down a thread, which is where the double rounding comes from
         const Res res[] = {col, level(&G.of_luma[p], 0), CB_OF(0)};
         record_pass(cb, P_OF_PREPARE_LUMA, res, groups(groups((uint32_t)uw, 2), 16), groups(groups((uint32_t)uh, 2), 16), 1);
@@ -908,8 +1021,8 @@ int vk_fsr3fi_generate(VkCommandBuffer cb, const VkFiInputs *in, VkImageView col
                            PYR(10), PYR(11), PYR(12), cb_fi, cb_frame_pyramid};
         record_pass(cb, P_FI_INPAINTING_PYRAMID, res, frame_groups[0], frame_groups[1], 1);
     }
-    {   // The present backbuffer, then the interpolation source: the same image without a HUD-less colour, so there is
-        // nothing to take the HUD from.
+    {   // The present backbuffer, then the interpolation source: with the frames without their HUD the two differ at
+        // the HUD, which is what the pass takes from the backbuffer; without them they are the same image.
         const Res res[] = {tex(&G.of_scd_output), tex(&G.fi_inpainting_pyramid), shown, col, dst, cb_fi};
         record_pass(cb, P_FI_INPAINTING, res, display_x, display_y, 1);
     }
@@ -939,6 +1052,8 @@ void vk_fsr3fi_release(void) {   // device idle
     }
     memset(&G, 0, sizeof G);
     plat_mutex_lock(&nl);
+    if (c && c->device) free_pictures(1);
+    P.failed = 0, P.next = 0;
     noted.valid = 0;   // the device is going: no upscaler's inputs stay
     plat_mutex_unlock(&nl);
 }
