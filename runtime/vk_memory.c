@@ -2192,7 +2192,25 @@ static void kept_cut(PoolRec *r, const MRange *run, int n) {
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
+// The write-watch snapshot of the pool's regions runs before mirror_lock (#317: late in a long session one
+// GetWriteWatch took 0.38 ms, and held under mirror_lock it made the replay thread and six slice workers wait 2.7 s per
+// 60 frames). mepoch only changes on the replay thread between submissions, and the body below re-checks snap_at under
+// gen_lock, so it queries again for any region the early snapshot did not cover. Lock order stays mirror, then gen:
+// gen_lock is taken and dropped here before mirror_lock.
 static void mirror_sync(PoolRec *r) {
+    {
+        uint64_t e0 = r->import_lo >> SNAP_SHIFT, e1 = (r->import_hi - 1) >> SNAP_SHIFT;
+        int need = 0;
+        plat_mutex_lock_shared(&gen_lock);
+        for (uint64_t k = e0; k <= e1; k++)
+            if (snap_at[k] != mepoch) { need = 1; break; }
+        plat_mutex_unlock_shared(&gen_lock);
+        if (need) {
+            plat_mutex_lock(&gen_lock);
+            __atomic_fetch_add(&mrep.sync_queries, snap_regions(e0, e1, mepoch), __ATOMIC_RELAXED);   // outside mirror_lock
+            plat_mutex_unlock(&gen_lock);
+        }
+    }
     int locked = mirror_lock_if_shared();
     if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) == msub) {   // the other thread did it meanwhile
         mirror_unlock(locked);
