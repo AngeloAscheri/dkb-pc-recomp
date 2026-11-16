@@ -240,13 +240,14 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
                                   fw[i].h, fw[i].fmt, fw[i].n);
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
-           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu twin restarts %llu; targets%s",
+           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu twin restarts %llu; compute barriers %llu; targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
            (unsigned long long)f->clears, (unsigned long long)f->copies, (unsigned long long)f->dispatches,
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
-           (unsigned long long)f->fb_layouts, (unsigned long long)f->twin_restarts, list);
+           (unsigned long long)f->fb_layouts, (unsigned long long)f->twin_restarts,
+           (unsigned long long)f->cs_barriers, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
 }
@@ -290,7 +291,7 @@ static void state_reset(VkExec *ex) {
     ex->st_vmask[0] = ex->st_vmask[1] = ex->st_wmask[0] = ex->st_wmask[1] = 0xff;
     ex->depth_range[1] = 1.0f;
     vk_pipe_state_defaults(&ex->pipe);
-    ex->barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
 }
 
 // ---- render targets
@@ -775,6 +776,45 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
+// Consecutive dispatches. The game's compute work comes as runs of small dispatches (one workgroup each, in the
+// destruction of terrain about 170 to 200 in a part of 4 to 5 ms of GPU time), each with a barrier before it, ours or the
+// game's. On an RX 9070 XT (RGP) each full barrier flushed and invalidated the colour, depth, L2 and scalar caches, 10 to
+// 20 us apiece, and the dispatch after it ran from cold caches. When nothing but compute work, and the copies the
+// dispatches' bindings record, came since the last barrier, a barrier among the compute and transfer stages orders the
+// same accesses without touching the colour and depth caches: a later pass, copy or clear still gets its own full
+// barrier (barrier_to), which covers the dispatches too. Eglantine narrows the barrier before a dispatch as well
+// (yuzu-derived RasterizerVulkan::DispatchCompute: graphics, compute and transfer stages to the compute stage,
+// MEMORY_WRITE to MEMORY_READ). TOTK_CS_BARRIER=0: the full barrier every time; ab switches it with the A/B blocks.
+static int cs_barrier_on(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = rt_knob("CS_BARRIER", "1");
+        rt_log("vk: consecutive dispatches are ordered by %s (TOTK_CS_BARRIER=%s)",
+               mode == 2 ? "compute or full barriers in the A/B blocks" : mode ? "compute barriers" : "full barriers",
+               mode == 2 ? "ab" : mode ? "1" : "0");
+    }
+    return RT_KNOB_ON(mode);
+}
+
+void vk_exec_barrier_cs(VkExec *ex) {
+    if (ex->in_pass || ex->nfbl || ex->cs_tail != ex->recorded || !cs_barrier_on()) {
+        barrier_to(ex, NULL, NULL, 0);
+        return;
+    }
+    if (ex->cs_barrier_at == ex->recorded) return;   // one is there already
+    const VkPipelineStageFlags2 stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = stages, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = stages | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,   // an indirect dispatch's arguments
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->cs_barrier_at = ex->cs_tail = ++ex->recorded;
+    FRAME->cs_barriers++;
+}
+
+void vk_exec_note_dispatch(VkExec *ex) { ex->cs_tail = ex->recorded; }
+
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     if (par_slice) { vk_exec_par_hazard(); return; }   // a slice cannot open a pass (parallel passes)
@@ -1113,7 +1153,7 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     split_draws = 0;
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
-    ex->barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
     ex->dirty = VK_EXEC_DIRTY_ALL;
     vk_exec_draw_new_cb(ex);
     n_parts++;
@@ -1363,7 +1403,7 @@ static void par_job(void *arg) {
     par_walk(ex, P.from, p->cut, 1);
     // The command buffer starts as the replay thread's do (record_impl); every image is in GENERAL: the part before
     // ends with a full barrier, the replay thread's (par_join) or a helper's (below).
-    ex->recorded = 0, ex->in_pass = 0, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = -1;
+    ex->recorded = 0, ex->in_pass = 0, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
     ex->nfbl = 0, ex->fbl_mask = 0, ex->fb_dirty = 0, ex->fb_fs = NULL;
     memcpy(&p->S, ex, sizeof p->S);
     p->state_ns = kern_now_ns() - t0;
@@ -1649,7 +1689,7 @@ static const op_hdr *par_join(VkExec *ex, const op_hdr *h) {
         // on the command buffer, no memo of the state, no barrier to rely on. par_check compares at the end.
         vk_spec_cb_drop((int)i);
         PW[i].n = 0;
-        ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = -1;
+        ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
         ex->nfbl = 0, ex->fbl_mask = 0, ex->fb_dirty = 0, ex->fb_fs = NULL;
         vk_exec_draw_rebase(ex);
         P.chk_frame = vk_exec_frame;
@@ -2630,7 +2670,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_RT: set_rt(ex, a); break;
         case OP_CLEAR_COLOR: clear_color(ex, a); break;
         case OP_CLEAR_DS: clear_ds(ex, a); break;
-        case OP_BARRIER: vk_exec_barrier(ex); break;
+        case OP_BARRIER: vk_exec_barrier_cs(ex); break;   // between dispatches, a compute barrier
         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW_IDX && merge_walk(ex, &h)) continue;
@@ -2678,7 +2718,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     ex->dirty = VK_EXEC_DIRTY_ALL;
     ex->rt_resolved = 0;   // images may have changed since the last command buffer
     ex->nviews = 0;
-    ex->barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
     split_draws = part_start = 0;
