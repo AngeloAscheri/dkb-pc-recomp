@@ -408,6 +408,13 @@ area = "os"
 cmd = ["{python}", "tests/aoc_romfs_test.py", "--cc", "{cc}", "--out", "{out}"]
 
 [[test]]
+name = "switch-rumble"
+tier = 0
+area = "os"
+cmd = ["{python}", "tests/switch_rumble_test.py", "--cc", "{cc}", "--out", "{out}"]
+needs = ["cc"]
+
+[[test]]
 name = "mods-scan"
 tier = 1
 area = "os"
