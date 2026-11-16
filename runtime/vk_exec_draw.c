@@ -4414,10 +4414,13 @@ static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info
     const VkTexImage *a = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
     const VkTexImage *b = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
     // The output must be strictly larger: with equal sizes this shape (one B10G11R11 texture in, one written image out,
-    // 256 or more wide) is also any same-size post-process compute pass, so it could not be told from the upscaler.
+    // 256 or more wide) is also any same-size post-process compute pass, so it could not be told from the upscaler. The
+    // one exception is native anti-aliasing (dkb_wide.c dkb_native_aa): the game's upscale step is then made to run at
+    // full size, and that dispatch is known by the guest address that issues it, not by its shape.
+    int same = a && b && b->width == a->width && b->height == a->height && dkb_native_aa_issued_by(d->caller);
     if (!a || !b || a->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || b->format != a->format || a->samples > 1 ||
         b->samples > 1 || a->type != VK_IMAGE_TYPE_2D || b->type != VK_IMAGE_TYPE_2D || a->width < 256 ||
-        a->height < 256 || b->width <= a->width || b->height <= a->height)
+        a->height < 256 || (!same && (b->width <= a->width || b->height <= a->height)))
         return 0;
     double aspect = (double)a->width / a->height - (double)b->width / b->height;
     if (aspect < -0.02 || aspect > 0.02) return 0;
@@ -4427,9 +4430,9 @@ static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info
     while (i < ntold && told[i] != h) i++;
     if (i == ntold && ntold < 4) {
         told[ntold++] = h;
-        rt_log("upscaler: compute shader %016llx is taken for the game's upscaler by its images (%ux%u -> %ux%u, "
+        rt_log("upscaler: compute shader %016llx is taken for the game's upscaler by its images (%ux%u -> %ux%u%s, "
                "issued at %#llx)", (unsigned long long)h, a->width, a->height, b->width, b->height,
-               (unsigned long long)d->caller);
+               same ? ": the same size, native anti-aliasing" : "", (unsigned long long)d->caller);
     }
     return 1;
 }

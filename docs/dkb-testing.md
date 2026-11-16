@@ -226,6 +226,25 @@ display x 2/3 / ratio: `full` drew 1920x1080 at a 2880x1620 render resolution an
 sets that scale to 1.0 (set `render3d`), so the scene is the render resolution divided by the ratio, as on 1.0.0. A ratio
 keeps the upscaler: `scene_res = 1.5` at 3840x2160 draws the scene at 2560x1440 and DLSS outputs 3840x2160
 (`dlss: Quality 2560x1440 -> 3840x2160`), where `auto` outputs 2560x1440.
+
+Native anti-aliasing (update 3.2.0): `scene_res = full` with `upscaler = fsr3`, `fsr4` or `dlss` runs that upscaler at
+100% (input and output the same size), as FSR 3.1, FSR 4 and DLSS in DLAA mode, which anti-alias the 3D scene alone.
+At a full-size 3D the game skips the dispatch of its upscale step (its upscaler level, in the settings at +0x10, is 0
+there and 2 at a scaled 3D), so there was nothing for the upscaler to replace. The patch set `dkbnative`
+(`recomp/patches-dkb458752.txt`) reads the level as 2 at the two loads of the step (main f_7000325a80), so the
+dispatch runs from the 3D to an image of the same size, and `dkb_wide.c` `dkb_native_aa_live` turns the set on while
+one of the three upscalers is chosen and the scene ratio in effect is 1.0. The setting is live: the Upscaler row
+switches it. `game_upscaler` (`vk_exec_draw.c`) keeps its rule that the output is larger than the input, because an
+equal-size dispatch of the same shape is also any post-process pass; only while the set is on does it take an
+equal-size dispatch, and only one issued from the wrapper main f_7000325f30 (the return address 0x7000325fc4 on 3.2.0,
+`dkb_wide.c` `dkb_native_aa_issued_by`). The three upscalers accept equal sizes: `vk_fsr3.c` and `vk_fsr4.c` check only
+that the input is not larger than the output, and `vk_dlss.c` names a scale under 1.1 DLAA. FSR 4 and DLSS are
+Windows only, and FSR 3.1 runs elsewhere. The default upscaler (`fsr`, the game's own) and `bilinear` leave `full` as
+it was, and 1.0.0 has no `dkbnative` set (no addresses for it yet), so `full` stays as before there. A run with it
+has `Bananza resolution: native anti-aliasing on (fsr4 with the 3D at the output size: ...)` in `dkb.log`, then
+`upscaler: compute shader ... is taken for the game's upscaler by its images (WxH -> WxH: the same size, native
+anti-aliasing, issued at 0x7000325fc4)` and the upscaler's own line at equal sizes (`fsr3: ...`, `fsr4: ...`,
+`dlss: DLAA WxH -> WxH, preset K`). The patch set needs the generated code to be made with this `patches-dkb458752.txt`.
 The render-target pool is carved from the game's GSys heap, 518144 KiB (506 MiB) in
 `System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs`. A pool GSys cannot hold crashed the game before it showed
 anything (access violation reading 0xa0 in main+0x128d40 on 3.2.0): at 3840x2160, pools of 474 MiB ran and 514 MiB
