@@ -332,7 +332,8 @@ class Emitter:
             if not entry <= t < end:
                 raise patches.PatchError(f'{a:#x}: guard target {t:#x} outside the function {entry:#x}-{end:#x}')
             # The guard's edge leaves before the instruction runs, but the flow keeps it as an edge of that instruction
-            # (state after it): safe only when the instruction changes no flags, makes no call and does not escape.
+            # (state after it): safe only when the instruction changes no flags, makes no call (except a bl, below) and does
+            # not escape.
             g = insns[(a - entry) // 4]
             # A bl is allowed: the check runs before the call, so the branch skips it with x30 untouched and the
             # registers still in their locals (the call spills them only after the check passes).
@@ -484,7 +485,10 @@ class Emitter:
             for i, line in body:
                 if i is not None:
                     texts[i] += line
+            # A guarded instruction is not clean: its guard edge leaves before it, so the dirty locals must be spilled
+            # along that edge too
             clean = {i for i, ins in enumerate(insns) if entry + 4 * i not in self.patched
+                     and entry + 4 * i not in self.guards
                      and (ins.kind in ('bl', 'blr') or (ins.kind == 'op' and regs.RELOAD in texts[i]))}
             rp = regs.plan(texts, succ, clean, self.reg_locals, self.kept)
             if rp.regs:
