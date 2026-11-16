@@ -3,8 +3,8 @@
 // fab8cb37641714bd839ae83c2a7bc582bedc4d70, GPL-3.0; Auto, the multipliers above 2x, the sets and the display thread from
 // https://git.notrexed.dev/Hookshot/Hookshot @ 7191250b7b0f8a4becd79ee086229a2620872fc7) with its shaders
 // runtime/shaders/fg_*.comp:
-//   1. the crop of the window texture is copied into an RGBA8 history image (the game draws over its texture next frame)
-//      and reduced to quarter-size luma;
+//   1. the crop of the window texture is copied into a history image (RGBA8; A2B10G10R10 for the game's own HDR
+//      picture: the game draws over its texture next frame) and reduced to quarter-size luma;
 //   2. block matching of the luma against the frame before: a vector per 16x16 pixels within +-32 pixels, then a 3x3 median;
 //   3. a frame at each time t between the two blends the last frame moved back and the new one forward along the vectors.
 //
@@ -30,6 +30,16 @@
 // Every frame goes through the whole present chain (colour, FSR, SMAA, HDR, overlay), so the overlay is never
 // interpolated. The game's texture is read only by the command buffer vk_fg_record submits, and the swapchain is touched
 // only through vk_present_image and vk_present_flip (and, from the display thread, under the present lock).
+//
+// The game's own HDR picture (hdr_native = 1, ov_gfx.c hdr_native_on) is Rec. 2020 PQ code values in an A2B10G10R10
+// window texture. Its frames are made in the same way, in A2B10G10R10 history, made-frame and set images, so the
+// picture keeps its 10 bits and vk_present_image shows each frame as the game's own HDR picture. The blend works on the
+// code values, as it does on sRGB's: PQ is, like sRGB, a perceptual coding. The comparisons in the luma and
+// synthesis passes (block matching's cost, what counts as moved or agreeing) take each value to the SDR picture's
+// scale first, the sRGB code of its light over paper white (hdr_game_nits), so their thresholds mean what they do in
+// SDR. The lifted SDR picture (hdr = 1 without hdr_native) needs nothing of this: the window texture is the SDR
+// picture, and the HDR pass runs on every frame shown.
+//
 // Any failure turns the pass off for the session with one log line, and the present goes on as without it.
 #include "vk.h"
 
@@ -49,6 +59,7 @@
 #include "ui/menu.h"   // gfx_window_present_mode
 
 #define HIST_FMT VK_FORMAT_R8G8B8A8_UNORM
+#define HIST_FMT_PQ VK_FORMAT_A2B10G10R10_UNORM_PACK32   // the game's own HDR picture
 #define SETS 3   // one shown, one waiting its place on the line, one being made: the display thread never holds the game back
 
 typedef struct {
@@ -74,6 +85,7 @@ typedef struct {
     int game[FG_MAX_MULT];
     int64_t due[FG_MAX_MULT];
     uint32_t w, h;
+    VkFormat fmt;               // the images' format (HIST_FMT or HIST_FMT_PQ), which vk_present_image shows them as
     uint64_t frame_no;          // the game frame for the thumbnails and the dump (vk_thumbs_frame), 0 none
     int busy;                   // made and not yet all shown (D.mu)
 } Set;
@@ -94,6 +106,8 @@ static struct {
     int said_n;           // the frames a game frame got at the last "asked, made" log line; 0 = none yet
     uint64_t said_at;
     uint32_t w, h;        // the crop size the images were made for; 0 = none
+    VkFormat img_fmt;     // the history and made-frame images' format (HIST_FMT or HIST_FMT_PQ)
+    int pq_ok;            // HIST_FMT_PQ's features: 0 not looked at yet, 1 enough, -1 not
     VkFormat fmt_ok;      // the last window texture format found to have BLIT_SRC
     VkFormat fmt_bad;     // the last one found without it
     int cur;              // the history image the next frame is copied into; the other holds the frame before
@@ -257,10 +271,10 @@ static int init(VkCtx *c) {
         }
     }
     const struct { Pipe *p; const char *name; const uint32_t *code; size_t size; uint32_t samplers, push; } pipes[] = {
-        {&S.luma, "luma", fg_luma_spv, sizeof fg_luma_spv, 1, 0},
+        {&S.luma, "luma", fg_luma_spv, sizeof fg_luma_spv, 1, 8},
         {&S.flow, "flow", fg_flow_spv, sizeof fg_flow_spv, 2, 0},
         {&S.median, "median", fg_median_spv, sizeof fg_median_spv, 1, 0},
-        {&S.synth, "synth", fg_synth_spv, sizeof fg_synth_spv, 3, 4},
+        {&S.synth, "synth", fg_synth_spv, sizeof fg_synth_spv, 3, 12},
     };
     for (size_t i = 0; i < sizeof pipes / sizeof *pipes; i++) {
         VkResult r = make_pipe(c, pipes[i].p, pipes[i].code, pipes[i].size, pipes[i].samplers, pipes[i].push);
@@ -307,11 +321,12 @@ static int fg_mode(void) {
     return 0;
 }
 
-// Images for a w x h crop. frames 0 is the 2x path (one made image); otherwise `frames` images in each of the SETS sets.
-// A new size or count waits for the display thread and the device (the earlier jobs' images may still be read, the sets
-// still shown) and starts the history again.
-static int ensure_images(VkCtx *c, uint32_t w, uint32_t h, int frames, int mode) {
-    if (S.w == w && S.h == h && S.frames == frames) return 1;
+// Images for a w x h crop in format f (HIST_FMT, or HIST_FMT_PQ for the game's own HDR picture). frames 0 is the 2x
+// path (one made image); otherwise `frames` images in each of the SETS sets. A new size, count or format waits for the
+// display thread and the device (the earlier jobs' images may still be read, the sets still shown) and starts the
+// history again.
+static int ensure_images(VkCtx *c, uint32_t w, uint32_t h, int frames, int mode, VkFormat f) {
+    if (S.w == w && S.h == h && S.frames == frames && S.img_fmt == f) return 1;
     if (S.w) {   // the first allocation has nothing to wait for
         display_idle();
         vk_queue_lock();   // vkDeviceWaitIdle needs every queue left alone
@@ -322,14 +337,14 @@ static int ensure_images(VkCtx *c, uint32_t w, uint32_t h, int frames, int mode)
     uint32_t qw = (w + 3) / 4, qh = (h + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     const VkImageUsageFlags work = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     int ok = 1;
-    if (!frames) ok = make_image(c, &S.made, HIST_FMT, w, h, work | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!frames) ok = make_image(c, &S.made, f, w, h, work | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     // a set's frames are written by the synthesis pass or copied from the history, and blitted to the window
     for (int s = 0; s < SETS && ok; s++)
         for (int i = 0; i < frames && ok; i++)
-            ok = make_image(c, &S.sets[s].frame[i], HIST_FMT, w, h,
+            ok = make_image(c, &S.sets[s].frame[i], f, w, h,
                             work | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     for (int i = 0; i < 2 && ok; i++)
-        ok = make_image(c, &S.hist[i], HIST_FMT, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        ok = make_image(c, &S.hist[i], f, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
              make_image(c, &S.luma_img[i], VK_FORMAT_R16_SFLOAT, qw, qh, work) &&
              make_image(c, &S.flow_img[i], VK_FORMAT_R16G16B16A16_SFLOAT, cw, ch, work);
@@ -338,14 +353,16 @@ static int ensure_images(VkCtx *c, uint32_t w, uint32_t h, int frames, int mode)
         snprintf(msg, sizeof msg, "images %ux%u not made", w, h);
         return fail(c, msg);
     }
-    S.w = w, S.h = h, S.frames = frames, S.fresh = 1;
+    S.w = w, S.h = h, S.frames = frames, S.img_fmt = f, S.fresh = 1;
+    const char *hist = f == HIST_FMT_PQ ? "RGB10A2 (the game's own HDR picture, PQ)" : "RGBA8";
     if (mode == 1)
         rt_log("fg: frame generation Auto on (experimental): a frame for each of the display's refreshes (%.0f Hz; up to %d "
-               "a game frame), made at %ux%u, history RGBA8, %d sets", gfx_window_refresh_hz(), frames, w, h, SETS);
+               "a game frame), made at %ux%u, history %s, %d sets", gfx_window_refresh_hz(), frames, w, h, hist, SETS);
     else if (frames)
-        rt_log("fg: frame generation %dx on (experimental): made at %ux%u, history RGBA8, %d sets", mode, w, h, SETS);
+        rt_log("fg: frame generation %dx on (experimental): made at %ux%u, history %s, %d sets", mode, w, h, hist,
+               SETS);
     else
-        rt_log("fg: frame generation 2x on (experimental): made at %ux%u, history RGBA8", w, h);
+        rt_log("fg: frame generation 2x on (experimental): made at %ux%u, history %s", w, h, hist);
     return 1;
 }
 
@@ -395,6 +412,20 @@ static void pass(VkCommandBuffer cb, const Pipe *p, const VkDescriptorImageInfo 
     if (push_bytes) vkCmdPushConstants(cb, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(cb);
+}
+
+// HIST_FMT_PQ's uses here, looked at once: storage (the synthesis pass writes it), sampled with linear filtering, and
+// blits both ways. Vulkan requires none of them of A2B10G10R10 beyond sampling.
+static int pq_format_ok(VkCtx *c) {
+    if (!S.pq_ok) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(c->phys, HIST_FMT_PQ, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                          VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        S.pq_ok = (fp.optimalTilingFeatures & need) == need ? 1 : -1;
+    }
+    return S.pq_ok > 0;
 }
 
 static void log_stats(uint64_t now) {
@@ -476,7 +507,7 @@ static void display_main(void *arg) {
             plat_mutex_unlock(&D.mu);
             if (live) {
                 if (st->game[k] && st->frame_no) vk_thumbs_frame(st->frame_no);   // the thumbnail and the dump name the game's frame
-                vk_present_image_held(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, (int)st->w, (int)st->h, NULL);
+                vk_present_image_held(st->frame[k].img, VK_IMAGE_LAYOUT_GENERAL, st->fmt, (int)st->w, (int)st->h, NULL);
             }
             vk_present_unlock();
             if (shown_at) {
@@ -518,16 +549,20 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     if (cx + cw > w) cw = w - cx;
     if (cy + ch > h) ch = h - cy;
     if (cw <= 0 || ch <= 0) return 0;
-    // Where no frames are made (one log line each): the HDR picture (PQ code values: not for a blend); TotK, whose
-    // back-edge pacing (vk_backend.c present_hold) the paced show replaces; window textures that are not 8-bit UNORM; and
-    // FIFO, where the two acquires and presents of a job would block the present thread and halve the game's rate (the
-    // display thread's presents would block on the display and hold the sets back).
+    // Where no frames are made (one log line each): TotK, whose back-edge pacing (vk_backend.c present_hold) the paced
+    // show replaces; window textures that are neither 8-bit UNORM nor the game's own HDR picture; that picture on a GPU
+    // without HIST_FMT_PQ's features; and FIFO, where the two acquires and presents of a job would block the present
+    // thread and halve the game's rate (the display thread's presents would block on the display and hold the sets
+    // back).
     const char *pmode = gfx_window_present_mode();
+    const int pq = fmt == HIST_FMT_PQ && hdr_native_on();   // the game's own HDR picture: PQ code values, 10 bits
     int skip = 0;
-    if (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && hdr_native_on()) skip = 1, say(SAY_HDR, "fg: native HDR picture: no made frames", 0);
-    else if (rt_game_version != 0) skip = 1, say(SAY_GAME, "fg: not Bananza: no made frames", 0);
-    else if (fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_B8G8R8A8_UNORM)
+    if (rt_game_version != 0) skip = 1, say(SAY_GAME, "fg: not Bananza: no made frames", 0);
+    else if (!pq && fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_B8G8R8A8_UNORM)
         skip = 1, say(SAY_FMT, "fg: window texture format %d is not 8-bit UNORM: no made frames", (int)fmt);
+    else if (pq && !pq_format_ok(c))
+        skip = 1, say(SAY_HDR, "fg: A2B10G10R10 lacks storage, linear filtering or blits here: no made frames from the "
+                               "game's own HDR picture", 0);
     else if (!*pmode) skip = 1;   // no swapchain yet
     else if (strcmp(pmode, "mailbox") && strcmp(pmode, "immediate"))
         skip = 1, say(SAY_MODE, "fg: present mode fifo: no made frames (needs mailbox or immediate)", 0);
@@ -568,8 +603,8 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     const double hz = gfx_window_refresh_hz();
     // the images are made once for the most a game frame may be given: Auto's cap, or the multiplier's frames (2x: one)
     const int frames = mode == 2 ? 0 : mode == 1 ? fg_pace_auto_cap(hz) : mode;
-    if (!ensure_images(c, (uint32_t)cw, (uint32_t)ch, frames, mode)) return 0;
-    int blend = S.have_prev && !hitch;   // ensure_images cleared have_prev on a new size or count
+    if (!ensure_images(c, (uint32_t)cw, (uint32_t)ch, frames, mode, pq ? HIST_FMT_PQ : HIST_FMT)) return 0;
+    int blend = S.have_prev && !hitch;   // ensure_images cleared have_prev on a new size, count or format
     if (!frames && blend && fg_pace_over_refresh(S.interval, hz)) blend = 0, S.over++;   // the display cannot show 2x
     if (!blend && !hitch && !S.fresh && !S.have_prev) S.no_hist++;
     S.real++;
@@ -614,7 +649,7 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
             n = 1, st->game[0] = 1, t[0] = 1.0f, st->due[0] = (int64_t)now + S.interval;
             S.slot_next = (int64_t)now + (int64_t)(1e9 / (hz > 0 ? hz : 60.0));
         }
-        st->n = n, st->w = (uint32_t)cw, st->h = (uint32_t)ch, st->frame_no = frame_no;
+        st->n = n, st->w = (uint32_t)cw, st->h = (uint32_t)ch, st->fmt = S.img_fmt, st->frame_no = frame_no;
         any_made = 0;
         for (int k = 0; k < n; k++) any_made |= !st->game[k];
     }
@@ -647,15 +682,21 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
     vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, S.hist[cur].img, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
     full_barrier(cb);
     const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
+    // the passes' comparisons on the SDR picture's scale (shaders/fg_luma.comp, fg_synth.comp): pq says the frames hold
+    // PQ code values, white the paper white their light is taken over
+    const int32_t pq_push = pq;
+    const float white = pq ? vk_hdr_game_nits() : 0.0f;
+    const struct { int32_t pq; float white; } luma_push = {pq_push, white};
     VkDescriptorImageInfo in[3];
     in[0] = (VkDescriptorImageInfo){S.nearest, S.hist[cur].view, G};
-    pass(cb, &S.luma, in, S.luma_img[cur].view, qw, qh, NULL, 0);
+    pass(cb, &S.luma, in, S.luma_img[cur].view, qw, qh, &luma_push, sizeof luma_push);
     // 2x with frame_gen_by = fsr3: AMD's interpolation makes the frame where the upscaler gave this frame's depth and
     // motion (vk_fsr3fi.c; a size that is not the 3D's shape, a first frame after a gap and a camera cut it refuses).
     // The flow and synthesis passes below then run only for a frame it did not make (the luma above always runs: the
     // built-in flow of a later frame reads it).
     int by_amd = 0;
-    if (!frames && any_made && vk_fsr3fi_wanted()) {
+    // AMD's passes take an SDR picture, so a PQ history (the game's own HDR picture) goes to the built-in interpolation.
+    if (!frames && any_made && !pq && vk_fsr3fi_wanted()) {
         if (fi && fi->valid)
             by_amd = vk_fsr3fi_generate(cb, fi, S.hist[cur].view, S.hist[prev].view, S.made.view, uw, uh);
         else
@@ -674,13 +715,14 @@ static int record(VkImage src, VkFormat fmt, int w, int h, const int crop[4], co
         in[1] = (VkDescriptorImageInfo){S.linear, S.hist[cur].view, G};
         in[2] = (VkDescriptorImageInfo){S.nearest, S.flow_img[1].view, G};
         if (!frames) {
-            const float half = 0.5f;
+            const struct { float t; int32_t pq; float white; } half = {0.5f, pq_push, white};
             pass(cb, &S.synth, in, S.made.view, uw, uh, &half, sizeof half);
             S.made_n++;
         }
         for (int k = 0; k < n; k++)
             if (!st->game[k]) {
-                pass(cb, &S.synth, in, st->frame[k].view, uw, uh, &t[k], sizeof t[k]);
+                const struct { float t; int32_t pq; float white; } sp = {t[k], pq_push, white};
+                pass(cb, &S.synth, in, st->frame[k].view, uw, uh, &sp, sizeof sp);
                 S.made_n++;
             }
     }
@@ -747,13 +789,14 @@ void vk_fg_show(int (*pending)(void), uint64_t frame) {
     plat_mutex_lock(&fgl);
     VkImage made = S.made.img, real = S.hist[S.shown].img;
     int w = (int)S.w, h = (int)S.h;
+    const VkFormat fmt = S.img_fmt;
     int64_t interval = S.interval;
     plat_mutex_unlock(&fgl);
     if (!made || !real) return;   // released meanwhile
-    vk_present_image(made, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, w, h, NULL);
+    vk_present_image(made, VK_IMAGE_LAYOUT_GENERAL, fmt, w, h, NULL);
     uint64_t made_at = kern_now_ns();
     if (frame) vk_thumbs_frame(frame);   // the thumbnail and the dump name the game's frame, not the made one
-    vk_present_blit(real, VK_IMAGE_LAYOUT_GENERAL, HIST_FMT, w, h, NULL);
+    vk_present_blit(real, VK_IMAGE_LAYOUT_GENERAL, fmt, w, h, NULL);
     // the game's frame goes out half an interval after the made one, or at once when a newer job waits: the present
     // thread must not hold it back (vk_backend.c present_hold)
     uint64_t due = (uint64_t)fg_pace_due((int64_t)made_at, interval), now;

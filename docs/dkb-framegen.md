@@ -60,6 +60,7 @@ The depth and motion are the temporal upscaler's: `vk_dlss.c` `vk_temporal_input
 - a temporal upscaler drew this frame's 3D (`upscaler = dlss`, `fsr3` or `fsr4`, with the 3D below the output size, so that a scene was noted at the input size), and the projection is a perspective one;
 - the GPU has push descriptors, storage images without a format and the subgroup arithmetic and quad operations the passes need (the log says what is missing);
 - the history is there: the first frame after a gap, a resize or a camera cut is made by the built-in interpolation, as is any frame the passes refuse (a picture whose shape is not the 3D's).
+- the history is an SDR picture: AMD's passes read 8-bit colour, so with the game's own HDR picture (`hdr_native`, a PQ history) the built-in interpolation makes the frame, which works on the PQ code values (`vk_framegen.c` `record`);
 
 Otherwise the built-in frame is made, with no other change to frame generation. The game's HUD is part of the picture the passes read, so it is interpolated with the scene, as it is by the built-in interpolation; AMD's SDK can take the picture without the HUD as well, which this runtime does not make yet.
 
@@ -71,10 +72,20 @@ Without these, no made frames are produced (one log line says why) and presentat
 
 - Bananza only.
 - Present mode `mailbox` or `immediate` (`TOTK_VK_PRESENT`). With `fifo` the several presents per game frame would block the present thread.
-- Window texture format 8-bit UNORM (RGBA8 or BGRA8) with blit-source support.
-- Not with native HDR output (the picture holds PQ code values, which cannot be blended).
+- Window texture format 8-bit UNORM (RGBA8 or BGRA8) with blit-source support, or the game's own HDR picture (A2B10G10R10 with `hdr_native = 1`; see HDR below) on a GPU that can store to, filter and blit that format.
 
 If set-up fails (missing push descriptors, format support, pipeline or image creation, fence timeout, submit failure), the pass turns itself off for the session.
+
+## HDR
+
+Both HDR modes get made frames, in every mode of `frame_gen` (2x, Auto and 3x to 8x; `vk_framegen.c`, header comment):
+
+- `hdr = 1` alone (the SDR picture lifted to HDR10, `vk_hdr.c`): the window texture is the game's SDR picture, so the frames are made as in SDR, and every frame shown, made or the game's own, goes through the HDR pass.
+- `hdr_native = 1` (the game's own HDR picture, 3.2.0): the window texture holds Rec. 2020 PQ code values in A2B10G10R10. The history, the made-frame image and each set's frame images (Auto and 3x to 8x, including the copy of the game's own frame) are then A2B10G10R10 as well, so the picture keeps its 10 bits, and each frame is shown as the game's own HDR picture (`vk_present.c`, native HDR), by the present thread at 2x and by the display thread at Auto and 3x to 8x, which presents each set with the format the set was made in. The blend works on the PQ code values, which is as sound as blending sRGB's: both are perceptual codings. The comparisons in `fg_luma.comp` and `fg_synth.comp` (block matching's cost, what counts as moved, whether the two moved frames agree) first take each value to the SDR picture's scale, the sRGB code of its light over paper white (`hdr_game_nits`, `vk_hdr_game_nits`), so that their thresholds mean what they do in SDR. The shaders get this through their `pq` and `white` push constants.
+
+Where the GPU cannot use A2B10G10R10 this way (storage image, linear filtering, blit source and destination), no frame is made from the game's own HDR picture and the log says so once.
+
+To see it work, run with `hdr = 1`, `hdr_native = 1` and `frame_gen = 2x`, `auto` or `4x` on an HDR10 display. The log has `hdr: HDR10 swapchain` and then the set-up line (`frame generation 2x on`, `Auto on` or `4x on`, the last two with the number of sets) with `history RGB10A2 (the game's own HDR picture, PQ)` once the game's HDR picture starts (the line says `RGBA8` for an SDR picture, and appears again when the format changes, such as when the game switches between them). The 5 s `fg:` lines then show `made` frames and `shown` near the multiplier times `real` (at Auto and 3x to 8x the `frame interpolation` line shows the frames shown on time), as in SDR; the line `fg: native HDR picture: no made frames` no longer appears.
 
 ## When a made frame is skipped
 
