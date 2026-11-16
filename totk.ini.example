@@ -200,9 +200,9 @@
 # later, so a game at 30 fps is shown at 60. auto gives each refresh of the display between two game frames a frame, up
 # to 4 a game frame (the refresh over 30 fps), shown one game frame later. 3x to 8x make that many frames for each of the
 # game's, and no more than the display can show: a game at 60 fps on a 165 Hz display gets 2 whatever the multiplier. The
-# menu overlay is drawn on every shown frame and is never interpolated. No frame is made after a gap of over 100 ms, when
-# the picture's size changes, for the game's own HDR picture, when the display's refresh is below the rate asked, or
-# unless vk_present is mailbox or immediate. Changes while the game runs take effect at once.
+# menu overlay is drawn on every shown frame and is never interpolated. No frame is made after a gap of over 100 ms,
+# when the picture's size changes, for the game's own HDR picture, when at 2x the display's refresh is below the doubled
+# rate, or unless vk_present is mailbox or immediate. Changes while the game runs take effect at once.
 # frame_gen = off
 # What makes the frames of frame_gen = 2x (experimental): builtin, the default, from the picture alone; fsr3, AMD FSR 3.1's
 # frame interpolation, which also uses the scene's depth and motion. fsr3 runs only while a temporal upscaler (upscaler =
