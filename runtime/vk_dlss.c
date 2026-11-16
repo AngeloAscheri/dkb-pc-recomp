@@ -206,6 +206,9 @@ static int load(void) {
 #undef GET
     if (NGX_FAILED(required(&n_inst_ext, &inst_ext, &n_dev_ext, &dev_ext))) n_inst_ext = n_dev_ext = 0;
     rt_log("dlss: NGX core loaded, it asks for %u instance and %u device extensions", n_inst_ext, n_dev_ext);
+    if (!strcmp(cfg_value("TOTK_SCENE_RES"), "full"))   // dkb_wide.c dkb_scene_ratio: the game then runs no upscale
+        rt_log("dlss: scene_res = full draws the 3D scene at the output size, so the game runs no upscale for DLSS to "
+               "replace; set scene_res = auto for DLSS");
     return 1;
 }
 
@@ -234,7 +237,13 @@ static int init(void) {
     wchar_t *cut = n ? wcsrchr(dir, L'\\') : NULL;
     if (!cut) return fail("the executable's folder is unknown");
     wcscpy(cut + 1, L"nvngx_dlss.dll");
-    if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) return fail("nvngx_dlss.dll is not next to dkb.exe");
+    if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) {   // the path in the line, so a copy elsewhere shows
+        char why[MAX_PATH * 3 + 64];
+        int k = snprintf(why, sizeof why, "nvngx_dlss.dll is not next to dkb.exe (looked for ");
+        WideCharToMultiByte(CP_UTF8, 0, dir, -1, why + k, (int)sizeof why - k - 2, NULL, NULL);
+        strcat(why, ")");
+        return fail(why);
+    }
     *cut = 0;
     // 231313132: the application id of NVIDIA's DLSS samples, for applications without their own. The data path is
     // where NGX looks for nvngx_dlss.dll first and writes its logs.
@@ -501,6 +510,14 @@ void vk_dlss_jitter(VkImage depth, float j[2]) {
 
 void vk_dlss_scene_draw(const VkExec *ex) {
     if (state < 0 && !vk_fsr3_wanted()) return;
+    // DLSS on and the scene drawn, but no upscale of the game's for half a minute: the game draws its 3D scene at the
+    // output size (its dynamic resolution at full on a fast GPU), so DLSS has nothing to replace. One line per run,
+    // where the log would otherwise show only that NGX started.
+    static int idle_logged;
+    if (!idle_logged && vk_dlss_wanted() && frames_now() - J.frame > 1800 && !vk_spec_helper() &&
+        !__atomic_exchange_n(&idle_logged, 1, __ATOMIC_RELAXED) && !strcmp(cfg_value("TOTK_UPSCALER"), "dlss"))
+        rt_log("dlss: the game ran no upscale in the last 1800 frames (it draws its 3D scene at the output size), so "
+               "DLSS has nothing to replace; a larger output_res makes the game upscale again");
     const VkExecTarget *z = &ex->depth;
     const p_bind_buf *b = &ex->ubo[0][0];   // vertex bank c3: the replay keeps the user banks from c3 on
     Scene *s = vk_spec_helper() ? &SH[vk_spec_here - 1] : &S;

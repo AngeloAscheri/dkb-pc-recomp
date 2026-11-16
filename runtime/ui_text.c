@@ -107,7 +107,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SCENE_RES_AUTO] = "Auto (game)", [UI_MENU_SCENE_RES_FULL] = "Full",
     [UI_MENU_UPSCALER] = "Upscaling method",
     [UI_MENU_UPSCALER_DESC] = "This applies when the game image is smaller than the area it fills on your screen or in your window. "
-                              "AMD FSR 1 can keep edges sharper than Bilinear.",
+                              "AMD FSR 1 can keep edges sharper than Bilinear. NVIDIA DLSS (RTX GPU, nvngx_dlss.dll next to dkb.exe) "
+                              "replaces the game's own upscale of its 3D scene and applies at the next start.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_UPSCALER_FSR3] = "AMD FSR 3.1",
     [UI_MENU_ASPECT] = "Display scaling",

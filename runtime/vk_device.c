@@ -376,10 +376,12 @@ static int create_device(void) {
     if (vk_dlss_wanted() && g_vk.props.vendorID == 0x10de) {
         const char *dx[16];
         int nd = vk_dlss_device_exts(dx, 16);
-        for (int i = 0; i < nd && n_ext < 48; i++)
-            if (!listed(ext, n_ext, dx[i]) && has_ext(ep, ne, dx[i]) &&
-                !(c->f12.bufferDeviceAddress && !strcmp(dx[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)))
+        for (int i = 0; i < nd && n_ext < 48; i++) {
+            if (!has_ext(ep, ne, dx[i])) rt_log("dlss: the device lacks %s, which NGX asks for (an older driver?)", dx[i]);
+            else if (!listed(ext, n_ext, dx[i]) &&
+                     !(c->f12.bufferDeviceAddress && !strcmp(dx[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)))
                 ext[n_ext++] = dx[i];
+        }
     }
     free(ep);
     const VkPhysicalDeviceFeatures *h = &c->f2.features;

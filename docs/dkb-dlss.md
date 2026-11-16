@@ -1,6 +1,6 @@
 # DLSS (experimental)
 
-`upscaler = dlss` in `totk.ini` (or `DKB_UPSCALER=dlss`) replaces the game's own upscaler, the compute dispatch that
+`upscaler = dlss` in `dkb.ini` (or `DKB_UPSCALER=dlss`) replaces the game's own upscaler, the compute dispatch that
 scales the rendered frame to the output resolution, with NVIDIA DLSS Super Resolution (`runtime/vk_dlss.c`). FSR still
 scales the output to the window when the window is larger. The setting is read at start.
 
@@ -10,6 +10,20 @@ Needs:
   (`_nvngx.dll`); the runtime finds it through the driver's registry keys.
 - `nvngx_dlss.dll`, the DLSS model, next to `dkb.exe`. DKB Recomp does not ship it. Take it from a game or from
   NVIDIA's DLSS SDK release (310.5 or later for preset M, which `dlss_preset = m` asks for).
+
+## Turning it on
+
+1. Put `nvngx_dlss.dll` next to `dkb.exe` (not in a subfolder; the log line names the path it looked for).
+2. Pick NVIDIA DLSS in the F1 menu's upscaler row, or write `upscaler = dlss` under `[display]` in `dkb.ini`.
+3. Restart the game: NGX adds its Vulkan extensions when the device is made, so DLSS starts only with a run that
+   began with `upscaler = dlss`.
+4. Keep `scene_res = auto`. `full` draws the 3D scene at the output size and the game runs no upscale to replace.
+5. Read `logs/dkb.log` next to `dkb.exe`. A run with DLSS on has `dlss: NGX core loaded`, then
+   `dlss: NGX initialised ...` and, once the game upscales, `dlss: Quality WxH -> WxH, preset K`. Every way it can
+   stop logs one `dlss:` line with the reason; a `cfg: ... upscaler = '...' is not one of ...` line means the value
+   was misspelt. `dlss: the game ran no upscale in the last 1800 frames` means the game draws its 3D scene at the
+   output size, which a fast GPU reaches at the default `output_res`; a larger `output_res` (3840x2160) gives DLSS
+   an upscale to replace.
 
 The model: `dlss_preset` in `dkb.ini` (`DKB_DLSS_PRESET`, `auto|k|m`, applies at the next upscale). `auto`, the
 default, asks for DLSS 4's transformer model (preset K) in every quality mode but Ultra Performance, which has its own

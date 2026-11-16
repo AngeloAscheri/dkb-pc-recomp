@@ -197,6 +197,27 @@ static char *norm_key(char *key) {
     return !strncmp(key, PREFIX, PREFIX_LEN) ? key + PREFIX_LEN : !strncmp(key, "DKB_", 4) ? key + 4 : key;
 }
 
+// A value of a key with named choices ("fsr|bilinear|dlss"): written in another case it becomes the choice in place
+// ("DLSS" -> "dlss", which consumers compare exactly); a word that is none of them gets a log line, since a consumer
+// that compares names falls back without a word (upscaler = dlss with a typo would run FSR and log nothing).
+static void check_choice(const char *key, char *value, int line) {
+    const CfgMeta *m = cfg_meta(key);
+    if (!m || !m->values || strstr(m->values, "..") || !strpbrk(m->values, "abcdefghijklmnopqrstuvwxyz")) return;
+    size_t vl = strlen(value);
+    for (const char *c = m->values; *c;) {
+        size_t n = strcspn(c, "|");
+        if (n == vl && !strncasecmp(c, value, n)) {
+            memcpy(value, c, n);
+            return;
+        }
+        c += n + (c[n] == '|');
+    }
+    char *end;
+    (void)strtod(value, &end);
+    if (end != value && !*end) return;   // a number: some keys take one besides their names (scene_res = 1.5)
+    rt_log("cfg: settings file line %d: %s = '%s' is not one of %s", line, key, value, m->values);
+}
+
 static void add(char *key, char *value, int line) {
     key = norm_key(key);
     size_t vl = strlen(value);
@@ -204,6 +225,7 @@ static void add(char *key, char *value, int line) {
     if (!*key) return;
     if (!is_known(key)) rt_log("cfg: totk.ini line %d: unknown key '%s'", line, key);
     if (!*value) return;   // "key =" leaves the setting at its default
+    check_choice(key, value, line);
     for (int i = 0; i < n_entries; i++)
         if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
             free(entries[i].value);
