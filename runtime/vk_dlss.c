@@ -206,9 +206,9 @@ static int load(void) {
 #undef GET
     if (NGX_FAILED(required(&n_inst_ext, &inst_ext, &n_dev_ext, &dev_ext))) n_inst_ext = n_dev_ext = 0;
     rt_log("dlss: NGX core loaded, it asks for %u instance and %u device extensions", n_inst_ext, n_dev_ext);
-    if (!strcmp(cfg_value("TOTK_SCENE_RES"), "full"))   // dkb_wide.c dkb_scene_ratio: the game then runs no upscale
+    if (!strcmp(cfg_value("TOTK_SCENE_RES"), "full") && !dkb_native_aa())   // dkb_wide.c dkb_scene_ratio: no upscale
         rt_log("dlss: scene_res = full draws the 3D scene at the output size, so the game runs no upscale for DLSS to "
-               "replace; set scene_res = auto for DLSS");
+               "replace (update 3.2.0 makes it run one for native anti-aliasing); set scene_res = auto for DLSS");
     return 1;
 }
 
