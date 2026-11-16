@@ -647,10 +647,12 @@ NVN_API(nvnCommandBufferEndRecording) {
 // NVNboolean nvnCommandBufferIsRecording(const NVNcommandBuffer *cmd)
 NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 
-// The called recording is copied into the caller at the call position: the game recycles command memory in small steps,
-// so a handle may be gone by the time the caller is submitted. Deferred binds stay deferred. A copy is OP_BEGIN, its
-// records and OP_END (take_recording checked them), so the records go over as one block; usage grows by the same
-// bytes as record by record.
+// With TOTK_CALL_REF (the default), a call to a recording without deferred records whose copy nests less than
+// CALL_REF_DEPTH deep becomes one OP_CALL naming that copy, which counts the reference and so outlives the game's
+// release of its control memory. Every other call copies the called recording into the caller at the call position:
+// the game recycles command memory in small steps, so a handle may be gone by the time the caller is submitted.
+// Deferred binds stay deferred. A copy is OP_BEGIN, its records and OP_END (take_recording checked them), so the
+// records go over as one block; usage grows by the same bytes as record by record.
 static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
     if (!handle) rt_fatal("nvn: %s with a null handle", what);
     uint64_t bytes;
