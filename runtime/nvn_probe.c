@@ -785,17 +785,24 @@ static void probe_null_effects(void) {
     CALL(nvnCommandBufferBarrier, U(c), 1);
     uint64_t ha = CALL(nvnCommandBufferEndRecording, U(c));
 
+    // The second recording calls the first, which has no deferred records: with TOTK_CALL_REF one OP_CALL names it, so
+    // the null back end reaches its side effects through the call (gfx_null.c null_replay)
     begin(&cmd2, ctlmem2, 0x38000);
+    CALL(nvnCommandBufferCallCommands, U(&cmd2), 1, U(&ha));
     CALL(nvnCommandBufferUpdateUniformBuffer, U(&cmd2), base + OFF_DST, 64, 0, 8, U(d2));   // after the first copy
     CALL(nvnCommandBufferSignalEvent, U(&cmd2), U(&ev), NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_TOP, 0, 0x99);
     uint64_t hb = CALL(nvnCommandBufferEndRecording, U(&cmd2));
+    int hb_calls = 0;
+    for (const op_hdr *o = nvn_op_first(hb); o->op != OP_END; o = nvn_op_next(o))
+        hb_calls += o->op == OP_CALL && ((const p_jump *)nvn_op_payload(o))->target == ha;
+    CHECK(hb_calls == (nvn_call_ref_on() ? 1 : 0), "a recording without deferred records is called by %d OP_CALL records "
+          "(expected %d)", hb_calls, nvn_call_ref_on());
 
     CHECK(*(uint32_t *)ev_val == 0 && !pmem[OFF_UB + 4] && !pmem[OFF_DST] && pmem[OFF_COUNTER_B] == 0xaa,
           "recording has no side effects");
 
     uint64_t t0 = rt_ticks(), subs = nvn_submit_count(), fence0 = nvn_fence_last();
-    uint64_t hs[2] = {ha, hb};
-    CALL(nvnQueueSubmitCommands, U(&queue), 2, U(hs));
+    CALL(nvnQueueSubmitCommands, U(&queue), 1, U(&hb));
     uint64_t t1 = rt_ticks();
     CALL(nvnQueueFenceSync, U(&queue), U(&syncs), NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
     uint64_t wait = CALL(nvnSyncWait, U(&syncs), 1000000000ull);
@@ -804,11 +811,11 @@ static void probe_null_effects(void) {
     CHECK(nvn_submit_count() == subs + 1 && nvn_fence_last() == fence0 + 1 && gfx_backend()->fence_done() == nvn_fence_last(),
           "one submit advances the fence once (%llu -> %llu)", (unsigned long long)fence0, (unsigned long long)nvn_fence_last());
 
-    // event: WRITE 0x11, ADD 5, then handle 2's WRITE 0x99
+    // event: WRITE 0x11, ADD 5 in the called recording, then the caller's WRITE 0x99
     CHECK((uint32_t)CALL(nvnEventGetValue, U(&ev)) == 0x99, "event value %#x after the stream, expected 0x99", *(uint32_t *)ev_val);
     // uniform update lands at buffer + offset, nothing around it moves
     CHECK(!memcmp(pmem + OFF_UB + 4, d1, 16) && !pmem[OFF_UB + 3] && !pmem[OFF_UB + 20], "uniform update");
-    // buffer copy in stream order: handle 1's copy, then handle 2's update over its first 8 bytes
+    // buffer copy in stream order: the called recording's copy, then the caller's update over its first 8 bytes
     CHECK(!memcmp(pmem + OFF_DST, d2, 8) && !memcmp(pmem + OFF_DST + 8, d1 + 8, 8) && !pmem[OFF_DST + 16],
           "buffer copy and later update in stream order");
     // counters: NVNcounterData {counter, timestamp}; the null GPU reports 0 and a timestamp in 19.2 MHz ticks

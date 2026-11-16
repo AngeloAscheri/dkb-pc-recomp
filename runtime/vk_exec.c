@@ -2533,7 +2533,8 @@ static void par_hazards(int hazard, uint64_t sig) {
 // walk's counts of its draws; *hp then is the op after it. Only in a pass par_start has looked at, so that no draw of
 // the run would have started a sliced pass, and without helper parts or their comparison, whose ranges are counted
 // in draws (par_watch). The ops looked at are those the run can hold: indexed draws and uniform block binds, up to the
-// first draw whose arguments differ from the first one's, which ends any run. Without that bound, a stretch of
+// first draw whose arguments differ from the first one's, which ends any run. A run also ends at an OP_CALL record and at the end of a
+// called recording (TOTK_CALL_REF), so identical draws in two called recordings are not merged into one run. Without that bound, a stretch of
 // different draws with only uniform binds between them would be gathered again from each of its draws.
 #define MERGE_OPS 2048
 static int merge_walk(VkExec *ex, const op_hdr **hp) {
