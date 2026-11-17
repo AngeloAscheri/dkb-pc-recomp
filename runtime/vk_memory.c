@@ -1682,9 +1682,6 @@ static int mirror_own = 1;             // TOTK_MIRROR_OWN: mirror_sync skips the
 static PoolRec **mlist;                // pool_lock: mirrored pools by import_lo
 static int nm, mcap;
 static uint32_t msub;                  // replay: number of the submission being recorded
-// What vk_mem_gpu_wrote and vk_mem_gpu_kept remember as already added is keyed by this: it moves with each submission
-// and with each early write-back (vk_mem_mirror_wb_early), after which a range written again must be added again.
-static uint32_t wb_epoch;
 // The write-back tag of this thread's GPU writes (vk_mem_wb_tag): the place in the walk of the part that records them, so
 // a held part can write back the ranges its own commands and the parts before it wrote (vk_mem_mirror_wb_held).
 static _Thread_local uint32_t wb_tag;
@@ -1729,7 +1726,7 @@ typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
     uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes, own_bytes;
     uint64_t sync_bytes, presnap_pools, presnap_used, presnap_unused_bytes;
-    uint64_t early_n, early_bytes;   // vk_mem_mirror_wb_early: write-backs made before the submission's end, their bytes
+    uint64_t early_n, early_bytes;   // the held parts' write-backs (wb_job_run): command buffers submitted, their bytes
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -1797,7 +1794,7 @@ static void wb_range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off,
 // the lock in vk_mem_gpu_wrote.
 // The kept GPU writes of the submission (vk_mem_gpu_kept), as whole pages, go into a second list of each thread's
 // (k), which vk_mem_mirror_end merges into the pools' kept lists (kept_take).
-// lock: the owner adds to a and the walk takes a held part's ranges out of it (vk_mem_mirror_wb_held) while the owner
+// lock: the owner adds to a and the write-back thread takes a held part's ranges out of it (wb_job_run) while the owner
 // records slices of a later pass; uncontended otherwise.
 typedef struct WbLocal { MRange *a; int n, cap; MRange *k; int nk, ck; struct WbLocal *next; PlatMutex lock; } WbLocal;
 static WbLocal *wb_locals;   // every thread's, added under mirror_lock and kept until exit
@@ -2400,14 +2397,17 @@ int vk_mem_mirror_probe(uint64_t addr) {
 // A range already added in this submission adds nothing (copy_ranges merges overlaps): each thread remembers the
 // ranges it added, so the same storage buffer bound by draw after draw takes mirror_lock once. A profile on eight
 // threads had 6% of the parallel slices' recording waiting for the lock here, and the busy area adds about 7,600
-// write-back ranges a frame that vk_mem_mirror_end sorts.
+// write-back ranges a frame that vk_mem_mirror_end sorts. The ranges are remembered with their write-back tag
+// (vk_mem_wb_tag): a held part's write-back (vk_mem_mirror_wb_held) takes ranges out of the lists in the middle of the
+// submission, and a range the GPU writes again after that carries a higher tag (vk_exec.c wb_tag_walk only grows), so
+// it is added again and copied again later.
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
     vk_spec_event();   // a bind the GPU writes through: never the helper thread's
     PoolRec *r = sp->pool;
     if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return;
     static _Thread_local struct { const PoolRec *r; uint64_t off, size; uint32_t sub, tag; } seen[128];
     __typeof__(seen[0]) *k = &seen[((uintptr_t)r >> 6 ^ sp->offset >> 4) & 127];
-    uint32_t sub = __atomic_load_n(&wb_epoch, __ATOMIC_RELAXED);
+    uint32_t sub = __atomic_load_n(&msub, __ATOMIC_RELAXED);
     if (k->r == r && k->sub == sub && k->tag == wb_tag && k->off == sp->offset && k->size >= size) return;
     if (count_quiet) wb_local_add(r, sp->offset, size);
     else {
@@ -2439,7 +2439,7 @@ int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
     // As in vk_mem_gpu_wrote, a range this thread already kept in this submission is in the list.
     static _Thread_local struct { const PoolRec *r; uint64_t off, size; uint32_t sub, tag; } seen[128];
     __typeof__(seen[0]) *k = &seen[((uintptr_t)r >> 6 ^ sp->offset >> 4) & 127];
-    uint32_t sub = __atomic_load_n(&wb_epoch, __ATOMIC_RELAXED);
+    uint32_t sub = __atomic_load_n(&msub, __ATOMIC_RELAXED);
     if (k->r == r && k->sub == sub && k->tag == wb_tag && k->off == sp->offset && k->size >= size) return 1;
     if (a < pa) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = sp->offset}, pa - a);
     if (pb < b) vk_mem_gpu_wrote(&(VkMemSpan){.pool = r, .buffer = sp->buffer, .offset = pb - r->import_lo}, b - pb);
@@ -2579,7 +2579,6 @@ void vk_mem_mirror_begin(void) {
     uint64_t t0 = qpc();
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
-    __atomic_store_n(&wb_epoch, wb_epoch + 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
@@ -2748,31 +2747,9 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
     return j->n + 2;
 }
 
-// The write-backs of a[0, n) into cb, between full barriers; the command count.
-static int wb_record(VkCommandBuffer cb, uint64_t fence, MRange *a, int n) {
-    VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_COPY_BIT;
-    VkAccessFlags2 reads = VK_ACCESS_2_TRANSFER_READ_BIT, writes = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    if (mirror_sparse) {
-        stage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        reads |= VK_ACCESS_2_SHADER_READ_BIT;
-        writes |= VK_ACCESS_2_SHADER_WRITE_BIT;
-    }
-    mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, stage, reads);
-    for (int i = 0; i < n; i++) a[i].r->wb_sub = msub;
-    mrep.wb_ranges += (uint64_t)n;
-    int rec = copy_ranges(cb, a, n, 0, &mrep.wb_bytes, &mrep.wb_copies, fence) + 2;
-    mbarrier(cb, stage, writes,
-             VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-             VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
-    return rec;
-}
-
-// TOTK_WB_EARLY (on by default; "ab" for an in-run A/B; a number above 1 sets the least KiB, default 256): the
-// write-backs of the GPU writes noted so far are recorded into the part being replayed when the walk is between passes
-// and no slice is being recorded (vk_exec.c wb_early), instead of all of them at the end of the submission, after its
-// last full barrier. Every command that wrote those ranges is earlier in queue order than the part (a held part is
-// submitted ahead of the part the walk records), so the copies read what the GPU wrote; a range the GPU writes again
-// later in the submission is noted again (wb_epoch) and copied again at its end.
+// TOTK_WB_EARLY (on by default; "ab" for an in-run A/B; a number above 1 sets the least KiB, default 256): the least
+// KiB of noted GPU writes worth a held part's write-back (vk_mem_mirror_wb_held), 0 when off. What no held part's
+// write-back takes goes back at the end of the submission, after its last full barrier, as before.
 int vk_mem_wb_early_min(void) {
     static int mode = -1, min_kib = 256;
     if (mode < 0) {
@@ -2781,20 +2758,6 @@ int vk_mem_wb_early_min(void) {
         if (e && atoi(e) > 1) min_kib = atoi(e), mode = 1;
     }
     return RT_KNOB_ON(mode) ? min_kib : 0;
-}
-
-int vk_mem_mirror_wb_early(VkCommandBuffer cb, uint64_t fence, uint64_t min_bytes) {
-    if (!vk_mirror_on) return 0;
-    if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take();
-    uint64_t bytes = 0;
-    for (int i = 0; i < nwbl && bytes < min_bytes; i++) bytes += wbl[i].size;
-    if (!nwbl || bytes < min_bytes) return 0;
-    uint64_t b0 = mrep.wb_bytes;
-    int rec = wb_record(cb, fence, wbl, nwbl);
-    nwbl = 0;
-    __atomic_store_n(&wb_epoch, wb_epoch + 1, __ATOMIC_RELAXED);
-    mrep.early_n++, mrep.early_bytes += mrep.wb_bytes - b0;
-    return rec;
 }
 
 // Moves the ranges tagged upto or lower from a[0, *n) to the end of out (keeping the others in order); their bytes.
@@ -2937,8 +2900,6 @@ static void wb_shutdown(VkCtx *c) {   // vk_mem_shutdown, the device idle: the p
     plat_mutex_unlock(&WB.lock);
 }
 
-int vk_mem_wb_jobs_pending(void) { return WB.t && __atomic_load_n(&WB.n, __ATOMIC_ACQUIRE) != 0; }
-
 void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes) {
     if (!vk_mirror_on) return;
     // Enough to be worth a command buffer? The walk's own list here, the slice threads' under their locks.
@@ -2977,7 +2938,23 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         plat_mutex_unlock(&WB.lock);
     }
     if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take(), kept_take();
-    if (nwbl) rec += wb_record(cb, fence, wbl, nwbl), nwbl = 0;
+    if (nwbl) {
+        VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+        VkAccessFlags2 reads = VK_ACCESS_2_TRANSFER_READ_BIT, writes = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        if (mirror_sparse) {
+            stage |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            reads |= VK_ACCESS_2_SHADER_READ_BIT;
+            writes |= VK_ACCESS_2_SHADER_WRITE_BIT;
+        }
+        mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, stage, reads);
+        for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub;
+        mrep.wb_ranges += (uint64_t)nwbl;
+        rec += copy_ranges(cb, wbl, nwbl, 0, &mrep.wb_bytes, &mrep.wb_copies, fence) + 2;
+        mbarrier(cb, stage, writes,
+                 VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        nwbl = 0;
+    }
     if (mirror_verify) rec += verify_record(cb, fence);
     plat_mutex_lock(&mirror_stat_lock);
     uint64_t *d = (uint64_t *)&macc, *s = (uint64_t *)&mrep;
@@ -3022,7 +2999,7 @@ static void mirror_log(uint64_t frame) {
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, own GPU writes not copied in %.3f MiB, write-back %.3f MiB in %.1f ranges "
-           "(before the end %.2f times, %.3f MiB), flush calls %.1f (%.3f MiB), queries %.1f pre-snap (%.1f MiB) + %.1f sync, "
+           "(before the end: %.2f command buffers, %.3f MiB), flush calls %.1f (%.3f MiB), queries %.1f pre-snap (%.1f MiB) + %.1f sync, "
            "prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f), sync snaps %.1f MiB, pre-snapped pools %.1f "
            "(used %.1f, unused %.1f MiB)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],

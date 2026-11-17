@@ -70,7 +70,8 @@ static int par_defer_mode = -1;
 static struct { int s0, s1; uint64_t sig; uint32_t cap_lo, cap_hi, tag; } PDQ[PAR_DEFER_DEPTH];
 // The write-back tag of the walk's GPU writes (vk_mem_wb_tag): it moves past each held pass end, and once the part is
 // submitted, what is tagged up to the pass's own goes back (par_settle_front, TOTK_WB_EARLY). A slice tags its writes
-// with its pass's. It only grows: a submission's end takes every range, whatever its tag.
+// with its pass's. It only grows, so a range the GPU writes again after its write-back carries a higher tag and is
+// noted again (vk_memory.c vk_mem_gpu_wrote); a submission's end takes every range, whatever its tag.
 static uint32_t wb_tag_walk;
 static int pd_head, pd_n;
 static volatile uint8_t pdone[1024];   // PAR_MAX_SLICES: each slice of the batch is recorded
@@ -1117,20 +1118,6 @@ static int par_no_split;   // TOTK_REPLAY_PAR=check: the draws being compared st
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
 
-// Between passes with no slice being recorded (nothing held, no collection): the GPU writes noted so far go back to
-// guest memory from this part (vk_memory.c vk_mem_mirror_wb_early, TOTK_WB_EARLY), not after the submission's last
-// barrier. The part goes to the queue at the next split, while the GPU otherwise waits for the walk.
-static void wb_early(VkExec *ex) {
-    int min = vk_mem_wb_early_min();
-    if (!min || ex != &X || !x_here || ex->in_pass || pd_n || PC.on || par_no_split || !ex->cb || vk_mem_wb_jobs_pending())
-        return;
-    int rec = vk_mem_mirror_wb_early(ex->cb, ex->fence, (uint64_t)min << 10);
-    if (!rec) return;
-    ex->recorded += rec;
-    ex->dirty = VK_EXEC_DIRTY_ALL;   // the sparse write-back binds a compute pipeline and pushes its descriptors
-    vk_exec_draw_new_cb(ex);
-}
-
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
         split_n = cfg_int("TOTK_SPLIT_DRAWS");
@@ -2024,7 +2011,6 @@ static int par_start(VkExec *ex) {
         par_restart = 0;
         par_restarts++;
     }
-    if (!pd_n) wb_early(ex);
     VkQueryControlFlags qf = 0;
     int qopen = 0, q = vk_exec_oq_begin_outside(ex, &qf, &qopen);
     if (q < 0) return pass_why = PAR_WHY_QUERY, pass_tried = 1, par_skipped_oq++, 0;
@@ -2754,7 +2740,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         if ((h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) && ex->in_pass) pass_draws++;
         // A held part goes to the queue as soon as its slices are recorded, not only at the next sliced pass or split:
         // the GPU waits for it meanwhile.
-        if (pd_n && par_settle_ready(ex)) wb_early(ex);
+        if (pd_n) par_settle_ready(ex);
         if (split_draws >= split_n) maybe_split(ex);
         h = nvn_op_next(h);
     }

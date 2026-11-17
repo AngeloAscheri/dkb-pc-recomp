@@ -364,16 +364,13 @@ uint64_t vk_usnap_gen(void);                      // changes whenever a binding 
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
-// TOTK_WB_EARLY: the least KiB of noted GPU writes worth an early write-back (0: off), and that write-back: the ranges
-// noted so far go back into cb now when they hold min_bytes or more (no slice may be recording). The command count.
+// TOTK_WB_EARLY: the least KiB of noted GPU writes worth a held part's write-back (vk_mem_mirror_wb_held; 0: off).
 int vk_mem_wb_early_min(void);
-int vk_mem_mirror_wb_early(VkCommandBuffer cb, uint64_t fence, uint64_t min_bytes);
 // The write-back tag of the calling thread's GPU writes from now on (vk_exec.c: the walk's place among held pass ends);
 // returns the previous one. vk_mem_mirror_wb_held: once a held part is submitted, the writes tagged upto or lower go
 // back from a command buffer of a write-back thread's, submitted after it.
 uint32_t vk_mem_wb_tag(uint32_t tag);
 void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes);
-int vk_mem_wb_jobs_pending(void);   // held write-backs queued that are not submitted yet
 int vk_mem_mirror_pending(void);
 void vk_mem_mirror_prologue(VkCommandBuffer cb);
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
