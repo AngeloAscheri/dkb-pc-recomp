@@ -1007,6 +1007,26 @@ static uint64_t ww_query(uint64_t addr, uint64_t size) {
     return n;
 }
 
+static void stamp_page(uint64_t a, uint32_t g);
+
+// gen_lock held exclusively. Stamps every page of [lo, hi) the CPU wrote with g, in as many queries as gen_pages needs;
+// 0 when the range is not write-watched. A full answer resets only the pages it holds, and the platforms report pages
+// in address order (gfx_abi_probe.c check_write_watch), so the next query starts after the last page reported. Each
+// query used to start at lo again: a range with many written pages cost one scan of all of it per 1024 pages, and the
+// mirror snapshot at the first use of the 450 MiB terrain arena of a layer (115,000 written pages, 113 queries) took
+// 14 to 21 ms of the replay (#397); resumed, it takes 3 to 8 ms.
+static int ww_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+    const uint64_t max = sizeof gen_pages / sizeof *gen_pages;
+    for (uint64_t a = lo; a < hi;) {
+        uint64_t n = ww_query(a, hi - a);
+        if (n == UINT64_MAX) return 0;
+        for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
+        if (n < max) break;
+        a = (gen_pages[n - 1] & ~0xfffull) + (1ull << GEN_PAGE_SHIFT);
+    }
+    return 1;
+}
+
 // Frozen regions: a 2 MiB region whose pages nothing wrote for freeze_idle submissions is made read-only
 // (memory.c mem_freeze), and write-watch queries skip it until a write or a file read thaws it. Most of the pool memory
 // the mirror and the texture checks cover is static (meshes, textures), and a query costs about 1 us per MiB (4-5 on an
@@ -1063,12 +1083,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     uint32_t g = ++gen_now;
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
-    while (!frozen) {
-        uint64_t n = ww_query(lo, hi - lo);
-        if (n == UINT64_MAX) { tracked = 0; break; }
-        for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
-        if (n < sizeof gen_pages / sizeof *gen_pages) break;   // a full answer may have left pages for the next call
-    }
+    if (!frozen) tracked = ww_stamp(lo, hi, g);
     int changed = 0;
     for (uint64_t a = lo; tracked && a < hi && !changed; a += 1ull << GEN_PAGE_SHIFT) {
         uint32_t *s = gen_slot(a, 0);
@@ -1105,14 +1120,8 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         uint64_t k = r;   // one query over a run of regions not seen in this epoch
         while (k + 1 <= r1 && snap_at[k + 1] != epoch && !mem_frozen((k + 1) << SNAP_SHIFT)) k++;
         uint64_t a = r << SNAP_SHIFT, b = (k + 1) << SNAP_SHIFT;
-        int tracked = 1;
         if (!g) g = ++gen_now;
-        for (;;) {
-            uint64_t n = ww_query(a, b - a);
-            if (n == UINT64_MAX) { tracked = 0; break; }
-            for (uint64_t j = 0; j < n; j++) stamp_page(gen_pages[j], g);
-            if (n < sizeof gen_pages / sizeof *gen_pages) break;
-        }
+        int tracked = ww_stamp(a, b, g);
         calls++;
         for (uint64_t j = r; j <= k; j++) {
             snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!tracked;
@@ -1217,16 +1226,6 @@ void vk_mem_bound_note(void *pool) {   // TOTK_TRACE=perf; parallel slices call 
 
 static uint64_t page_lo(const PoolRec *r) { return r->lo & ~0xfffull; }
 static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~0xfffull; }
-
-// gen_lock held exclusively. 0: the range is not write-watched.
-static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
-    for (;;) {
-        uint64_t n = ww_query(lo, hi - lo);
-        if (n == UINT64_MAX) return 0;
-        for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
-        if (n < sizeof gen_pages / sizeof *gen_pages) return 1;
-    }
-}
 
 // ---------------------------------------------------------------- shadow storage
 // Where importing guest memory costs too much (Linux: re-protecting pages that amdgpu imported as a userptr
@@ -1357,7 +1356,7 @@ static void shadow_sync_pool(PoolRec *r) {
         if (mem_frozen(a)) { a = b; continue; }
         while (b < hi && !mem_frozen(b)) b = b + (1ull << REG_SHIFT) < hi ? b + (1ull << REG_SHIFT) : hi;
         s_queries++;
-        if (!query_stamp(a, b, g)) tracked = 0;
+        if (!ww_stamp(a, b, g)) tracked = 0;
         a = b;
     }
     uint32_t since = r->sgen;
@@ -1593,10 +1592,10 @@ void vk_mem_dirty_submit(void) {
         for (; j < n && page_lo(dlist[j]) <= hi + DIRTY_GAP; j++)
             if (page_hi(dlist[j]) > hi) hi = page_hi(dlist[j]);
         queries++;
-        int ok = query_stamp(lo, hi, g);
+        int ok = ww_stamp(lo, hi, g);
         for (int k = i; k < j; k++) {
             dlist[k]->untracked = 0;
-            if (!ok) queries++, dlist[k]->untracked = (uint8_t)!query_stamp(page_lo(dlist[k]), page_hi(dlist[k]), g);
+            if (!ok) queries++, dlist[k]->untracked = (uint8_t)!ww_stamp(page_lo(dlist[k]), page_hi(dlist[k]), g);
         }
         i = j;
     }
@@ -2582,7 +2581,7 @@ static void freeze_pass(void) {
         if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
         done++;
         if (!mem_freeze(a)) { n_frz_refused++; continue; }
-        query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
+        ww_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
     }
 }
 
