@@ -23,6 +23,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "astc_opaque.h"
 #include "nvn_tex.h"
 #include "sampler_book.h"
 #include "tex.h"
@@ -43,6 +44,9 @@ typedef struct Tex {
     tex_t t;                      // the newest texture object seen with this key
     TexVkFormat f;
     VmaAllocation alloc;          // own memory; NULL when bound into pool memory
+    VkImageCreateFlags cflags;    // the flags and usage the image was created with (astc_reformat makes it again)
+    VkImageUsageFlags cusage;
+    uint8_t bc_settled;           // an ASTC image kept as BC3: 1 once it is to stay BC3 for good (astc_opaque.h)
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
     uint32_t checked;             // submit_epoch of the last check from a draw binding
@@ -515,6 +519,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->key = *k;
     e->t = *t;
     e->f = f;
+    e->cflags = ci.flags, e->cusage = ci.usage;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
     if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
@@ -754,6 +759,43 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }
 
+// An ASTC image kept as BC3 (f.astc_bc 1) made again as BC1 (to_bc1) or the other way (vk_astc_bc1.c
+// vk_astc_bc_remake): the old image and the replay's views of it go once the GPU is done with them, as in destroy_tex,
+// and the generation bump makes the texture-descriptor memos (vk_exec_draw.c tex_info_lookup) look the texture up again
+// instead of handing out a view of the old image. The new image holds nothing: the caller uploads every level and
+// layer into it. cb is the open upload batch, which takes the image's first transition. 0, nothing changed, when the
+// image cannot be made again (pool memory, no memory).
+static int astc_reformat(Tex *e, int to_bc1, VkCommandBuffer cb) {
+    if (!e->f.astc_bc || e->bound_to || !e->alloc) return 0;
+    VkImage img;
+    VmaAllocation alloc;
+    VkFormat f;
+    if (!vk_astc_bc_remake(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, to_bc1, &img, &alloc, &f)) return 0;
+    vk_exec_image_gone(e->pub.image);
+    vk_defer_image(e->pub.image, e->alloc);
+    e->pub.image = img, e->alloc = alloc, e->pub.format = f, e->f.vk = f, e->f.astc_bc = to_bc1 ? 2 : 1;
+    init_image(e, cb);
+    tex_gen_bump(e->key.addr);
+    vk_spec_world_changed();
+    return 1;
+}
+
+static void upload(Tex *e);
+
+void vk_texture_astc_bc3(const VkTexImage *img) {
+    if (!img) return;
+    lock();
+    Tex *e = (Tex *)img;   // pub is the first member
+    if (e->f.astc_bc == 2) {
+        VkCommandBuffer cb = vk_upload_begin();
+        int ok = astc_reformat(e, 0, cb);
+        vk_upload_end();
+        if (ok) e->bc_settled = 1;   // BC3 for good; when it could not be made again it stays BC1 and is asked again
+        if (ok && e->pub.mirrored && !e->pub.gpu_owned) upload(e);
+    }
+    unlock();
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded;
@@ -772,6 +814,11 @@ static void upload(Tex *e) {
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
     VkDeviceSize total = 0, decoded = 0;
+    // BC1 or BC3 for an ASTC image (astc_opaque.h): the blocks' kinds are counted from the deswizzled blocks in memory
+    // of our own, not read back out of the staging buffer (write-combined memory). Only a mirrored image in memory of
+    // its own, and not once it is to stay BC3.
+    int kinds = agpu && e->f.astc_bc && e->pub.mirrored && !e->bc_settled && vk_astc_bc1() && !e->bound_to && e->alloc;
+    AstcOpaqueScan sc = {0};
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
@@ -792,13 +839,17 @@ static void upload(Tex *e) {
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
-            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
+            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb || kinds ? malloc(raw) : NULL;
             if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
             }
             if (agpu) {
+                if (kinds && tmp) {   // (the count stops at the first block that may carry alpha)
+                    if (!sc.alpha) astc_opaque_scan(&sc, tmp, raw, 1);
+                    memcpy(dst, tmp, raw);
+                }
                 ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
             } else if (astc) {
                 uint64_t a0 = perf_begin();
@@ -815,6 +866,11 @@ static void upload(Tex *e) {
             }
             free(tmp);
         }
+    if (kinds) {   // a remade image is uploaded whole below, every level and layer
+        int was = e->f.astc_bc, choice = astc_bc_choice(was, &sc), remade = 0;
+        if (choice != ASTC_BC_KEEP) remade = astc_reformat(e, choice == ASTC_BC_TO_BC1, cb);
+        if (astc_bc_settled(was, choice, remade, &sc)) e->bc_settled = 1;
+    }
     uint8_t *raw_copy = acheck ? malloc(total) : NULL;
     if (raw_copy) memcpy(raw_copy, stg, total);
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -986,7 +1042,7 @@ static int make_fresh_snap(Tex *e) {
 // Bytes per block and block size of the image's VkFormat (ASTC decodes to RGBA8, RGB expands to RGBA); 0 when the
 // VkFormat substitutes another one of unknown size.
 static int img_block(const Tex *e, int *bw, int *bh) {
-    if (e->f.astc_bc) { *bw = *bh = 4; return 16; }
+    if (e->f.astc_bc) { *bw = *bh = 4; return e->f.astc_bc == 2 ? 8 : 16; }
     if (e->f.astc_bw) { *bw = *bh = 1; return 4; }
     int b = nvn_fmt_bpb(e->t.d.format, bw, bh);
     if (e->f.expand_rgb) { *bw = *bh = 1; return b / 3 * 4; }
@@ -1562,6 +1618,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
     VkImageAspectFlags aspect;
+    if (write && e->f.astc_bc == 2) vk_texture_astc_bc3(&e->pub);   // texels that may carry alpha: not into a BC1 image
     if (e->f.astc_bw && !write) {
         log_limited(&n_astc, "ReadTexels of ASTC texture %#llx: the image holds decoded RGBA8; zeros returned",
                     (unsigned long long)e->pub.addr);

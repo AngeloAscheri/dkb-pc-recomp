@@ -455,6 +455,8 @@ int vk_astc_mode(void);                 // decided once per device (logged); VK_
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
 int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (TOTK_ASTC_BC=1)
+// 1: with vk_astc_bc, an image whose blocks are all opaque may be BC1 (vk_astc_record bc 2; TOTK_ASTC_BC1=0: off)
+int vk_astc_bc1(void);
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
 // after the other), w x h texels and slices deep, written at offset of level / layer.
 typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
@@ -508,6 +510,11 @@ typedef struct {
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin).
                                    // Read and set through vk_tex_fb_learned and vk_tex_fb_learn
 } VkTexImage;
+// vk_astc_bc1.c: the image of an ASTC texture kept as BC3 made again as BC1 (to_bc1) or back, with img's extent,
+// levels, layers, flags and usage, in new memory. 1 with *out, *out_alloc and *out_format set; the caller retires the
+// old image.
+int vk_astc_bc_remake(const VkTexImage *img, VkImageCreateFlags flags, VkImageUsageFlags usage, int srgb, int to_bc1,
+                      VkImage *out, VmaAllocation *out_alloc, VkFormat *out_format);
 // fb_learned is set by the replay thread (vk_exec_draw.c feedback_prepare) while the helper threads (vk_spec.h) read
 // it for the draws they translate and the passes they begin, so it is loaded and stored atomically. A helper part that
 // read it before the store is dropped: the store is followed by vk_spec_world_changed.
@@ -518,6 +525,9 @@ static inline void vk_tex_fb_learn(VkTexImage *img) { __atomic_store_n(&img->fb_
 // is let go for the wait (vk_texture.c hold_barrier). Any other thread, or no held slice left: returns at once.
 void vk_texture_hold_barrier(void);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
+// An ASTC image kept as BC1 made BC3 again and uploaded whole, before texels that may carry alpha are written into it
+// (vk_exec_xfer.c's copies into a decoded ASTC image, WriteTexels). Any other image is left as it is.
+void vk_texture_astc_bc3(const VkTexImage *img);
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view);
 // The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the
