@@ -54,6 +54,7 @@ _Noreturn void rt_fatal(const char *format, ...) {
     fputc('\n', stderr); ExitProcess(21);
 }
 void rt_log(const char *format, ...) { (void)format; }
+uint64_t kern_now_ns(void) { return 0; }   // vk_sync.c vk_sync_queue_submit times the submit
 unsigned rt_trace;
 static void wb_async_forget(const void *e) { (void)e; }
 void vk_dlss_image_gone(VkImage image) { (void)image; }
