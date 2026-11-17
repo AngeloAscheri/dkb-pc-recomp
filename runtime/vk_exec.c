@@ -776,27 +776,29 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
-// Consecutive dispatches. The game's compute work comes as runs of small dispatches (one workgroup each, in the
-// destruction of terrain about 170 to 200 in a part of 4 to 5 ms of GPU time), each with a barrier before it, ours or the
-// game's. On an RX 9070 XT (RGP) each full barrier flushed and invalidated the colour, depth, L2 and scalar caches, 10 to
-// 20 us apiece, and the dispatch after it ran from cold caches. When nothing but compute work, and the copies the
-// dispatches' bindings record, came since the last barrier, a barrier among the compute and transfer stages orders the
-// same accesses without touching the colour and depth caches: a later pass, copy or clear still gets its own full
-// barrier (barrier_to), which covers the dispatches too. Eglantine narrows the barrier before a dispatch as well
-// (yuzu-derived RasterizerVulkan::DispatchCompute: graphics, compute and transfer stages to the compute stage,
-// MEMORY_WRITE to MEMORY_READ). TOTK_CS_BARRIER=0: the full barrier every time; ab switches it with the A/B blocks.
-// TOTK_CS_BARRIER=game (experimental): a dispatch that follows only compute work gets no barrier at all unless the game
-// asked for one since the dispatch before. Maxwell runs consecutive compute launches without waiting for each other
-// unless a barrier orders them (docs/maxwell.md 1.9, DK3D: ordering is WaitForIdle), and the game's own barriers say
-// which of its dispatches depend on the one before. In terrain destruction the game's compute work is hundreds of
-// one-wave dispatches (RGP on an RX 9070 XT: 32 threads, about 22 us a wave), which a barrier before each keeps on one
-// compute unit at a time.
+// Consecutive dispatches (TOTK_CS_BARRIER). Every dispatch gets a full barrier before it by default (0), as before.
+// While terrain breaks, the game's compute work is long runs of one-wave dispatches (RGP on an RX 9070 XT: one
+// workgroup of 32 threads, about 22 us a wave, a compute pass of 3.7 ms), so with a barrier before each one compute
+// unit works at a time. Each full barrier also flushed and invalidated the colour, depth, L2 and scalar caches.
+// - 1: a dispatch, or a barrier of the game, that follows only compute work since the last barrier gets a barrier among
+//   the compute and transfer stages (and the indirect argument read), which flushes no colour or depth cache; a later
+//   pass, copy or clear still gets its own full barrier (barrier_to), which covers the dispatches too. Eglantine
+//   narrows the barrier before a dispatch as well (yuzu-derived RasterizerVulkan::DispatchCompute). Measured: within
+//   the run-to-run spread (GPU peaks while terrain broke 16.7 to 17.7 ms against 17.9 to 18.5 with 0).
+// - game (experimental): such a dispatch gets no barrier at all unless the game asked for one since the dispatch
+//   before (OP_BARRIER, VkExec.game_barrier). Maxwell runs consecutive compute launches without waiting for each other
+//   unless a barrier orders them (docs/maxwell.md 1.9, DK3D: ordering is WaitForIdle), and the game's own barriers say
+//   which of its dispatches depend on the one before; more than half of the runs' dispatches had none (13,677 of
+//   22,130 in one stretch). GPU peaks while terrain broke went from 15.8 to 19.6 ms to 12.3 to 15.0 (background 9);
+//   no visible difference in about ten minutes of play. Opt-in until it has been played longer.
+// - ab switches 0 and 1 with the A/B blocks.
+// The perf trace counts those dispatches by whether the game ordered them (perf: dispatches after compute work alone).
 static int cs_mode = -1;   // 0 full barriers, 1 compute barriers, 2 the two in the A/B blocks, 3 game
 static uint64_t cs_after_game, cs_after_none, cs_skipped;   // perf: dispatches after compute work
 static int cs_barrier_on(void) {
     if (cs_mode < 0) {
         const char *e = cfg_get("TOTK_CS_BARRIER");
-        cs_mode = e && !strcmp(e, "game") ? 3 : rt_knob("CS_BARRIER", "1");
+        cs_mode = e && !strcmp(e, "game") ? 3 : rt_knob("CS_BARRIER", "0");
         static const char *const how[] = {"full barriers", "compute barriers", "compute or full barriers in the A/B blocks",
                                           "the game's barriers alone (experimental)"};
         static const char *const val[] = {"0", "1", "ab", "game"};
