@@ -683,6 +683,75 @@ static int written_overlaps(VkExec *ex, uint64_t addr, uint64_t size) {
     return 0;
 }
 
+// TOTK_RESET_BATCH: the nonnull targets in address order (*out, the replaying thread's buffer, *n of them), and whether
+// two share a byte, as reset_targets_overlap answers. msort returns at once on a list already in order.
+static int reset_sort(const uint64_t *pointers, uint32_t count, const uint64_t **out, uint32_t *n) {
+    static uint64_t *sorted, *sbuf;   // the replaying thread's
+    static size_t cap, scap;
+    if (cap < count) {
+        free(sorted);
+        cap = count;
+        if (!(sorted = malloc(cap * sizeof *sorted))) rt_fatal("vk: out of memory checking indirect-reset targets");
+    }
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (pointers[i]) sorted[m++] = pointers[i];
+    sort_u64(sorted, m, &sbuf, &scap);
+    int overlap = 0;
+    for (uint32_t i = 1; i < m && !overlap; i++) overlap = sorted[i] - sorted[i - 1] < NVN_INDIRECT_RESET_RECORD_BYTES;
+    *out = sorted, *n = m;
+    return overlap;
+}
+
+// The bookkeeping of the records the reset just copied, sorted and disjoint: once per run of records that touch end
+// to start, with the run's span, instead of once per record. A run covers exactly the bytes its records do, so the
+// mirror's write-back (vk_mem_gpu_wrote), the written ranges of the command buffer (note_written) and the uniform
+// snapshot's GPU writes (vk_usnap_drop_many, one lock for the reset) name the same bytes as before; only the census
+// counts a run once. A run that does not lie in one mapping is noted record by record. With as many runs as records,
+// what is saved is the snapshot's lock, taken once for the reset instead of once per record, and the copy commands
+// (vk_exec_reset_indirect); each record is then resolved a second time here. With TOTK_TRACE=perf the log says every
+// 3600 resets how many records and runs a reset had.
+static void reset_batch(VkExec *ex, const uint64_t *sorted, uint32_t n) {
+    DrawCtx *const dc = DC_OF(ex);   // for vk_mem_count
+    const uint64_t rec = NVN_INDIRECT_RESET_RECORD_BYTES;
+    static uint64_t (*runs)[2];   // the replaying thread's
+    static uint32_t cruns;
+    static uint64_t n_resets, n_records, n_runs;
+    if (cruns < n) {
+        free(runs);
+        cruns = n;
+        if (!(runs = malloc(sizeof *runs * cruns))) rt_fatal("vk: out of memory noting indirect-reset writes");
+    }
+    uint32_t nr = 0;
+    for (uint32_t i = 0, j; i < n; i = j) {
+        uint64_t lo = sorted[i], hi = lo + rec;
+        for (j = i + 1; j < n && sorted[j] == hi; j++) hi += rec;
+        VkMemSpan span;
+        if (vk_mem_resolve(lo, hi - lo, &span)) {
+            VK_MEM_USE(span);
+            vk_mem_gpu_wrote(&span, hi - lo);
+            vk_mem_count(span.cls, VK_MUSE_GPU_WRITE, hi - lo);
+            note_written(ex, lo, hi - lo, span.buffer);
+        } else {
+            for (uint32_t k = i; k < j; k++) {
+                if (!vk_mem_resolve(sorted[k], rec, &span)) rt_fatal("vk: an indirect-reset mapping changed during replay");
+                VK_MEM_USE(span);
+                vk_mem_gpu_wrote(&span, rec);
+                vk_mem_count(span.cls, VK_MUSE_GPU_WRITE, rec);
+                note_written(ex, sorted[k], rec, span.buffer);
+            }
+        }
+        runs[nr][0] = lo, runs[nr][1] = hi, nr++;
+    }
+    vk_usnap_drop_many((const uint64_t (*)[2])runs, nr);
+    n_records += n, n_runs += nr;
+    if ((rt_trace & RT_TRACE_PERF) && ++n_resets >= 3600) {
+        rt_log("vk: indirect resets: %.1f records in %.1f runs of adjacent records a reset (TOTK_RESET_BATCH)",
+               (double)n_records / (double)n_resets, (double)n_runs / (double)n_resets);
+        n_resets = n_records = n_runs = 0;
+    }
+}
+
 // The pointer list may have been written earlier in this submission. Read its GPU-visible contents after submitting
 // that prefix, then validate every target before recording a write. Null pointers have no record to reset.
 //
@@ -742,13 +811,22 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
     Chunk *chunk = &resources->chunks[resources->nchunks - 1];
     if (vmaFlushAllocation(vk_ctx()->vma, chunk->alloc, source_offset, sizeof record) != VK_SUCCESS)
         rt_fatal("vk: flushing indirect-reset values failed");
-    int ordered = reset_targets_overlap(pointers, list.count);
+    // TOTK_RESET_BATCH (on by default; 0 as before; ab alternates with the A/B blocks): disjoint targets are copied in
+    // address order, so the copies into one buffer share commands of up to 128 regions, and their bookkeeping is done
+    // once per run of adjacent records (reset_batch) instead of once per record.
+    static int batch_mode = -1;
+    uint32_t nsorted = 0;
+    const uint64_t *sorted = NULL;
+    int ordered;
+    if (knob_on(&batch_mode, "RESET_BATCH", "1")) ordered = reset_sort(pointers, list.count, &sorted, &nsorted);
+    else ordered = reset_targets_overlap(pointers, list.count);
+    int batch = sorted && !ordered;   // overlapping targets keep their input order, one barrier apart, as before
     VkBuffer dst = VK_NULL_HANDLE;
     VkBufferCopy regions[128];
     uint32_t nregions = 0;
     vk_exec_barrier(ex);   // the copies follow every earlier access to the records
-    for (uint32_t i = 0; i < list.count; i++) {
-        uint64_t addr = pointers[i];
+    for (uint32_t i = 0, n = batch ? nsorted : list.count; i < n; i++) {
+        uint64_t addr = batch ? sorted[i] : pointers[i];
         if (!addr) continue;
         VkMemSpan span;
         if (!vk_mem_resolve(addr, sizeof record, &span))
@@ -759,8 +837,9 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
         if (ordered) vk_exec_barrier(ex);   // preserves the input order of duplicate or overlapping target ranges
         VkBufferCopy copy = {source_offset, span.offset, sizeof record};
         if (!ordered) {
-            // Do not reorder targets. Within one command the destination ranges must be disjoint,
-            // including when different guest addresses resolve to the same Vulkan buffer.
+            // Do not reorder overlapping targets (disjoint ones may go in any order: the bytes end the same). Within
+            // one command the destination ranges must be disjoint, including when different guest addresses resolve
+            // to the same Vulkan buffer.
             if (nregions && (dst != span.buffer || nregions == sizeof regions / sizeof regions[0] ||
                 span.offset < regions[nregions - 1].dstOffset + sizeof record)) {
                 vkCmdCopyBuffer(ex->cb, source, dst, nregions, regions);
@@ -773,6 +852,7 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
             vkCmdCopyBuffer(ex->cb, source, span.buffer, 1, &copy);
             ex->recorded++;
         }
+        if (batch) continue;   // reset_batch notes the writes below
         vk_mem_gpu_wrote(&span, sizeof record);
         vk_usnap_drop(addr, sizeof record);
         vk_mem_count(span.cls, VK_MUSE_GPU_WRITE, sizeof record);
@@ -782,6 +862,7 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
         vkCmdCopyBuffer(ex->cb, source, dst, nregions, regions);
         ex->recorded++;
     }
+    if (batch) reset_batch(ex, sorted, nsorted);
     free(pointers);
     vk_exec_barrier(ex);   // subsequent shader accesses and indirect reads see every completed record
     return 1;
