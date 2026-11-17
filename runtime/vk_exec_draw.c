@@ -701,12 +701,15 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
     static int cpu_list = -1;
     if (cpu_list < 0) cpu_list = cfg_int("TOTK_RESET_CPU_LIST");
     VkMemSpan list_span;
-    // Guest memory holds the list only when the host can read it (not the GPU window) and no GPU write can still land
+    // Guest memory holds the list only when the host can read it (not the GPU window, and a host pool rather than a
+    // device-local one, whose GPU writes land only in VRAM) and no GPU write can still land
     // there: none recorded in this command buffer (note_written), none noted with a fence not done yet (copies, fills,
     // reports and stores of this or an earlier submission, vk_usnap_gpu_writing), and no page kept in a VRAM mirror
     // (vk_mem_kept_overlaps), whose bytes never reach guest memory. The uniform snapshot trusts guest memory on the
     // same terms (vk_usnap.c vk_usnap_begin).
     const int guest_ok = cpu_list && !nvn_gpu_only(list.begin) && vk_mem_resolve(list.begin, list.bytes, &list_span) &&
+                         !list_span.alloc && list_span.pool && list_span.avail >= list.bytes &&
+                         (list_span.cls == VK_MCLS_HOST_CACHED || list_span.cls == VK_MCLS_HOST_UNC) &&
                          !written_overlaps(ex, list.begin, list.bytes) && !vk_usnap_gpu_writing(list.begin, list.bytes) &&
                          !vk_mem_kept_overlaps(list.begin, list.bytes);
     int have = 0;
