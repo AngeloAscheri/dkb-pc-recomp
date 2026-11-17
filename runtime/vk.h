@@ -422,6 +422,9 @@ void vk_upload_end(void);
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);
 uint64_t vk_upload_flush(int wait);
 int vk_upload_done(uint64_t seq);                 // the upload batch seq (vk_upload_flush's value) has completed
+// The sequence number of the open upload batch, the value vk_upload_flush will return for it. Only between
+// vk_upload_begin and vk_upload_end.
+uint64_t vk_upload_seq(void);
 // Upload batch figures since the previous call (the perf line): GPU time of the timed ones, batches submitted, time
 // threads waited in vk_upload_flush(1), bytes of staging allocated.
 void vk_upload_perf(uint64_t *gpu_ns, uint64_t *timed, uint64_t *batches, uint64_t *wait_ns, uint64_t *bytes);
@@ -522,6 +525,10 @@ typedef struct { uint32_t serial, ridx, rgen, aidx, valid; } VkSlotStamp;
 uint64_t vk_texture_slot_token_stamped(const dpool_ref *pool, int id, VkSlotStamp *st);
 uint64_t vk_texture_slot_token_again(const VkSlotStamp *st);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
+// Whether the registration with this serial (a token's high half) had its once-a-submission storage check in submission
+// epoch (vk_texture_epoch), so that vk_texture_by_id_locked has nothing left to do for it while its token holds.
+// Unlocked; 0 may also mean the answer was overwritten by another registration's.
+int vk_texture_slot_checked(uint32_t serial, uint32_t epoch);
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 // The same for a part the helper thread recorded (vk_spec.h): _ready asks, on the helper, whether the marking can wait
 // until the replay thread takes the part; _late does it then, and only for an entry that is still GPU-owned.
@@ -705,6 +712,15 @@ int vk_sync_noting(void);
 void vk_sync_note(int kind, uint64_t a, uint64_t b, uint64_t work);
 void vk_sync_note_args(uint64_t addr);
 void vk_sync_note_write(uint64_t addr, uint64_t size, uint64_t stage);
+// A slice of a sliced pass notes into its own note, not the part's, which the replay thread keeps recording meanwhile.
+// vk_sync_slice_note_begin(on), on the thread that records the slice: from here to vk_sync_slice_note_end, this
+// thread's notes go to the note it returns (NULL, and nothing noted, when !on: the pass's part is untimed). The replay
+// thread passes each to vk_sync_note_merge in slice order, which adds it to the part that executes the slices (the
+// oldest held part when held_front, else the part being recorded) and frees it.
+typedef struct VkSyncNote VkSyncNote;
+VkSyncNote *vk_sync_slice_note_begin(int on);
+void vk_sync_slice_note_end(void);
+void vk_sync_note_merge(VkSyncNote *n, int held_front);
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);

@@ -307,7 +307,7 @@ void perf_lock_wait(int lock, uint64_t ns) {
 }
 
 static void lock_waits_log(uint64_t frame) {
-    static const char *const name[PERF_LOCK_N] = {"texture", "memory pools", "mirror"};
+    static const char *const name[PERF_LOCK_N] = {"texture", "memory pools", "mirror", "generations"};
     char line[300];
     size_t o = 0;
     for (int i = 0; i < PERF_LOCK_N; i++) {

@@ -321,8 +321,9 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     plat_mutex_unlock(&r->lock);
 }
 
-// ---- render tick: one frame each time the output device has taken the ring below its target (audio_mixer_pace_ns),
-// or every sample_count / sample_rate seconds of the host clock without a device, while stopped or while it stalls
+// ---- render tick: one frame every sample_count / sample_rate seconds of the host clock, nudged toward the output
+// target while the device paces rendering (audio_mixer_fill, render_thread); plain host time without a device, while
+// stopped or while it stalls
 static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) {
     if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate) return;
     double want = v->fraction + out_seconds * v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0);
@@ -376,7 +377,10 @@ static void render_thread(void *p) {
                 next = kern_now_ns();
                 continue;
             }
-            if (have < target - 2 * period || have < 2 * block) {
+            // Steady state the queue saws between about target - period / 2 and target + period / 2 as the device takes a
+            // period at a time; more than half a period and two blocks under that low point it is behind (start,
+            // underrun): refill now instead of at the +5 % ramp.
+            if (have < target - period - 2 * block || have < 2 * block) {
                 next = now + frame_ns;   // refill now
             } else {
                 double err = (double)(have - target) / (double)(target > 0 ? target : 1);   // > 0: too full
@@ -385,19 +389,10 @@ static void render_thread(void *p) {
                 else if (now - next > 100000000ull) next = now;
                 next += (uint64_t)((double)frame_ns * k);
             }
-        } else {
-            int64_t pace = audio_mixer_pace_ns(r, now);
-            if (pace > 0) {
-                plat_wait_ns((uint64_t)pace);
-                continue;
-            }
-            if (pace == 0) {
-                next = now + frame_ns;   // where the timer goes on if the device stops pacing
-            } else {
-                if (next > now) plat_wait_ns(next - now);
-                else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
-                next += frame_ns;
-            }
+        } else {   // no device, stopped or stalled: the host clock alone
+            if (next > now) plat_wait_ns(next - now);
+            else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
+            next += frame_ns;
         }
         plat_mutex_lock(&r->lock);
         if (r->state == 0) {
