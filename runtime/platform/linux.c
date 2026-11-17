@@ -581,38 +581,49 @@ void plat_mutex_unlock_shared(PlatMutex *m) {
     if (!(s & LK_R) && (s & LK_S)) lk_wake(w);
 }
 
-// ---- condition variables: a sequence number in the first 32 bits. A waiter reads it before releasing the lock and
-// sleeps only while it is unchanged, so a signal between the release and the sleep is not lost.
+// ---- condition variables: a sequence number in the first 32 bits and the count of waiting threads in the second. A
+// waiter reads the number before releasing the lock and sleeps only while it is unchanged, so a signal between the
+// release and the sleep is not lost. A signal skips the futex system call when nobody waits, as Hookshot's
+// WakeConditionVariable and cv_wait do (Hookshot, host/posix/win32_posix.c). Every access is sequentially consistent:
+// a signal that reads no waiter came, in that one order, before the waiter counted itself, so either the waiter read
+// the number after the signal's increment (the signal came before the wait, which the caller's predicate under the
+// lock covers) or the futex wait finds the number changed and returns at once. Nothing is lost.
 
+_Static_assert(sizeof(PlatCond) >= 2 * sizeof(uint32_t), "PlatCond holds the sequence number and the waiter count");
 static inline volatile uint32_t *cv(PlatCond *c) { return (volatile uint32_t *)&c->p; }
+static inline volatile uint32_t *cv_waiters(PlatCond *c) { return (volatile uint32_t *)&c->p + 1; }
 
 void plat_cond_init(PlatCond *c) { c->p = 0; }
 
 void plat_cond_wait(PlatCond *c, PlatMutex *m) {
-    uint32_t seq = __atomic_load_n(cv(c), __ATOMIC_RELAXED);
+    uint32_t seq = __atomic_load_n(cv(c), __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(cv_waiters(c), 1, __ATOMIC_SEQ_CST);
     plat_mutex_unlock(m);
     futex(cv(c), FUTEX_WAIT, seq, NULL);
+    __atomic_sub_fetch(cv_waiters(c), 1, __ATOMIC_SEQ_CST);
     plat_mutex_lock(m);
 }
 
 int plat_cond_wait_ns(PlatCond *c, PlatMutex *m, uint64_t ns) {
-    uint32_t seq = __atomic_load_n(cv(c), __ATOMIC_RELAXED);
+    uint32_t seq = __atomic_load_n(cv(c), __ATOMIC_SEQ_CST);
     struct timespec ts = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    __atomic_add_fetch(cv_waiters(c), 1, __ATOMIC_SEQ_CST);
     plat_mutex_unlock(m);
     long r = futex(cv(c), FUTEX_WAIT, seq, &ts);
     int timed_out = r == -1 && errno == ETIMEDOUT;
+    __atomic_sub_fetch(cv_waiters(c), 1, __ATOMIC_SEQ_CST);
     plat_mutex_lock(m);
     return !timed_out;
 }
 
 void plat_cond_signal(PlatCond *c) {
-    __atomic_add_fetch(cv(c), 1, __ATOMIC_RELEASE);
-    futex(cv(c), FUTEX_WAKE, 1, NULL);
+    __atomic_add_fetch(cv(c), 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(cv_waiters(c), __ATOMIC_SEQ_CST)) futex(cv(c), FUTEX_WAKE, 1, NULL);
 }
 
 void plat_cond_broadcast(PlatCond *c) {
-    __atomic_add_fetch(cv(c), 1, __ATOMIC_RELEASE);
-    futex(cv(c), FUTEX_WAKE, INT_MAX, NULL);
+    __atomic_add_fetch(cv(c), 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(cv_waiters(c), __ATOMIC_SEQ_CST)) futex(cv(c), FUTEX_WAKE, INT_MAX, NULL);
 }
 
 // ---- files
