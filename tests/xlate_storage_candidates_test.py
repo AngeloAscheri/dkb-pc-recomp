@@ -189,7 +189,7 @@ class CandidateTest(unittest.TestCase):
             'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMDATA', 'SYSTEMDRIVE'}}
         cls.env.update(DOTNET_ROOT=str(args.dotnet.parent), DOTNET_PROCESSOR_COUNT='2',
                        DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_GENERATE_ASPNET_CERTIFICATE='false',
-                       DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1', DOTNET_NOLOGO='1',
+                       DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1', DOTNET_NOLOGO='1', DOTNET_ADD_GLOBAL_TOOLS_TO_PATH='false',
                        DOTNET_CLI_HOME=str(args.out / 'dotnet-home'), MSBUILDDISABLENODEREUSE='1',
                        DOTNET_CLI_USE_MSBUILD_SERVER='0')
         cls.command = [str(args.dotnet), str(args.xlate)] if args.xlate.suffix == '.dll' else [str(args.xlate)]
