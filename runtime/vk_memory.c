@@ -3188,6 +3188,7 @@ void vk_mem_collect(void) {
     plat_rmutex_lock(&cmd_lock);
     collect_locked(c);
     plat_rmutex_unlock(&cmd_lock);
+    vk_mem_pressure_check();
 }
 
 void vk_mem_stats(VkMemStats *s) {

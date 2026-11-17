@@ -1657,6 +1657,13 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) *proc_mb = (float)(pmc.WorkingSetSize >> 20);
 }
 
+int plat_mem_avail(uint64_t *avail, uint64_t *swap_free, uint64_t *total, int *has_swap) {
+    (void)avail, (void)swap_free, (void)total, (void)has_swap;
+    return 0;   // the memory-pressure policy (vk_mem_pressure.c) is Linux only
+}
+
+int plat_mem_trim(void) { return 0; }
+
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
     *proc_mb = *used_mb = *limit_mb = -1;
     MEMORYSTATUSEX ms = {.dwLength = sizeof ms};

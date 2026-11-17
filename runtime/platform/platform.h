@@ -423,6 +423,13 @@ void plat_cpu_load(PlatLoad *l, float *total_pct, float *proc_pct, float *temp_c
 void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb);
 // Physical memory in MB: in use and installed on the machine, and this process's working set.
 void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
+// Linux only (the memory-pressure policy of vk_mem_pressure.c; the other hosts answer 0 and do nothing): MemAvailable,
+// SwapFree and MemTotal in bytes and whether swap is configured, from /proc/meminfo (linux_pressure.h
+// lp_parse_meminfo); 1 when read. plat_mem_trim gives the heap's freed pages back to the system (glibc malloc_trim,
+// which also returns the other threads' arenas); 1 when it released any. A no-op on the other hosts and on a C library
+// without malloc_trim.
+int plat_mem_avail(uint64_t *avail, uint64_t *swap_free, uint64_t *total, int *has_swap);
+int plat_mem_trim(void);
 // Commit charge in MB: this process's private bytes, the system's commit in use and its limit (RAM plus page files).
 // An allocation fails when the system's reaches the limit, however much physical memory is free. -1 when unknown.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);

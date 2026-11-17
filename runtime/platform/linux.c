@@ -6,6 +6,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <linux/fs.h>
 #include <linux/futex.h>
 #include <linux/userfaultfd.h>
@@ -32,6 +35,7 @@
 #include <SDL3/SDL_clipboard.h>
 
 #include "platform.h"
+#include "../linux_pressure.h"
 
 // The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h), for headers older than it: the release
 // builds against the Steam Runtime's 5.10 headers and runs on newer kernels. The kernel refuses what it lacks at run time.
@@ -1595,6 +1599,24 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     unsigned long long size, resident;
     if (f && fscanf(f, "%llu %llu", &size, &resident) == 2) *proc_mb = (float)(resident * (uint64_t)sysconf(_SC_PAGESIZE) >> 20);
     if (f) fclose(f);
+}
+
+int plat_mem_avail(uint64_t *avail, uint64_t *swap_free, uint64_t *total, int *has_swap) {
+    char buf[4096];
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return lp_parse_meminfo(buf, avail, swap_free, total, has_swap);
+}
+
+int plat_mem_trim(void) {
+#ifdef __GLIBC__
+    return malloc_trim(0);
+#else
+    return 0;
+#endif
 }
 
 // No walk of the address space on this host: mem_commit_report then sums nothing.
