@@ -3,6 +3,8 @@
 Draft, not released. The 0.4.1 notes follow below, unchanged.
 
 - `console = 0` also closes a Windows Terminal window: the game frees its console instead of hiding the window (#238, #364).
+- #372 Leave the translator's emulated compare-exchange loop after 1024 attempts (@roverdrubber)
+- dotnet no longer adds a dead folder to the user's PATH on each install (c222918).
 - HD rumble falls back to the two-motor path for the rest of the session when a pad disconnects after HD packets (#363, untested on that pad).
 - #354 Read indirect-reset pointer lists from guest memory instead of through a GPU read-back (TOTK_RESET_CPU_LIST) (@thatbananaman08, landed with a host-pool check)
 - #361 Scan a pool's pages for its mirror sync under the pool's own lock, and take mirror_lock only to queue the copies (@thatbananaman08)
