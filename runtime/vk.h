@@ -682,6 +682,9 @@ uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
+// vkQueueSubmit2 on the graphics queue under vk_queue_lock; a call over 10 ms is logged with value, the timeline value
+// the part belongs to. vk_sync.c and the recorder thread (vk_rec.c) submit their parts through it.
+VkResult vk_sync_queue_submit(const VkSubmitInfo2 *si, VkFence fence, uint64_t value);
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has

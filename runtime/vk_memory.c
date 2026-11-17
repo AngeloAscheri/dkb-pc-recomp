@@ -138,18 +138,35 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 }
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
-static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
-static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+// The phases of one import, in ns (import_pool fills it for its log line): mem_thaw, mem_touch, the host pointer query,
+// vkCreateBuffer, vkAllocateMemory (the driver pins the pages there) and vkBindBufferMemory.
+typedef struct { uint64_t thaw, touch, props, create, alloc, bind; } ImportTimes;
+static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, ImportTimes *t);
+// where: when it runs, for the log line ("on first GPU use", "at initialize").
+static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, const char *where) {
+    ImportTimes t = {0};
     uint64_t t0 = qpc();
-    mem_touch(addr, size);   // the driver pins the pages: reserved ones of a lazy heap (TOTK_HEAP_LAZY) would fail
+    mem_thaw(addr, size);    // the import may need write access to the pages
     uint64_t t1 = qpc();
-    int ok = import_pool_timed(c, r, addr, size);
-    __atomic_add_fetch(&import_touch_ns, t1 - t0, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&import_total_ns, qpc() - t0, __ATOMIC_RELAXED);
+    mem_touch(addr, size);   // the driver pins the pages: reserved ones of a lazy heap (TOTK_HEAP_LAZY) would fail
+    uint64_t t2 = qpc();
+    int ok = import_pool_timed(c, r, addr, size, &t);
+    uint64_t total = qpc() - t0;
+    t.thaw = t1 - t0, t.touch = t2 - t1;
+    __atomic_add_fetch(&import_touch_ns, t2 - t1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&import_total_ns, total, __ATOMIC_RELAXED);
+    // A slow vkAllocateMemory, or any import of 64 MiB or more (the terrain arena of a layer is 450 MiB, #397), gets a
+    // line with every phase (the first 32): the stall of a first GPU use was more than the allocation alone.
+    static int32_t n_slow_alloc;
+    if ((t.alloc > 10000000ull || size >= (64ull << 20)) && plat_inc32(&n_slow_alloc) <= 32)
+        rt_log("vk: importing %llu MiB of guest memory took %.1f ms in vkAllocateMemory (%.1f ms in all, %s: thaw %.1f, "
+               "touch %.1f, host pointer query %.1f, vkCreateBuffer %.1f, vkBindBufferMemory %.1f)%s",
+               (unsigned long long)(size >> 20), qpc_ms(t.alloc), qpc_ms(total), where, qpc_ms(t.thaw), qpc_ms(t.touch),
+               qpc_ms(t.props), qpc_ms(t.create), qpc_ms(t.bind), ok ? "" : "; failed");
     return ok;
 }
 
-static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, ImportTimes *t) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
     if (!p_host_props)
         p_host_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(c->device, "vkGetMemoryHostPointerPropertiesEXT");
@@ -172,6 +189,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
     }
     VkResult res;
     uint32_t known = cache_on ? __atomic_load_n(&host_bits, __ATOMIC_ACQUIRE) : 0;
+    uint64_t tp = qpc();
     if (known) {
         hp.memoryTypeBits = known, res = VK_SUCCESS;
     } else {
@@ -184,6 +202,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
             rt_log("vk: vkGetMemoryHostPointerPropertiesEXT of %llu MiB took %.1f ms", (unsigned long long)(n >> 20), ms);
         if (res == VK_SUCCESS && hp.memoryTypeBits && cache_on) __atomic_store_n(&host_bits, hp.memoryTypeBits, __ATOMIC_RELEASE);
     }
+    t->props = qpc() - tp;
     if (res != VK_SUCCESS || !hp.memoryTypeBits) {
         rt_log("vk: pool %#llx+%#llx: host pointer not importable (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         return 0;
@@ -192,7 +211,10 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = n,
                              .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if ((res = vkCreateBuffer(c->device, &bi, NULL, &r->buf)) != VK_SUCCESS) {
+    uint64_t tc = qpc();
+    res = vkCreateBuffer(c->device, &bi, NULL, &r->buf);
+    t->create = qpc() - tc;
+    if (res != VK_SUCCESS) {
         rt_log("vk: pool %#llx: vkCreateBuffer for the import failed (%d)", (unsigned long long)addr, (int)res);
         return 0;
     }
@@ -213,7 +235,6 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
-    static int32_t n_slow_alloc;
     uint64_t ta = qpc();
     res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
     if (res != VK_SUCCESS && known && p_host_props) {
@@ -229,12 +250,12 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
         }
     }
     if (res != VK_SUCCESS) r->mem = VK_NULL_HANDLE;
-    uint64_t alloc_ns = qpc() - ta;
-    __atomic_add_fetch(&import_alloc_ns, alloc_ns, __ATOMIC_RELAXED);
-    double alloc_ms = (double)alloc_ns / 1e6;
-    if (alloc_ms > 10.0 && plat_inc32(&n_slow_alloc) <= 32)
-        rt_log("vk: importing %llu MiB of guest memory took %.1f ms in vkAllocateMemory", (unsigned long long)(n >> 20), alloc_ms);
-    if (res != VK_SUCCESS || (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+    t->alloc = qpc() - ta;
+    __atomic_add_fetch(&import_alloc_ns, t->alloc, __ATOMIC_RELAXED);
+    uint64_t tb = qpc();
+    if (res == VK_SUCCESS) res = vkBindBufferMemory(c->device, r->buf, r->mem, 0);
+    t->bind = qpc() - tb;
+    if (res != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -263,14 +284,18 @@ static int lazy_enabled(void) {
     return on;
 }
 
+// The deferred imports since the last present (lazy_frame_log): count, bytes, time with the wait for lazy_lock, and
+// the largest one. The first frame of a layer imports hundreds of pools on the replay thread.
+static volatile int64_t lz_n, lz_bytes, lz_ns, lz_max_bytes, lz_max_ns;
+
 // The deferred import. The caller holds pool_lock, shared or exclusive: a finalize needs it exclusively, so the record
 // stays alive here. Returns whether r has a GPU buffer afterwards.
 static int lazy_import(PoolRec *r) {
     if (!__atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) return r->buf != VK_NULL_HANDLE;
+    uint64_t t0 = qpc();
     plat_mutex_lock(&lazy_lock);
     if (r->lazy) {
-        mem_thaw((uintptr_t)r->lo, r->size);   // the import may need write access to the pages
-        if (!import_pool(vk_ctx(), r, r->lo, r->size)) {
+        if (!import_pool(vk_ctx(), r, r->lo, r->size, "on first GPU use")) {
             long n = plat_inc32(&n_import_failures);
             if (n <= 8) rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (unsigned long long)r->lo,
                                r->flags, (unsigned long long)r->size, n);
@@ -279,9 +304,28 @@ static int lazy_import(PoolRec *r) {
             plat_inc32(&n_lazy_imports);
         }
         __atomic_store_n(&r->lazy, 0, __ATOMIC_RELEASE);
+        uint64_t ns = qpc() - t0;
+        plat_inc64(&lz_n);
+        plat_add64(&lz_bytes, (int64_t)r->size);
+        plat_add64(&lz_ns, (int64_t)ns);
+        if ((int64_t)r->size > lz_max_bytes) lz_max_bytes = (int64_t)r->size, lz_max_ns = (int64_t)ns;   // lazy_lock
     }
     plat_mutex_unlock(&lazy_lock);
     return r->buf != VK_NULL_HANDLE;
+}
+
+// Every present (vk_mem_census): a frame whose first-use imports took 10 ms or more gets a line (the first 64).
+static void lazy_frame_log(uint64_t frame) {
+    if (!__atomic_load_n(&lz_n, __ATOMIC_RELAXED)) return;
+    // Not under lazy_lock, which an import holds for up to 100 ms: an import that ends meanwhile may land in either
+    // frame's line, and its largest-pool figures in neither.
+    int64_t n = plat_xchg64(&lz_n, 0), bytes = plat_xchg64(&lz_bytes, 0), ns = plat_xchg64(&lz_ns, 0);
+    int64_t mb = plat_xchg64(&lz_max_bytes, 0), mn = plat_xchg64(&lz_max_ns, 0);
+    static int lines;
+    if (ns < 10000000 || lines >= 64) return;
+    lines++;
+    rt_log("vk: frame %llu: %lld pools (%.1f MiB) imported on their first GPU use took %.1f ms; the largest, %.1f MiB, "
+           "%.1f ms", (unsigned long long)frame, (long long)n, bytes / 1048576.0, ns / 1e6, mb / 1048576.0, mn / 1e6);
 }
 
 // Physical pool: device-local memory of the pool size that both buffers and optimal-tiling images can be bound to.
@@ -399,8 +443,7 @@ int vk_pool_init(pool_t *p) {
             r->lazy = 1;
             ok = 1;
         } else {
-            mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
-            ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+            ok = import_pool(c, r, (uintptr_t)p->mem, p->size, "at initialize");
         }
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
@@ -829,6 +872,7 @@ void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
     static int report_every = -1;   // TOTK_MEM_REPORT, read on the first present
     if (report_every < 0) report_every = cfg_int("TOTK_MEM_REPORT");
+    lazy_frame_log(frame);
     if (report_every > 0 && frame % (uint64_t)report_every == 0) {
         char when[32];
         snprintf(when, sizeof when, "frame %llu", (unsigned long long)frame);
@@ -2199,10 +2243,25 @@ static void refuse(PoolRec *r, int why, const char *what) {
     plat_add64(&m_refused_bytes[why], (int64_t)n);
 }
 
+// A mirror of BIG_MIRROR bytes or more gets a log line with the times of its parts (mirror_create) and of recording
+// the prologue that holds its first full copy (vk_mem_mirror_prologue): the first use of the 450 MiB terrain arena of
+// a layer stalled one frame for 250 ms or more (#397). Replay thread (mirror_lock when shared), like the mirror's
+// creation and the prologue.
+#define BIG_MIRROR (64ull << 20)
+static struct {
+    int pending;                               // a line waits for the prologue
+    uint64_t lo, size;                         // the pool's address and the mirror's size
+    uint64_t hold;                             // ns: vk_mem_use's wait for the walk and mirror_lock before it
+    uint64_t lock, budget, snap, alloc, total; // ns: pool_lock and the overlap check, vk_mem_vram, gen_lock and
+                                               // snap_regions, vmaCreateBuffer, all of mirror_create
+    uint64_t queries, pages;                   // the snapshot's write-watch queries and the written pages they found
+} big_mirror;
+
 // Replay thread: the pool's mirror on its first buffer use.
 static void mirror_create(PoolRec *r) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
+    uint64_t t0 = qpc();
     // The state is stored once, when it is final. A helper thread that reads it before that (vk_mem_use) sees MS_NONE
     // and gives its part up; it never sees a refusal that turns into a mirror.
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
@@ -2217,6 +2276,7 @@ static void mirror_create(PoolRec *r) {
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return refuse(r, MR_UNTRACKED, "outside the write-watched address space");
+    uint64_t t1 = qpc();
     uint64_t used, budget;
     int exact;
     if (vk_mem_vram(&used, &budget, &exact) && used + n + budget / 8 > budget) {
@@ -2225,18 +2285,22 @@ static void mirror_create(PoolRec *r) {
                  n / 1048576.0, used / 1048576.0, budget / 1048576.0);
         return refuse(r, MR_BUDGET, why);
     }
+    uint64_t t2 = qpc();
     gen_lock_x();
-    mrep.sync_queries += snap_regions(r0, r1, mepoch);
+    uint64_t p0 = ww_pages, q = snap_regions(r0, r1, mepoch), wpages = ww_pages - p0;
+    mrep.sync_queries += q;
     int untracked = 0;
     for (uint64_t k = r0; k <= r1; k++) untracked |= snap_untracked[k];
     r->mgen = gen_now;   // the whole-range copy below holds every write observed so far
     plat_mutex_unlock(&gen_lock);
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
+    uint64_t t3 = qpc();
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
     VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
+    uint64_t t4 = qpc();
     if (res != VK_SUCCESS) {
         r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
         char why[96];
@@ -2254,6 +2318,11 @@ static void mirror_create(PoolRec *r) {
     r->acc_sub = msub, r->sub_hist = 1;
     ms_set(r, MS_ON);   // after mbuf and acc_sub: what a reader of MS_ON goes on to read
     range_add(&pend, &npend, &cpend, r, 0, n);
+    if (n >= BIG_MIRROR) {
+        big_mirror.pending = 1, big_mirror.lo = r->lo, big_mirror.size = n, big_mirror.hold = 0;
+        big_mirror.lock = t1 - t0, big_mirror.budget = t2 - t1, big_mirror.snap = t3 - t2, big_mirror.alloc = t4 - t3;
+        big_mirror.total = qpc() - t0, big_mirror.queries = q, big_mirror.pages = wpages;
+    }
     mrep.first_n++, mrep.first_bytes += n;
     plat_inc64(&m_live_n);
     plat_add64(&m_live_bytes, (int64_t)n);
@@ -2443,9 +2512,14 @@ void vk_mem_use(VkMemSpan *sp) {
         // thread, and a part that ran while one was made is dropped (vk_mem_mirror_gen). The workers of sliced passes
         // make it under mirror_lock, and the first of them to get the lock does.
         if (vk_spec_helper()) { vk_spec_fail(VK_SPEC_MIRROR); return; }
+        uint64_t t0 = qpc();
         vk_texture_hold_barrier();   // the walk, with a pass end held back: its slices resolve the pool as it was
         int locked = mirror_lock_if_shared();
-        if (ms_get(r) == MS_NONE) mirror_create(r);
+        uint64_t t1 = qpc();
+        if (ms_get(r) == MS_NONE) {
+            mirror_create(r);
+            if (big_mirror.pending && big_mirror.lo == r->lo) big_mirror.hold = t1 - t0;
+        }
         mirror_unlock(locked);
         state = ms_get(r);
     }
@@ -2703,6 +2777,8 @@ int vk_mem_mirror_pending(void) { return __atomic_load_n(&npend, __ATOMIC_RELAXE
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     int locked = mirror_lock_if_shared();   // a helper may be queueing a sync
     if (npend) {
+        uint64_t t0 = qpc(), b0 = mrep.upload_bytes;
+        int n = npend;
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
         copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies, 0);
@@ -2710,6 +2786,18 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         __atomic_store_n(&npend, 0, __ATOMIC_RELAXED);
         mrep.prologues++;
+        if (big_mirror.pending) {   // its first full copy was in pend (mirror_create queues it before any prologue)
+            static int32_t lines;
+            big_mirror.pending = 0;
+            if (plat_inc32(&lines) <= 32)
+                rt_log("mem: mirror of %.0f MiB at %#llx made in %.1f ms on first use (after %.1f ms waiting for the walk "
+                       "and the mirror lock): pool lookup %.1f, budget check %.1f, snapshot %.1f (%llu queries, %llu "
+                       "written pages), vmaCreateBuffer %.1f; its prologue (%d ranges, %.1f MiB) recorded in %.2f ms",
+                       big_mirror.size / 1048576.0, (unsigned long long)big_mirror.lo, qpc_ms(big_mirror.total),
+                       qpc_ms(big_mirror.hold), qpc_ms(big_mirror.lock), qpc_ms(big_mirror.budget), qpc_ms(big_mirror.snap),
+                       (unsigned long long)big_mirror.queries, (unsigned long long)big_mirror.pages,
+                       qpc_ms(big_mirror.alloc), n, (mrep.upload_bytes - b0) / 1048576.0, qpc_ms(qpc() - t0));
+        }
     }
     mirror_unlock(locked);
 }

@@ -178,7 +178,7 @@ static void note_fold(PartNote *to, const PartNote *n) {
     if (n->draws + n->draws_ind + n->dispatches + n->dispatches_ind) to->last_a = n->last_a, to->last_b = n->last_b;
 }
 
-typedef struct { uint32_t pair, noted; uint64_t fence; PartNote note; } TsRead;
+typedef struct { uint32_t pair, noted, prologue; uint64_t fence; PartNote note; } TsRead;
 
 static void slow_part(const TsRead *t, double ms) {
     static double slow_ms = -1;
@@ -237,7 +237,15 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     if (vkGetQueryPoolResults(c->device, ts_pool, 2 * t->pair, 2, sizeof v, v, sizeof v[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
         uint64_t s = v[0] & ts_mask, e = v[1] & ts_mask;
         if (e >= s) {
-            slow_part(t, (double)(e - s) * ts_period / 1e6);
+            double ms = (double)(e - s) * ts_period / 1e6;
+            slow_part(t, ms);
+            // The mirror copies of a prologue: the first use of a large pool copies all of it (450 MiB for the terrain
+            // arena of a layer, #397), and the part after it waits for the copy on the GPU.
+            static int pro_lines;
+            if (t->prologue && ms >= 10.0 && pro_lines < 32) {
+                pro_lines++;
+                rt_log("perf: the mirror prologue of submission %llu ran %.1f ms on the GPU", (unsigned long long)t->fence, ms);
+            }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
             if (e > from) {
                 int64_t ns = (int64_t)((double)(e - from) * ts_period);
@@ -292,6 +300,7 @@ static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence, PartNote *n) 
     if (!t) rt_fatal("vk: out of memory");
     t->pair = (uint32_t)pair, t->fence = fence;
     if (n) t->note = *n, t->noted = 1, n->args = NULL;
+    else t->prologue = 1;   // prologue is the one caller without a note
     vk_completion_add(fence, ts_read_cb, t);
 }
 
@@ -470,6 +479,28 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
     return &slots[cur_slot];
 }
 
+// vkQueueSubmit2 under the queue lock, for every submission of a part from here and from the recorder thread
+// (vk_rec.c). A call that takes over 10 ms gets a line, with the wait for the queue lock apart (the first 32, then one
+// every 64): the first submission that references a newly imported or allocated large buffer may pay the driver's
+// residency work for it there (#397).
+VkResult vk_sync_queue_submit(const VkSubmitInfo2 *si, VkFence fence, uint64_t value) {
+    static int32_t slow;
+    uint64_t t0 = kern_now_ns();
+    vk_queue_lock();
+    uint64_t t1 = kern_now_ns();
+    VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, si, fence);
+    uint64_t t2 = kern_now_ns();
+    vk_queue_unlock();
+    if (t2 - t1 > 10000000ull) {
+        long n = plat_inc32(&slow);
+        if (n <= 32 || n % 64 == 0)
+            rt_log("vk: vkQueueSubmit2 of a part of value %llu (%u command buffers) took %.1f ms, after %.1f ms waiting "
+                   "for the queue lock (slow submit %ld)", (unsigned long long)value, si->commandBufferInfoCount,
+                   (t2 - t1) / 1e6, (t1 - t0) / 1e6, n);
+    }
+    return r;
+}
+
 // The copies the replay's first accesses to VRAM mirrors queued (vk_memory.c), in a command buffer of their own that is
 // submitted right before the part that needs them and timed like a part; VK_NULL_HANDLE when there are none. After the
 // part was recorded, sub_lock held; may move slots[].
@@ -536,11 +567,7 @@ static VkCommandBuffer split_impl(int wait) {
     // The recorder submits a part it ended while the replay goes on (rec_submit). A part that is waited for below, or
     // that the recorder did not end, is submitted here.
     VkResult r = VK_SUCCESS;
-    if (wait || !by_rec || !rec_submit(pro, cb, cur_fence)) {
-        vk_queue_lock();
-        r = vkQueueSubmit2(c->gfx_queue, 1, &si, prefix);
-        vk_queue_unlock();
-    }
+    if (wait || !by_rec || !rec_submit(pro, cb, cur_fence)) r = vk_sync_queue_submit(&si, prefix, cur_fence);
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
@@ -608,9 +635,7 @@ void vk_sync_split_finish(void (*tail)(VkCommandBuffer cb, void *arg), void *arg
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
     rec_submit_wait();   // a part the recorder still submits comes first
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
+    VkResult r = vk_sync_queue_submit(&si, VK_NULL_HANDLE, h.fence);
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of a held-back part of value %llu failed (%d)", (unsigned long long)h.fence, (int)r);
@@ -634,9 +659,7 @@ void vk_sync_split_insert(VkCommandBuffer cb) {
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
+    VkResult r = vk_sync_queue_submit(&si, VK_NULL_HANDLE, cur_fence);
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of a helper part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
@@ -697,9 +720,7 @@ static uint64_t submit_record(VkSyncRecordFn record, void *context, uint64_t sub
                         .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
                         .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
+    VkResult r = vk_sync_queue_submit(&si, VK_NULL_HANDLE, fence);
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
