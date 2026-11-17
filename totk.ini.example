@@ -17,6 +17,12 @@
 # cloth_realtime = 1
 # Fix for physics that bounce at high frame rates.
 # highfps_fix = 1
+# AMD Anti-Lag 2 (experimental, off by default): on an AMD GPU whose driver has VK_AMD_anti_lag, the driver starts each
+# frame as late as it can, for less delay from input to the screen. The row appears in Display > Frame rate only where
+# the device has it. On Linux, Mesa's RADV has it through the layer VK_LAYER_MESA_anti_lag, which the game loads when
+# antilag = 1 at start (so on RADV, turning it on needs a restart), unless you set ENABLE_LAYER_MESA_ANTI_LAG or
+# DISABLE_LAYER_MESA_ANTI_LAG yourself. Elsewhere changes while the game runs take effect at once.
+# antilag = 0
 
 [performance]
 # The keys of this section and of [diagnostics] are for testing and troubleshooting, and take effect at the next start.
@@ -201,17 +207,19 @@
 # later, so a game at 30 fps is shown at 60. auto gives each refresh of the display between two game frames a frame, up
 # to 4 a game frame (the refresh over 30 fps), shown one game frame later. 3x to 8x make that many frames for each of the
 # game's, and no more than the display can show: a game at 60 fps on a 165 Hz display gets 2 whatever the multiplier. The
-# menu overlay is drawn on every shown frame and is never interpolated. No frame is made after a gap of over 100 ms, when
-# the picture's size changes, for the game's own HDR picture, when the display's refresh is below the rate asked, or
-# unless vk_present is mailbox or immediate. Changes while the game runs take effect at once.
+# menu overlay is drawn on every shown frame and is never interpolated. No frame is made after a gap of over 100 ms,
+# when the picture's size changes, when at 2x the display's refresh is below the doubled rate, or unless vk_present is
+# mailbox or immediate. The game's own HDR picture (hdr_native) gets made frames too. Changes while the game runs take
+# effect at once.
 # The Display tab of the settings menu (F1) has this as Frame generation.
 # frame_gen = off
 # What makes the frames of frame_gen = 2x (experimental): builtin, the default, from the picture alone; fsr3, AMD FSR 3.1's
 # frame interpolation, which also uses the scene's depth and motion. fsr3 runs only while a temporal upscaler (upscaler =
 # dlss, fsr3 or fsr4) draws the 3D below the output size, at 2x, with the display's refresh over twice the game's rate; a
 # frame it cannot make (no depth or motion, a camera cut, the first frame after a gap) gets the built-in one, and the other
-# frame_gen values always use the built-in one. The game's HUD is interpolated with the scene. Changes while the game runs
-# take effect at once.
+# frame_gen values always use the built-in one, as does the game's own HDR picture (hdr_native), which AMD's passes do
+# not take. AMD's passes are given the picture copied before the game draws its HUD, so the HUD is not moved with the
+# scene. Changes while the game runs take effect at once.
 # The menu's Frame generation made by row shows while frame_gen is 2x.
 # frame_gen_by = builtin
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen

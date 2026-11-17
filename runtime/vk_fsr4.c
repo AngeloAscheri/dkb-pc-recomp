@@ -757,6 +757,7 @@ int vk_fsr4_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     vk_fsr3_io_out(cb, G.output.view, ov, ow, oh);   // the caller's full barrier follows
     t.reset = reset;
     vk_temporal_done(&t, w, h, ow);
+    vk_fsr3fi_note_picture(cb, out);   // the picture before the game's HUD, for AMD's frame interpolation
     static int first_logged;
     if (!first_logged++)
         rt_log("fsr4: input pass in use: colour RGBA16F, depth 1 - d R32F (inverted%s), motion RG16F, all %ux%u; output through "

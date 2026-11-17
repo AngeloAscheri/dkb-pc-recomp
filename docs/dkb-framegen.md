@@ -26,7 +26,7 @@ Each refresh of the display between two game frames gets a frame made at its pla
 
 ### Two threads, as in Hookshot (Auto and 3x to 8x)
 
-The design is Hookshot's (`gpu/vk/vk_framegen.cpp`: `framegen_record`, `display_main`). The present thread (`vk_backend.c` `present_main`) calls `vk_fg_record` in place of its blit: it makes the game frame's set (the made frames and a copy of the game's own, since the history image is written again two frames on) into one of three sets, submits it and queues it, and is free for the next game frame at once. It waits only when all three sets are still being shown, which holds the game back as Hookshot's sets do.
+The design is Hookshot's (`gpu/vk/vk_framegen.cpp`: `framegen_record`, `display_main`). The present thread (`vk_backend.c` `present_main`) calls `vk_fg_record` in place of its blit: it makes the game frame's set (the made frames and a copy of the game's own, since the history image is written again two frames on) into one of three sets, submits it and queues it, and is free for the next game frame at once. It waits only when all three sets are still being shown, which holds the game back as Hookshot's sets do (`waited for a set` in its 5 s line). Each set has images for the most frames the mode may make (Auto's cap, or the multiplier's), at the window texture's crop size in RGBA8, made when the mode or the size changes: 8x keeps 24 of them, about 800 MB at 3840x2160, even when the display lets fewer be made.
 
 The display thread (`display_main`) takes the sets in order and presents each frame through the whole present chain on an even line (`fg_pace_show_due`): the game's frame time divided by the set's frames apart, never more than one game frame behind what the game handed over, and from now again when it fell behind; Auto's frames go out at their own refreshes' times. A made frame is left out only when the next set is already waiting. A frame the display thread does not get (frame generation turned off, a skip) is presented by the present thread once every set before it was shown.
 
@@ -60,10 +60,23 @@ The depth and motion are the temporal upscaler's: `vk_dlss.c` `vk_temporal_input
 - a temporal upscaler drew this frame's 3D (`upscaler = dlss`, `fsr3` or `fsr4`, with the 3D below the output size, so that a scene was noted at the input size), and the projection is a perspective one;
 - the GPU has push descriptors, storage images without a format and the subgroup arithmetic and quad operations the passes need (the log says what is missing);
 - the history is there: the first frame after a gap, a resize or a camera cut is made by the built-in interpolation, as is any frame the passes refuse (a picture whose shape is not the 3D's).
+- the history is an SDR picture: AMD's passes read 8-bit colour, so with the game's own HDR picture (`hdr_native`, a PQ history) the built-in interpolation makes the frame, which works on the PQ code values (`vk_framegen.c` `record`);
 
-Otherwise the built-in frame is made, with no other change to frame generation. The game's HUD is part of the picture the passes read, so it is interpolated with the scene, as it is by the built-in interpolation; AMD's SDK can take the picture without the HUD as well, which this runtime does not make yet.
+Otherwise the built-in frame is made, with no other change to frame generation.
 
-Log lines: `fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU` and `fsr3fi: 17 pass pipelines ready` once the setting is chosen on a capable device, `fsr3fi: making the 2x frames at WxH from RWxRH depth and motion` at the first frame it makes, and `by AMD FSR 3.1 N` in the 2x `fg:` line (below), which counts the made frames AMD's passes made. `fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler ...` says once that a frame had none.
+### The HUD
+
+The game draws its HUD into the same picture the upscaler wrote, so AMD's interpolation, given only the picture as shown, moves the HUD with the scene: smeared hearts and counters, garbled text. The SDK takes the frames without their HUD as well (`HUDLessColor`, `HUDLessAttachedFactor`), for this frame and the one before: the flow and the interpolation then work on the scene alone, and the inpainting pass puts back every pixel where the two pictures differ, the HUD, as it is shown (`ffx_frameinterpolation_inpainting.h` `computeInpainting`). The idea of finding such a picture in a game that gives none is OptiScaler's HUDfix (<https://github.com/optiscaler/OptiScaler>, `hudfix/Hudfix_Vk.cpp`); no code of it is used.
+
+Bananza draws the upscale into a 3D-sized R11G11B10F picture, then draws the HUD into that same image with blended quads, and one last draw reads it with bilinear filtering and writes the window texture, whose sRGB format encodes it (no tone mapping between them). So:
+
+1. `vk_fsr3fi_note_picture` (called by `vk_fsr3.c`, `vk_fsr4.c` and `vk_dlss.c` right after the upscaler wrote the output) copies the output into a ring of three images before the HUD is drawn, and notes the copy with the frame's depth and motion.
+2. `shaders/fg_hudless.comp` (run by `vk_framegen.c` before AMD's passes) does the last draw's work on the copy: bilinear to the window texture's size, sRGB encoded. Where that is within 3 levels of the frame as shown, it keeps the shown pixel exactly, so AMD's test sees no HUD there; elsewhere, the HUD's pixels, it gives the scene behind.
+3. The pictures of this frame and the one before go to `vk_fsr3fi_generate` as its sources, and the frame as shown is the inpainting pass's backbuffer. A frame without them (the first one after a change, a picture of another shape than the window texture, a crop of part of it, a frame whose upscaler did not note a picture) is interpolated from the frames as shown, with the HUD moved as before.
+
+The log says `fsr3fi: the upscaled picture is copied before the game's HUD` when the copies are made, and the 2x `fg:` line counts the made frames that used the frames without their HUD. With FSR 4 (a Windows build, `vk_fsr4.c`) and DLSS (`vk_dlss.c`) the copy is taken the same way, from the same output image; those two were compiled but not run on the machine this was written on.
+
+Log lines: `fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU` and `fsr3fi: 17 pass pipelines ready` once the setting is chosen on a capable device, `fsr3fi: making the 2x frames at WxH from RWxRH depth and motion` at the first frame it makes, and `by AMD FSR 3.1 N, K of them with the frames without their HUD` in the 2x `fg:` line (below), which counts the made frames AMD's passes made and those of them that had the frames without their HUD. `fg: frame_gen_by = fsr3 needs the depth and motion of a temporal upscaler ...` says once that a frame had none.
 
 ## Requirements
 
@@ -71,17 +84,27 @@ Without these, no made frames are produced (one log line says why) and presentat
 
 - Bananza only.
 - Present mode `mailbox` or `immediate` (`TOTK_VK_PRESENT`). With `fifo` the several presents per game frame would block the present thread.
-- Window texture format 8-bit UNORM (RGBA8 or BGRA8) with blit-source support.
-- Not with native HDR output (the picture holds PQ code values, which cannot be blended).
+- Window texture format 8-bit UNORM (RGBA8 or BGRA8) with blit-source support, or the game's own HDR picture (A2B10G10R10 with `hdr_native = 1`; see HDR below) on a GPU that can store to, filter and blit that format.
 
 If set-up fails (missing push descriptors, format support, pipeline or image creation, fence timeout, submit failure), the pass turns itself off for the session.
+
+## HDR
+
+Both HDR modes get made frames, in every mode of `frame_gen` (2x, Auto and 3x to 8x; `vk_framegen.c`, header comment):
+
+- `hdr = 1` alone (the SDR picture lifted to HDR10, `vk_hdr.c`): the window texture is the game's SDR picture, so the frames are made as in SDR, and every frame shown, made or the game's own, goes through the HDR pass.
+- `hdr_native = 1` (the game's own HDR picture, 3.2.0): the window texture holds Rec. 2020 PQ code values in A2B10G10R10. The history, the made-frame image and each set's frame images (Auto and 3x to 8x, including the copy of the game's own frame) are then A2B10G10R10 as well, so the picture keeps its 10 bits, and each frame is shown as the game's own HDR picture (`vk_present.c`, native HDR), by the present thread at 2x and by the display thread at Auto and 3x to 8x, which presents each set with the format the set was made in. The blend works on the PQ code values, which is as sound as blending sRGB's: both are perceptual codings. The comparisons in `fg_luma.comp` and `fg_synth.comp` (block matching's cost, what counts as moved, whether the two moved frames agree) first take each value to the SDR picture's scale, the sRGB code of its light over paper white (`hdr_game_nits`, `vk_hdr_game_nits`), so that their thresholds mean what they do in SDR. The shaders get this through their `pq` and `white` push constants.
+
+Where the GPU cannot use A2B10G10R10 this way (storage image, linear filtering, blit source and destination), no frame is made from the game's own HDR picture and the log says so once.
+
+To see it work, run with `hdr = 1`, `hdr_native = 1` and `frame_gen = 2x`, `auto` or `4x` on an HDR10 display. The log has `hdr: HDR10 swapchain` and then the set-up line (`frame generation 2x on`, `Auto on` or `4x on`, the last two with the number of sets) with `history RGB10A2 (the game's own HDR picture, PQ)` once the game's HDR picture starts (the line says `RGBA8` for an SDR picture, and appears again when the format changes, such as when the game switches between them). The 5 s `fg:` lines then show `made` frames and `shown` near the multiplier times `real` (at Auto and 3x to 8x the `frame interpolation` line shows the frames shown on time), as in SDR; the line `fg: native HDR picture: no made frames` no longer appears.
 
 ## When a made frame is skipped
 
 - No history: the first frame, after a hitch, a crop change, or after a skip for the reasons above.
 - Hitch: more than 100 ms since the previous game frame (loading, pause). The history starts again.
 - Crop change: the window texture crop size changed; images are rebuilt and the history starts again.
-- Over refresh: at 2x, 2 / interval exceeds the monitor refresh by more than 5% (60 Hz is assumed if the refresh is unknown); at a fixed multiplier, the display shows one frame per game frame.
+- Over refresh: at 2x, 2 / interval exceeds the monitor refresh by more than 5% (60 Hz is assumed if the refresh is unknown); at a fixed multiplier, the display shows one frame per game frame. Auto and 3x to 8x make as many frames as the display can show, so they make none only when it shows one a game frame.
 - Left out (Auto and 3x to 8x): the next set was already waiting when a made frame's turn came (the display thread is a set behind).
 
 A skipped frame is shown as the game's frame alone.
@@ -90,24 +113,25 @@ A skipped frame is shown as the game's frame alone.
 
 At 2x, every 5 seconds:
 
-`fg: 5.0 s: real R fps, shown S fps, made N (by AMD FSR 3.1 M); skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
+`fg: 5.0 s: real R fps, shown S fps, made N (by AMD FSR 3.1 M, K of them with the frames without their HUD); skipped: no history A, hitch B, over refresh C, crop D; real cut short E; late >2 ms F`
 
 - real: game frames per second.
 - shown: real plus made frames per second.
-- made: made frames in the period; by AMD FSR 3.1: those AMD's passes made (`frame_gen_by = fsr3`), the rest the built-in interpolation.
+- made: made frames in the period; by AMD FSR 3.1: those AMD's passes made (`frame_gen_by = fsr3`), the rest the built-in interpolation; K: those of M that had the frames without their HUD.
 - skipped: made frames not produced, by reason (see above).
 - real cut short: the game's frame was flipped before its half-interval wait ended because a newer frame was already waiting.
 - late >2 ms: the game's frame flipped more than 2 ms after its due time.
 
 With Auto and 3x to 8x, from the present thread:
 
-`fg: 5.0 s: real R fps, made N (M a second); game frames without made ones: no history A, hitch B, over refresh C, crop D`
+`fg: 5.0 s: real R fps, made N (M a second); game frames without made ones: no history A, hitch B, over refresh C, crop D; waited for a set W`
 
 and from the display thread, worded as Hookshot's line so the two logs compare directly:
 
 `fg: frame interpolation: N frames shown on time, L late (over 2 ms), S made ones left out (the game's next frame waiting); shown apart: <7 ms a, 7-9 b, 9-12 c, 12-17 d, 17-25 e, over 25 f`
 
-- on time and late: presented within 2 ms of the frame's due time, or later.
+- waited for a set: game frames whose set had to wait for the display thread to finish showing an older one (the present thread, and the game behind it, wait then).
+- on time and late: presented within 2 ms of the frame's due time, or later. After a held-up present the line's due time can be past, and the set's frames then go out at once and count as late, as in Hookshot.
 - left out: made frames not shown because the next set was already waiting.
 - shown apart: the time between two presents, counted by range.
 
@@ -119,6 +143,14 @@ The set-up line says the mode: `fg: frame generation Auto on (experimental): a f
 - Input latency: at 2x it is unchanged (the made frame is not newer than the real one); a fixed multiplier above 2x shows the game's frame up to (n - 1) / n of a frame time later; Auto one frame time later.
 - Extra GPU cost: a blit, luma, block matching and median pass per game frame, and a full-size synthesis pass per made frame.
 - Experimental: artifacts around fast or occluded motion are expected.
+
+## AMD Anti-Lag 2
+
+`antilag = 1` (`TOTK_ANTILAG=1`; Display > Frame rate > AMD Anti-Lag 2, off by default, experimental), independent of frame generation. Code: `runtime/vk_antilag.c`. The row is shown only where the device has `VK_AMD_anti_lag` with its `antiLag` feature. The extension is enabled whenever it is there, so the setting applies at once.
+
+On Linux, RADV has no `VK_AMD_anti_lag` of its own: Mesa ships it as the implicit layer `VK_LAYER_MESA_anti_lag`, which the Vulkan loader loads only with `ENABLE_LAYER_MESA_ANTI_LAG=1`. `vk_device.c` sets that variable before the instance when `antilag = 1` at start, unless the player set it either way (`DISABLE_LAYER_MESA_ANTI_LAG=1` still keeps the layer out). With `antilag = 0` at start the layer is not loaded, so on RADV turning Anti-Lag 2 on takes a restart, and its menu row appears only after one.
+
+Each game frame gives the driver two stages with the same index through `vkAntiLagUpdateAMD`: the input stage right after the game presented the frame before (`vk_backend.c` `vk_be_present`), where the driver may wait so the frame starts later, and the present stage right before that frame's present on the present thread (`present_main`). Each present job carries its frame's index. With frame generation only the game's own frame gives a present stage and the made frames give none, so the driver sees one present stage per game frame at every mode: at 2x `vk_fg_show` gives it right before the game frame's flip, and at Auto and 3x to 8x the set keeps the game frame's index from when it was recorded (`vk_fg_record`) and the display thread (`display_main`) gives it right before it presents the set's own game frame, under the present lock and only when the set is still live (the dead flag and the generation counter), as for the present itself. A set that is dropped or released gives no present stage. The game frame comes last in its set, so the stage lands after the made frames of that set have gone out. The log has `vk: AMD Anti-Lag 2: available (VK_AMD_anti_lag)`, `on` and `off` lines. The input stage is given on the thread that presents, which under asynchronous replay is up to a frame behind the game's simulation.
 
 ## Attribution
 

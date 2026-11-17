@@ -751,6 +751,7 @@ int vk_fsr3_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     vk_fsr3_io_out(cb, G.output.view, ov, ow, oh);   // FSR's picture into the game's output image
     vk_defer_view(iv), vk_defer_view(ov);
     vk_temporal_done(&t, w, h, ow);
+    vk_fsr3fi_note_picture(cb, out);   // the picture before the game's HUD, for AMD's frame interpolation
     G.frames++, G.temporal++, G.resets += t.reset;
     if (G.frames == 1 || G.frames % 1800 == 0)
         rt_log("fsr3: %llu frames, %llu temporal, %llu resets; %ux%u -> %ux%u, jitter %+.3f %+.3f px of %u phases",

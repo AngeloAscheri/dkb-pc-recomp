@@ -92,8 +92,24 @@ static void driver_cache_room(void) {
 }
 #endif
 
+// AMD Anti-Lag 2 on Linux (vk_antilag.c): RADV has no VK_AMD_anti_lag of its own; Mesa ships it as the implicit layer
+// VK_LAYER_MESA_anti_lag, which the loader loads only with ENABLE_LAYER_MESA_ANTI_LAG=1 (its manifest's
+// enable_environment), and without it the device lists no such extension and the setting has no row. It is set here,
+// before the instance, unless the player set it either way, so the setting can be turned on while the game runs.
+// DISABLE_LAYER_MESA_ANTI_LAG=1 still keeps the layer out. Other platforms have no such layer: nothing is set there.
+static void mesa_anti_lag_layer(void) {
+#ifdef __linux__
+    // Only for a player who starts with antilag = 1: the layer is chosen when the instance is made, so with antilag = 0
+    // at start it is not loaded at all (and Anti-Lag 2 is not offered on RADV until a restart with it on).
+    char cur[16];
+    if (cfg_bool("TOTK_ANTILAG") && !plat_getenv("ENABLE_LAYER_MESA_ANTI_LAG", cur, sizeof cur))
+        plat_setenv("ENABLE_LAYER_MESA_ANTI_LAG", "1");
+#endif
+}
+
 static int create_instance(void) {
     mesa_cache_beside_exe();
+    mesa_anti_lag_layer();
 #ifndef _WIN32
     driver_cache_room();
 #endif
@@ -296,6 +312,9 @@ typedef struct {
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pei;
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT lrs;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT dbuf;
+#ifdef VK_AMD_anti_lag
+    VkPhysicalDeviceAntiLagFeaturesAMD antilag;
+#endif
 } FeatureChain;
 
 static int create_device(void) {
@@ -383,6 +402,16 @@ static int create_device(void) {
                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
         }
     }
+#ifdef VK_AMD_anti_lag
+    // AMD Anti-Lag 2 (vk_antilag.c): enabled wherever the device has it, so the setting needs no restart; enabled alone
+    // it does nothing. Before the graphics pipeline library pair, which must stay the last two entries of the extension
+    // list and the last link of the chain for the n_ext -= 2 and *gpl_link = NULL below.
+    int has_antilag_ext = n_ext < 45 && has_ext(ep, ne, VK_AMD_ANTI_LAG_EXTENSION_NAME);
+    if (has_antilag_ext) {
+        ext[n_ext++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
+        CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
+    }
+#endif
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -391,10 +420,12 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
-
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
+#ifdef VK_AMD_anti_lag
+    g_vk.has_anti_lag = has_antilag_ext && c->antilag.antiLag;
+#endif
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (has_dbuf) {
@@ -544,6 +575,7 @@ int vk_init(void) {
 }
 
 void vk_shutdown(void) {
+    vk_antilag_release();   // its function and state belong to the device about to go
     plat_mutex_lock(&g_lock);
     if (g_ready) { destroy_all(); g_ready = 0; }
     plat_mutex_unlock(&g_lock);
