@@ -53,7 +53,7 @@ void perf_count(int kind);
 // TOTK_TRACE=perf: a contended acquire of one of the replay's shared locks waited ns (callers time only after a failed
 // try). The perf line counts the waits over 100 us per lock and the longest: slices of parallel passes stalled for
 // milliseconds now and then, and a lock held by another thread is one cause.
-enum { PERF_LOCK_TEXTURE, PERF_LOCK_POOL, PERF_LOCK_MIRROR, PERF_LOCK_N };
+enum { PERF_LOCK_TEXTURE, PERF_LOCK_POOL, PERF_LOCK_MIRROR, PERF_LOCK_GEN, PERF_LOCK_N };
 void perf_lock_wait(int lock, uint64_t ns);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
