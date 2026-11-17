@@ -193,6 +193,7 @@ int vk_antilag_available(void);
 uint64_t vk_antilag_frame(void);
 void vk_antilag_input(void);
 void vk_antilag_present(uint64_t frame);
+void vk_antilag_release(void);   // before the device goes (vk_shutdown): the next device starts it afresh
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
