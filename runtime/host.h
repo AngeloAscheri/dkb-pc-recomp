@@ -178,6 +178,9 @@ int mem_frozen(uint64_t a);                                // the 2 MiB region o
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
+int mem_guest_readable(uint64_t a, uint64_t n);            // 1 a read of [a, a+n) cannot fault (heap, mapped alias
+                                                           // pages), 0 it can, -1 not guest heap or alias memory;
+                                                           // from memory.c's own map, no system call
 void mem_touch(uint64_t a, uint64_t n);                    // commits the lazy guest heap (TOTK_HEAP_LAZY) over [a, a+n)
                                                            // before a kernel or driver access; no-op otherwise
 void mem_commit_report(const char *when);                  // logs where the process's commit goes (TOTK_MEM_REPORT)
