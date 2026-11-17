@@ -102,6 +102,7 @@ typedef struct VkExec {
     int cs_tail;                         // recorded right after the last dispatch or compute barrier, when only
                                          // compute work followed the barrier before it (vk_exec_barrier_cs; -1: none)
     int cs_barrier_at;                   // recorded right after the last compute barrier (-1: none)
+    int game_barrier;                    // the game asked for a barrier (OP_BARRIER) since the last dispatch
 
     // Feedback loops (vk.h VkCtx.feedback, vk_exec_draw.c feedback_prepare). Learned targets are attached in
     // ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; they stay in it across consecutive passes and go back to GENERAL at the next
@@ -156,6 +157,11 @@ void vk_exec_par_hazard(void);
 // that it was compute work.
 void vk_exec_barrier_cs(VkExec *ex);
 void vk_exec_note_dispatch(VkExec *ex);
+// The barrier before a direct dispatch: vk_exec_barrier_cs, or with TOTK_CS_BARRIER=game none at all when only compute
+// work came since the last barrier and the game asked for none since the last dispatch (1 returned). Counts both kinds
+// for the perf trace.
+int vk_exec_dispatch_barrier(VkExec *ex);
+void vk_exec_dispatch_bound(VkExec *ex);
 // As vk_exec_par_hazard for a draw whose effect depends on the order of draws across slices (a storage buffer write):
 // the pass's targets are not sliced again from the next pass on.
 void vk_exec_par_order_hazard(void);

@@ -291,7 +291,7 @@ static void state_reset(VkExec *ex) {
     ex->st_vmask[0] = ex->st_vmask[1] = ex->st_wmask[0] = ex->st_wmask[1] = 0xff;
     ex->depth_range[1] = 1.0f;
     vk_pipe_state_defaults(&ex->pipe);
-    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1, ex->game_barrier = 0;
 }
 
 // ---- render targets
@@ -785,16 +785,41 @@ void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 // barrier (barrier_to), which covers the dispatches too. Eglantine narrows the barrier before a dispatch as well
 // (yuzu-derived RasterizerVulkan::DispatchCompute: graphics, compute and transfer stages to the compute stage,
 // MEMORY_WRITE to MEMORY_READ). TOTK_CS_BARRIER=0: the full barrier every time; ab switches it with the A/B blocks.
+// TOTK_CS_BARRIER=game (experimental): a dispatch that follows only compute work gets no barrier at all unless the game
+// asked for one since the dispatch before. Maxwell runs consecutive compute launches without waiting for each other
+// unless a barrier orders them (docs/maxwell.md 1.9, DK3D: ordering is WaitForIdle), and the game's own barriers say
+// which of its dispatches depend on the one before. In terrain destruction the game's compute work is hundreds of
+// one-wave dispatches (RGP on an RX 9070 XT: 32 threads, about 22 us a wave), which a barrier before each keeps on one
+// compute unit at a time.
+static int cs_mode = -1;   // 0 full barriers, 1 compute barriers, 2 the two in the A/B blocks, 3 game
+static uint64_t cs_after_game, cs_after_none, cs_skipped, cs_bind_rec;   // perf: dispatches after compute work
 static int cs_barrier_on(void) {
-    static int mode = -1;
-    if (mode < 0) {
-        mode = rt_knob("CS_BARRIER", "1");
-        rt_log("vk: consecutive dispatches are ordered by %s (TOTK_CS_BARRIER=%s)",
-               mode == 2 ? "compute or full barriers in the A/B blocks" : mode ? "compute barriers" : "full barriers",
-               mode == 2 ? "ab" : mode ? "1" : "0");
+    if (cs_mode < 0) {
+        const char *e = cfg_get("TOTK_CS_BARRIER");
+        cs_mode = e && !strcmp(e, "game") ? 3 : rt_knob("CS_BARRIER", "1");
+        static const char *const how[] = {"full barriers", "compute barriers", "compute or full barriers in the A/B blocks",
+                                          "the game's barriers alone (experimental)"};
+        static const char *const val[] = {"0", "1", "ab", "game"};
+        rt_log("vk: consecutive dispatches are ordered by %s (TOTK_CS_BARRIER=%s)", how[cs_mode], val[cs_mode]);
     }
-    return RT_KNOB_ON(mode);
+    return cs_mode == 3 ? 1 : RT_KNOB_ON(cs_mode);
 }
+
+int vk_exec_dispatch_barrier(VkExec *ex) {
+    int after_cs = !ex->in_pass && !ex->nfbl && ex->cs_tail == ex->recorded, asked = ex->game_barrier;
+    ex->game_barrier = 0;
+    if (after_cs) {
+        if (asked) cs_after_game++;
+        else cs_after_none++;
+        if (!asked && cs_barrier_on() && cs_mode == 3) return cs_skipped++, 1;
+    }
+    vk_exec_barrier_cs(ex);
+    return 0;
+}
+
+// op_dispatch, with no barrier before the dispatch (vk_exec_dispatch_barrier): its bindings recorded commands (copies),
+// which the dispatch reads, so a barrier goes between them after all.
+void vk_exec_dispatch_bound(VkExec *ex) { cs_bind_rec++, vk_exec_barrier(ex); }
 
 void vk_exec_barrier_cs(VkExec *ex) {
     if (ex->in_pass || ex->nfbl || ex->cs_tail != ex->recorded || !cs_barrier_on()) {
@@ -1153,7 +1178,7 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     split_draws = 0;
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
-    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1, ex->game_barrier = 0;
     ex->dirty = VK_EXEC_DIRTY_ALL;
     vk_exec_draw_new_cb(ex);
     n_parts++;
@@ -1403,7 +1428,7 @@ static void par_job(void *arg) {
     par_walk(ex, P.from, p->cut, 1);
     // The command buffer starts as the replay thread's do (record_impl); every image is in GENERAL: the part before
     // ends with a full barrier, the replay thread's (par_join) or a helper's (below).
-    ex->recorded = 0, ex->in_pass = 0, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
+    ex->recorded = 0, ex->in_pass = 0, ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1, ex->game_barrier = 0;
     ex->nfbl = 0, ex->fbl_mask = 0, ex->fb_dirty = 0, ex->fb_fs = NULL;
     memcpy(&p->S, ex, sizeof p->S);
     p->state_ns = kern_now_ns() - t0;
@@ -1689,7 +1714,7 @@ static const op_hdr *par_join(VkExec *ex, const op_hdr *h) {
         // on the command buffer, no memo of the state, no barrier to rely on. par_check compares at the end.
         vk_spec_cb_drop((int)i);
         PW[i].n = 0;
-        ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
+        ex->dirty = VK_EXEC_DIRTY_ALL, ex->rt_resolved = 0, ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1, ex->game_barrier = 0;
         ex->nfbl = 0, ex->fbl_mask = 0, ex->fb_dirty = 0, ex->fb_fs = NULL;
         vk_exec_draw_rebase(ex);
         P.chk_frame = vk_exec_frame;
@@ -2260,6 +2285,11 @@ static void par_notes(int s0, int s1, int front);
 
 static void par_flush(VkExec *ex) {
     if (!ex) {   // TOTK_TRACE=perf (record_impl): what was sliced since the last line
+        rt_log("perf: dispatches after compute work alone: %llu with a barrier of the game before them, %llu without one; "
+               "%llu recorded with no barrier (TOTK_CS_BARRIER=game), %llu of those after copies of their bindings",
+               (unsigned long long)cs_after_game, (unsigned long long)cs_after_none, (unsigned long long)cs_skipped,
+               (unsigned long long)cs_bind_rec);
+        cs_after_game = cs_after_none = cs_skipped = cs_bind_rec = 0;
         if (par_mode > 0)
             rt_log("perf: sliced passes %llu with %llu slices and %llu draws; %llu passes not sliced for want of "
                    "inherited queries", (unsigned long long)par_passes, (unsigned long long)par_slices,
@@ -2670,7 +2700,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_RT: set_rt(ex, a); break;
         case OP_CLEAR_COLOR: clear_color(ex, a); break;
         case OP_CLEAR_DS: clear_ds(ex, a); break;
-        case OP_BARRIER: vk_exec_barrier_cs(ex); break;   // between dispatches, a compute barrier
+        case OP_BARRIER: vk_exec_barrier_cs(ex), ex->game_barrier = 1; break;   // between dispatches, a compute barrier
         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
             if (h->op == OP_DRAW_IDX && merge_walk(ex, &h)) continue;
@@ -2718,7 +2748,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     ex->dirty = VK_EXEC_DIRTY_ALL;
     ex->rt_resolved = 0;   // images may have changed since the last command buffer
     ex->nviews = 0;
-    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1;
+    ex->barrier_at = ex->cs_tail = ex->cs_barrier_at = -1, ex->game_barrier = 0;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
     split_draws = part_start = 0;

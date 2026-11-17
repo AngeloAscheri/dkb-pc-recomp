@@ -4542,7 +4542,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
-    vk_exec_barrier_cs(ex);   // ends the pass; earlier writes are visible to the shader (a compute barrier after a dispatch)
+    int unordered = vk_exec_dispatch_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+    int bound_at = ex->recorded;
     // DLSS's one-time warm-up (vk_dlss.c vk_dlss_warm) records NGX's own work into the command buffer, so it goes before
     // the dispatch's binds, and the bound state is forgotten when it recorded. The replay thread's copy only: a
     // TOTK_REPLAY_PAR helper translating a dispatch leaves it to the replay thread.
@@ -4565,6 +4566,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         dc->twin_dispatch = 0;
         dlss = 0;
     }
+    if (unordered && ex->recorded != bound_at) vk_exec_dispatch_bound(ex);   // the bindings' copies before the shader
     if (!blit && !dlss) vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     ex->recorded++;
     if (!blit && !dlss) vk_exec_note_dispatch(ex);   // only compute work since the barrier above
