@@ -145,8 +145,9 @@ in the first cave of Ingot Isle at 1920x1080, the game's own upscaler, frame gen
 `DKB_WB_LAZY=1` (`wb_lazy = 1`, Linux, off by default) does that (`vk_memory.c`, "lazy write-back"): a storage
 buffer a shader wrote is not copied back at its fence; its pages are closed, and the first CPU access to one copies
 what it is owed and opens it. At the start of Ingot Isle on 3.2.0 (17 November, `bananza` 9ed1784 with it, RX 7900 XTX,
-Mesa 26.2.7, the scene at full size, FSR 4, frame generation Auto, HDR), three runs each way in turn: 52.7, 55.1 and
-51.9 fps off, 55.7, 57.6 and 59.1 on; render busy 18.42, 17.79 and 18.44 ms off, 14.52, 13.40 and 12.23 ms on; about
-12,000 pages stay closed and 14 MiB a frame is left uncopied, with 4 to 8 pages touched every 60 frames. With HDR off
-one pair ran at 56.8 and 56.7 fps, with render busy 17.49 and 13.60 ms. In the crater scene the game already holds
-60 fps, and it made no difference there. It stays off by default until more of the game has been played with it.
+Mesa 26.2.7, the default settings: the game's own upscaler from 1280x720 to 1920x1080, frame generation off, SDR),
+four runs each way in turn: render busy 18.42, 17.79, 18.44 and 17.49 ms off, 14.52, 13.40, 12.23 and 13.60 ms on,
+lower in every pair; 52.7, 55.1, 51.9 and 56.8 fps off, 55.7, 57.6, 59.1 and 56.7 on, higher in three pairs of four.
+About 12,000 pages stay closed and 14 MiB a frame is left uncopied, with 4 to 8 pages touched every 60 frames. In the
+crater scene the game already holds 60 fps, and it made no difference there. It stays off by default until more of
+the game has been played with it.
