@@ -4542,8 +4542,10 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
-    int unordered = vk_exec_dispatch_barrier(ex);   // ends the pass; earlier writes are visible to the shader
-    int bound_at = ex->recorded;
+    // Ends the pass; earlier writes are visible to the shader. With TOTK_CS_BARRIER=game a dispatch the game left
+    // unordered gets none: its bindings below record only state (pipeline, descriptors, push constants); the mirror
+    // syncs they ask for go into the part's prologue, and a depth twin's copies carry their own barriers (twin_update).
+    vk_exec_dispatch_barrier(ex);
     // DLSS's one-time warm-up (vk_dlss.c vk_dlss_warm) records NGX's own work into the command buffer, so it goes before
     // the dispatch's binds, and the bound state is forgotten when it recorded. The replay thread's copy only: a
     // TOTK_REPLAY_PAR helper translating a dispatch leaves it to the replay thread.
@@ -4566,7 +4568,6 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         dc->twin_dispatch = 0;
         dlss = 0;
     }
-    if (unordered && ex->recorded != bound_at) vk_exec_dispatch_bound(ex);   // the bindings' copies before the shader
     if (!blit && !dlss) vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     ex->recorded++;
     if (!blit && !dlss) vk_exec_note_dispatch(ex);   // only compute work since the barrier above

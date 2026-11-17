@@ -161,7 +161,6 @@ void vk_exec_note_dispatch(VkExec *ex);
 // work came since the last barrier and the game asked for none since the last dispatch (1 returned). Counts both kinds
 // for the perf trace.
 int vk_exec_dispatch_barrier(VkExec *ex);
-void vk_exec_dispatch_bound(VkExec *ex);
 // As vk_exec_par_hazard for a draw whose effect depends on the order of draws across slices (a storage buffer write):
 // the pass's targets are not sliced again from the next pass on.
 void vk_exec_par_order_hazard(void);

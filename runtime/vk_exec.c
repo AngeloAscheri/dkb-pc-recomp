@@ -792,7 +792,7 @@ void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 // one-wave dispatches (RGP on an RX 9070 XT: 32 threads, about 22 us a wave), which a barrier before each keeps on one
 // compute unit at a time.
 static int cs_mode = -1;   // 0 full barriers, 1 compute barriers, 2 the two in the A/B blocks, 3 game
-static uint64_t cs_after_game, cs_after_none, cs_skipped, cs_bind_rec;   // perf: dispatches after compute work
+static uint64_t cs_after_game, cs_after_none, cs_skipped;   // perf: dispatches after compute work
 static int cs_barrier_on(void) {
     if (cs_mode < 0) {
         const char *e = cfg_get("TOTK_CS_BARRIER");
@@ -816,10 +816,6 @@ int vk_exec_dispatch_barrier(VkExec *ex) {
     vk_exec_barrier_cs(ex);
     return 0;
 }
-
-// op_dispatch, with no barrier before the dispatch (vk_exec_dispatch_barrier): its bindings recorded commands (copies),
-// which the dispatch reads, so a barrier goes between them after all.
-void vk_exec_dispatch_bound(VkExec *ex) { cs_bind_rec++, vk_exec_barrier(ex); }
 
 void vk_exec_barrier_cs(VkExec *ex) {
     if (ex->in_pass || ex->nfbl || ex->cs_tail != ex->recorded || !cs_barrier_on()) {
@@ -2286,10 +2282,9 @@ static void par_notes(int s0, int s1, int front);
 static void par_flush(VkExec *ex) {
     if (!ex) {   // TOTK_TRACE=perf (record_impl): what was sliced since the last line
         rt_log("perf: dispatches after compute work alone: %llu with a barrier of the game before them, %llu without one; "
-               "%llu recorded with no barrier (TOTK_CS_BARRIER=game), %llu of those after copies of their bindings",
-               (unsigned long long)cs_after_game, (unsigned long long)cs_after_none, (unsigned long long)cs_skipped,
-               (unsigned long long)cs_bind_rec);
-        cs_after_game = cs_after_none = cs_skipped = cs_bind_rec = 0;
+               "%llu recorded with no barrier (TOTK_CS_BARRIER=game)",
+               (unsigned long long)cs_after_game, (unsigned long long)cs_after_none, (unsigned long long)cs_skipped);
+        cs_after_game = cs_after_none = cs_skipped = 0;
         if (par_mode > 0)
             rt_log("perf: sliced passes %llu with %llu slices and %llu draws; %llu passes not sliced for want of "
                    "inherited queries", (unsigned long long)par_passes, (unsigned long long)par_slices,
