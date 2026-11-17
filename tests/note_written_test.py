@@ -33,6 +33,7 @@ static DrawCtx ctx;
 static VkExec exec = {&ctx};
 typedef struct VkBuffer_T *VkBuffer;
 #define VK_NULL_HANDLE NULL
+#define VK_WB_LAZY (1ull << 63)   // vk.h: or-ed into a range's size; it travels in the written list only
 typedef struct { uint64_t addr, size; VkBuffer buf; } Range;
 typedef struct {
     Range *written;
@@ -85,7 +86,8 @@ static void check(const char *name) {
     int same = res.nwritten == nmodel && npending == nmodel;
     for (int i = 0; same && i < nmodel; i++)
         same = res.written[i].addr == model[i].addr && res.written[i].size == model[i].size &&
-               res.written[i].buf == model[i].buf && pending[i].addr == model[i].addr && pending[i].size == model[i].size;
+               res.written[i].buf == model[i].buf && pending[i].addr == model[i].addr &&
+               pending[i].size == (model[i].size & ~VK_WB_LAZY);   // the flag stays in the written list
     int table = res.written_slots && !(res.written_slots & (res.written_slots - 1)) &&
                 (uint32_t)res.nwritten < res.written_slots;
     if (!same || !table) failures++, fprintf(stderr, "FAIL %s: %d ranges, %d in the model\n", name, res.nwritten, nmodel);
@@ -155,6 +157,15 @@ int main(void) {
     for (uint64_t i = 1; i <= 2000; i++) note(i * 0x100, 0x40);
     for (uint64_t i = 1; i <= 2000; i++) note(i * 0x100, 0x40);
     check("many addresses under one size");
+    reset();
+
+    // A shader's storage write carries VK_WB_LAZY in its size: it stays in the written list, which keeps it apart from
+    // the same range written another way, and never reaches the pending list.
+    note(0x7000, 0x80 | VK_WB_LAZY), note(0x7000, 0x80), note(0x7000, 0x80 | VK_WB_LAZY);
+    if (res.nwritten != 2 || res.written[0].size != (0x80 | VK_WB_LAZY) || res.written[1].size != 0x80)
+        failures++, fprintf(stderr, "FAIL a storage write's flag: the written list lost it or merged the two\n");
+    if (npending != 2 || pending[0].size != 0x80 || pending[1].size != 0x80)
+        failures++, fprintf(stderr, "FAIL a storage write's flag reached the pending list\n");
     reset();
 
     printf("note_written: %u failures\n", failures);

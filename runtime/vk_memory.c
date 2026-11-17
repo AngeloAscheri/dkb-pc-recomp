@@ -1027,8 +1027,11 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&gen_lock);
 }
 
+static void wb_open(uint64_t a, uint64_t n);
+
 int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size) { *now = since; return 0; }
+    wb_open(addr, size);   // the caller reads the range next: the lazy write-back's pages get their bytes first
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     gen_lock_x();
     uint32_t g = ++gen_now;
@@ -1101,6 +1104,7 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
 
 int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now) {
     if (!size) { *now = since; return 0; }
+    wb_open(addr, size);
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     if (!epoch || r1 >= SNAP_REGIONS) return vk_mem_changed(addr, size, since, now);
@@ -1262,7 +1266,10 @@ static void shadow_touch(PoolRec *r) {
 }
 
 // vk_pool_fini, after the pool left the index: off the touched list before its record goes.
+static void wb_open(uint64_t a, uint64_t n);
+
 static void shadow_forget(PoolRec *r) {
+    wb_open(r->import_lo, r->import_hi - r->import_lo);   // what its sealed pages are owed, while the shadow is there
     plat_mutex_lock(&shadow_lock);
     for (int i = 0; i < nstouch; i++)
         if (stouch[i] == r) { stouch[i] = stouch[--nstouch]; break; }
@@ -1463,13 +1470,171 @@ static void written_batch(const VkGpuWrite *w, int n) {
     }
 }
 
-// One submission's GPU writes with the shadow storage. A heavy Bananza frame reports about 4,400 of them (a thousand
-// 15,000-byte storage buffers among them, 15 MiB in all), and one vk_gpu_written per range cost the completion thread
-// 6.7 ms a frame in the cave after the tutorial: every call searched the whole pending list, took four locks, and its
-// copy faulted once per write-watched page. The game's threads wait for these fences, so that time was frame time. Here
-// the ranges are sorted once, their pages are thawed and marked written in runs (plat_mem_prewrite), the copies run
-// under one hold of the locks, and one pass over the pending list removes them. Without the shadow storage the ranges
-// are stamped in batches (written_batch).
+// ---- lazy write-back (TOTK_WB_LAZY=1, off by default; Linux)
+// Most of what a frame's fences copy back to guest memory is never read there: of the 15 MiB a frame in the cave after
+// Bananza's tutorial, 14 are a thousand storage buffers that compute shaders write and later GPU work reads. With the
+// lazy write-back on, a range the replay marked VK_WB_LAZY is not copied at its fence. Its pages are sealed instead
+// (plat_mem_seal: no access), with the byte ranges owed to each page kept here, and the first access to a sealed page,
+// a read or a write from any thread, copies that page's ranges from the shadow and opens it (wb_fault, from the
+// platform's fault handler). So the guest sees the same bytes as with the copy at the fence, later GPU writes to a
+// page still sealed cost nothing, and a page somebody touches is not sealed again for a while: one second after the
+// first touch, doubling with each one up to about a minute, so a buffer the game reads every frame goes back to the
+// copy at the fence after one fault.
+// - What a sealed page owes is read from the shadow at the touch, not at the fence: the bytes may be those of a later
+//   GPU write than the one whose fence sealed the page, as on the console, where the two share the memory.
+// - A page's own lock (wb_lock) is a leaf: the fault handler takes nothing else, and nothing touches guest memory
+//   under it except the copy into a page it has just opened. Regions with sealed pages are never frozen
+//   (mem_freeze_exclude), so that copy cannot fault.
+// - A kernel write into guest memory fails on a sealed page instead of faulting; file reads thaw their buffer first
+//   (mem_thaw), and mem_thaw opens the sealed pages of its range (wb_open, through mem_thaw_hook). So do the checks
+//   that ask whether a range changed (vk_mem_changed, vk_mem_changed_snap): their caller reads the range next.
+// - A sealed page is not stamped as written at the fence: its guest bytes did not change. The copy at the touch writes
+//   them, which the write watch reports like any other write.
+// - Not covered: a kernel read from a sealed page (the game passing such a buffer to a file write), which fails. Only
+//   storage buffers written by shaders are ever sealed.
+#define WB_SEGS 6
+enum { WB_EMPTY, WB_SEALED, WB_OPEN };
+typedef struct {
+    uint64_t page;
+    const uint8_t *src;          // the shadow's bytes of this page, while sealed
+    uint32_t open_until;         // WB_OPEN: plat_now_ms before which the page is not sealed again
+    uint16_t seg[WB_SEGS][2];    // WB_SEALED: byte ranges [lo, hi) of the page owed to it, merged and sorted
+    uint8_t nseg, state, backoff, retries;
+} WbPage;
+static PlatMutex wb_lock = PLAT_MUTEX_INIT;   // leaf
+static WbPage *wbp;                           // wb_lock: open addressing by page
+static uint32_t wbp_cap, wbp_used;            // wb_lock
+static volatile int32_t wb_nsealed;           // pages sealed now
+static int wb_on = -1;
+static uint64_t wb_seals, wb_touches, wb_skipped, wb_touch_bytes;   // wb_lock: since the last log
+
+static uint32_t wb_slot(uint64_t page) { return (uint32_t)(((page >> 12) * 0x9E3779B97F4A7C15ull) >> 40); }
+
+// wb_lock held. NULL when the page has no entry and insert is 0.
+static WbPage *wb_find(uint64_t page, int insert) {
+    if (!wbp_cap) {
+        if (!insert) return NULL;
+        wbp_cap = 1u << 14;
+        wbp = calloc(wbp_cap, sizeof *wbp);
+        if (!wbp) rt_fatal("vk: out of memory for the lazy write-back's pages");
+    }
+    for (uint32_t at = wb_slot(page) & (wbp_cap - 1);; at = (at + 1) & (wbp_cap - 1)) {
+        if (wbp[at].state != WB_EMPTY && wbp[at].page == page) return &wbp[at];
+        if (wbp[at].state == WB_EMPTY) {
+            if (!insert) return NULL;
+            if (wbp_used * 2 >= wbp_cap) break;
+            wbp_used++;
+            wbp[at] = (WbPage){.page = page};
+            return &wbp[at];
+        }
+    }
+    WbPage *old = wbp;   // half full: twice the table (not in the fault handler, which never inserts)
+    uint32_t cap = wbp_cap;
+    wbp_cap *= 2, wbp_used = 0;
+    wbp = calloc(wbp_cap, sizeof *wbp);
+    if (!wbp) rt_fatal("vk: out of memory for the lazy write-back's pages");
+    for (uint32_t i = 0; i < cap; i++)
+        if (old[i].state != WB_EMPTY) {
+            WbPage *e = wb_find(old[i].page, 1);
+            uint64_t pg = e->page;
+            *e = old[i], e->page = pg;
+        }
+    free(old);
+    return wb_find(page, insert);
+}
+
+// wb_lock held: the page gets what it is owed and is open for a while.
+static void wb_open_page(WbPage *e) {
+    if (e->state != WB_SEALED) return;
+    plat_mem_seal(e->page, 0x1000, 0);
+    for (int i = 0; i < e->nseg; i++) {
+        memcpy((void *)(uintptr_t)(e->page + e->seg[i][0]), e->src + e->seg[i][0],
+               (size_t)(e->seg[i][1] - e->seg[i][0]));
+        wb_touch_bytes += (uint64_t)(e->seg[i][1] - e->seg[i][0]);
+    }
+    e->state = WB_OPEN, e->nseg = 0, e->retries = 0;
+    e->open_until = (uint32_t)plat_now_ms() + (1000u << e->backoff);
+    if (e->backoff < 6) e->backoff++;
+    wb_touches++;
+    plat_dec32(&wb_nsealed);
+}
+
+// The platform's access hook: any thread, in its fault handler. 1 retries the access.
+static int wb_fault(uint64_t addr) {
+    if (!__atomic_load_n(&wb_nsealed, __ATOMIC_ACQUIRE) && !wbp_cap) return 0;
+    int handled = 0;
+    plat_mutex_lock(&wb_lock);
+    WbPage *e = wb_find(addr & ~0xfffull, 0);
+    if (e && e->state == WB_SEALED) wb_open_page(e), handled = 1;
+    // Another thread opened the page between this one's fault and its turn here: the access only needs its retry. A
+    // fault of another kind on a page that was sealed once gets a few retries, then goes on to the crash handler.
+    // The page is opened again on the way: an access must never find a page of ours closed with nothing owed.
+    else if (e && e->state == WB_OPEN && e->retries < 8) plat_mem_seal(e->page, 0x1000, 0), e->retries++, handled = 1;
+    plat_mutex_unlock(&wb_lock);
+    return handled;
+}
+
+// Opens the sealed pages of [a, a+n): before a kernel write there, before a caller reads the range for a comparison,
+// and before a pool's shadow goes away.
+static void wb_open(uint64_t a, uint64_t n) {
+    if (!n || !__atomic_load_n(&wb_nsealed, __ATOMIC_ACQUIRE)) return;
+    uint64_t lo = a & ~0xfffull, hi = (a + n + 0xfff) & ~0xfffull;
+    plat_mutex_lock(&wb_lock);
+    if ((hi - lo) >> 12 > wbp_cap) {   // a large range: the table is the shorter walk
+        for (uint32_t i = 0; i < wbp_cap; i++)
+            if (wbp[i].state == WB_SEALED && wbp[i].page >= lo && wbp[i].page < hi) wb_open_page(&wbp[i]);
+    } else {
+        for (uint64_t pg = lo; pg < hi; pg += 0x1000) {
+            WbPage *e = wb_find(pg, 0);
+            if (e) wb_open_page(e);
+        }
+    }
+    plat_mutex_unlock(&wb_lock);
+}
+
+static int wb_lazy_on(void) {
+    if (wb_on < 0) {
+        wb_on = shadow_on && cfg_bool("TOTK_WB_LAZY") && plat_mem_access_hook(wb_fault);
+        if (wb_on) mem_thaw_hook(wb_open);
+        if (cfg_bool("TOTK_WB_LAZY"))
+            rt_log("mem: lazy write-back %s (TOTK_WB_LAZY=1)",
+                   wb_on ? "on: a storage buffer a shader wrote is copied back to guest memory at the first CPU access "
+                           "to its pages"
+                         : "not available here: every GPU write is copied back at its fence");
+    }
+    return wb_on;
+}
+
+// wb_lock held: [lo, hi) of the guest page e->page joins what the page is owed. 0 when the page has no room for it.
+static int wb_owe(WbPage *e, uint32_t lo, uint32_t hi) {
+    int i = 0;
+    while (i < e->nseg && e->seg[i][1] < lo) i++;
+    if (i < e->nseg && e->seg[i][0] <= hi) {   // touches or overlaps seg i, and maybe the ones after it
+        if (lo < e->seg[i][0]) e->seg[i][0] = (uint16_t)lo;
+        int j = i;
+        while (j + 1 < e->nseg && e->seg[j + 1][0] <= hi) j++;
+        if (e->seg[j][1] > hi) hi = e->seg[j][1];
+        e->seg[i][1] = (uint16_t)hi;
+        memmove(&e->seg[i + 1], &e->seg[j + 1], (size_t)(e->nseg - 1 - j) * sizeof e->seg[0]);
+        e->nseg = (uint8_t)(e->nseg - (j - i));
+        return 1;
+    }
+    if (e->nseg == WB_SEGS) return 0;
+    memmove(&e->seg[i + 1], &e->seg[i], (size_t)(e->nseg - i) * sizeof e->seg[0]);
+    e->seg[i][0] = (uint16_t)lo, e->seg[i][1] = (uint16_t)hi, e->nseg++;
+    return 1;
+}
+
+// One submission's GPU writes. A heavy Bananza frame reports about 4,400 of them (a thousand 15,000-byte storage
+// buffers among them, 15 MiB in all), and one vk_gpu_written per range cost the completion thread 6.7 ms a frame in the
+// cave after the tutorial: every call searched the whole pending list, took four locks, and its copy faulted once per
+// write-watched page. The game's threads wait for these fences, so that time was frame time. Here the ranges are
+// sorted once, their pages are thawed and marked written in runs (plat_mem_prewrite), the copies run under one hold of
+// the locks, and one pass over the pending list removes them. With the lazy write-back, the pages of a VK_WB_LAZY
+// range that nobody touched lately are sealed in place of their copy. Without the shadow storage each range goes
+// through vk_gpu_written_into as before.
+typedef struct { uint64_t lo, hi; const uint8_t *src; } WbCopy;   // src: the shadow's byte for guest address lo
+
 static int wb_cmp(const void *x, const void *y) {
     const uint64_t *a = x, *b = y;
     return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1];
@@ -1481,50 +1646,102 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
         return;
     }
     if (n < 4) {
-        for (int i = 0; i < n; i++) vk_gpu_written_into(in[i].addr, in[i].size, in[i].buf);
+        for (int i = 0; i < n; i++) vk_gpu_written_into(in[i].addr, in[i].size & ~VK_WB_LAZY, in[i].buf);
         return;
     }
-    uint64_t (*w)[2] = malloc((size_t)n * sizeof *w);
+    int lazy = wb_lazy_on();
+    uint64_t (*w)[3] = malloc((size_t)n * sizeof *w);   // {lo, hi, lazy}
     uint8_t *gone = calloc((size_t)n, 1);
+    WbCopy *cp = NULL;
+    uint64_t *seal = NULL;
+    int ncp = 0, ccp = 0, nseal = 0, cseal = 0;
     if (!w || !gone) rt_fatal("vk: out of memory for a write-back batch");
     int m = 0;
-    for (int i = 0; i < n; i++)
-        if (in[i].size) w[m][0] = in[i].addr, w[m][1] = in[i].addr + in[i].size, m++;   // {lo, hi}
+    for (int i = 0; i < n; i++) {
+        uint64_t size = in[i].size & ~VK_WB_LAZY;
+        if (!size) continue;
+        w[m][0] = in[i].addr, w[m][1] = in[i].addr + size, w[m][2] = lazy && (in[i].size & VK_WB_LAZY);
+        if (w[m][2]) mem_freeze_exclude(w[m][0], size);   // before any lock here: it takes memory.c's
+        m++;
+    }
     qsort(w, (size_t)m, sizeof *w, wb_cmp);
     pool_lock_shared();
     plat_mutex_lock(&shadow_lock);
-    // Look each range's pool up first: only a range the copy below takes (the pool has a shadow map covering it) has
-    // its pages thawed and prewritten, so a range outside every pool leaves its pages as they are.
-    PoolRec **pr = calloc((size_t)n, sizeof *pr);
-    if (!pr) rt_fatal("vk: out of memory for a write-back batch");
+    // Which bytes are copied now (cp) and which pages are sealed (seal, ascending as w is).
     PoolRec *r = NULL;
+    uint32_t now = lazy ? (uint32_t)plat_now_ms() : 0;
+    if (lazy) plat_mutex_lock(&wb_lock);
     for (int i = 0; i < m; i++) {
-        uint64_t a = w[i][0], size = w[i][1] - a;
-        if (!r || a < r->import_lo || w[i][1] > r->import_hi) {   // sorted: the last pool usually holds the next range
-            const pidx_ent *e = pidx_find(&pool_index, a, size);
+        uint64_t a = w[i][0], b = w[i][1];
+        if (!r || a < r->import_lo || b > r->import_hi) {   // sorted: the last pool usually holds the next range
+            const pidx_ent *e = pidx_find(&pool_index, a, b - a);
             r = e ? e->buf : NULL;
         }
-        if (r && r->smap && a >= r->import_lo && w[i][1] <= r->import_hi) pr[i] = r;
-    }
-    // Runs of pages the copies will write: neighbours and ranges on one page become one thaw and one prewrite.
-    for (int i = 0; i < m;) {
-        if (!pr[i]) {
-            i++;
+        if (!r || !r->smap || a < r->import_lo || b > r->import_hi) continue;
+        const uint8_t *src = r->smap + (a - r->import_lo);
+        if (!w[i][2]) {
+            if (ncp == ccp) grow((void **)&cp, &ccp, sizeof *cp);
+            cp[ncp++] = (WbCopy){a, b, src};
             continue;
         }
-        uint64_t lo = w[i][0] & ~0xfffull, hi = (w[i][1] + 0xfff) & ~0xfffull;
+        for (uint64_t pg = a & ~0xfffull; pg < b; pg += 0x1000) {
+            uint64_t lo = pg > a ? pg : a, hi = pg + 0x1000 < b ? pg + 0x1000 : b;
+            WbPage *e = wb_find(pg, 1);
+            const uint8_t *psrc = r->smap + (pg - r->import_lo);
+            if (e->state == WB_SEALED && e->src != psrc) wb_open_page(e);   // the page's pool changed under it
+            int sealed = e->state == WB_SEALED && wb_owe(e, (uint32_t)(lo - pg), (uint32_t)(hi - pg));
+            // too many pieces: copied from now on
+            if (e->state == WB_SEALED && !sealed) wb_open_page(e), e->backoff = 6;
+            if (!sealed && (e->state == WB_EMPTY || (int32_t)(now - e->open_until) >= 0)) {
+                e->state = WB_SEALED, e->src = psrc, e->nseg = 0, e->retries = 0;
+                plat_inc32(&wb_nsealed);
+                wb_owe(e, (uint32_t)(lo - pg), (uint32_t)(hi - pg));
+                if (!nseal || seal[nseal - 1] != pg) {
+                    if (nseal == cseal) grow((void **)&seal, &cseal, sizeof *seal);
+                    seal[nseal++] = pg;
+                }
+                sealed = 1;
+            }
+            if (sealed) { wb_skipped += hi - lo; continue; }
+            if (ncp == ccp) grow((void **)&cp, &ccp, sizeof *cp);
+            cp[ncp++] = (WbCopy){lo, hi, src + (lo - a)};
+        }
+    }
+    if (lazy) {
+        // A page sealed above and opened again by a later range of this batch (too many pieces) stays open.
+        int live = 0;
+        for (int i = 0; i < nseal; i++) {
+            WbPage *e = wb_find(seal[i], 0);
+            if (e && e->state == WB_SEALED) seal[live++] = seal[i];
+        }
+        nseal = live;
+        for (int i = 0; i < nseal;) {   // one protection change per run of new pages
+            int j = i + 1;
+            while (j < nseal && seal[j] == seal[j - 1] + 0x1000) j++;
+            if (plat_mem_seal(seal[i], (uint64_t)(j - i) << 12, 1)) wb_seals += (uint64_t)(j - i);
+            else   // refused (the kernel's limit of mappings, say): these pages are copied now and left alone for good
+                for (int k = i; k < j; k++) {
+                    WbPage *e = wb_find(seal[k], 0);
+                    wb_open_page(e), e->backoff = 6, e->open_until = now + (1u << 30);
+                }
+            i = j;
+        }
+        plat_mutex_unlock(&wb_lock);
+    }
+    // The copies: neighbours and pieces on one page become one thaw and one prewrite. A sealed page among them (a
+    // piece that is not lazy on a page another range sealed) is opened by mem_thaw's hook.
+    for (int i = 0; i < ncp;) {
+        uint64_t lo = cp[i].lo & ~0xfffull, hi = (cp[i].hi + 0xfff) & ~0xfffull;
         int j = i + 1;
-        for (; j < m && (!pr[j] || (w[j][0] & ~0xfffull) <= hi); j++)
-            if (pr[j] && ((w[j][1] + 0xfff) & ~0xfffull) > hi) hi = (w[j][1] + 0xfff) & ~0xfffull;
+        for (; j < ncp && (cp[j].lo & ~0xfffull) <= hi; j++)
+            if (((cp[j].hi + 0xfff) & ~0xfffull) > hi) hi = (cp[j].hi + 0xfff) & ~0xfffull;
         mem_thaw(lo, hi - lo);
         plat_mem_prewrite(lo, hi - lo);
         i = j;
     }
-    for (int i = 0; i < m; i++) {
-        if (!pr[i]) continue;
-        uint64_t a = w[i][0], size = w[i][1] - a;
-        memcpy((void *)(uintptr_t)a, pr[i]->smap + (a - pr[i]->import_lo), size);
-        s_wb_bytes += size;
+    for (int i = 0; i < ncp; i++) {
+        memcpy((void *)(uintptr_t)cp[i].lo, cp[i].src, (size_t)(cp[i].hi - cp[i].lo));
+        s_wb_bytes += cp[i].hi - cp[i].lo;
     }
     // Each range leaves the pending list once, as vk_gpu_written removes one entry per call: equal ranges are
     // neighbours in w, and gone[] marks the ones that found their entry.
@@ -1546,11 +1763,12 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
     plat_mutex_unlock_shared(&pool_lock);
     plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;
-    for (int i = 0; i < m; i++)
-        if (!nvn_gpu_only(w[i][0])) stamp_range(w[i][0] & ~0xfffull, (w[i][1] + 0xfff) & ~0xfffull, g);
+    for (int i = 0; i < ncp; i++)
+        if (!nvn_gpu_only(cp[i].lo)) stamp_range(cp[i].lo & ~0xfffull, (cp[i].hi + 0xfff) & ~0xfffull, g);
     plat_mutex_unlock(&gen_lock);
+    free(seal);
+    free(cp);
     free(gone);
-    free(pr);
     free(w);
 }
 
@@ -1602,6 +1820,15 @@ static void shadow_log(uint64_t frame) {
            qpc_ms(s_ticks), nspend);
     s_syncs = s_queries = s_copied = s_untracked = s_wb_bytes = s_ticks = 0;
     plat_mutex_unlock(&shadow_lock);
+    if (wb_on > 0) {
+        plat_mutex_lock(&wb_lock);
+        rt_log("mem: lazy write-back at frame %llu: %d pages sealed; since the last: %.1f MiB left for a touch, %llu "
+               "pages sealed, %llu touched (%.1f MiB copied then)", (unsigned long long)frame, (int)wb_nsealed,
+               wb_skipped / 1048576.0, (unsigned long long)wb_seals, (unsigned long long)wb_touches,
+               wb_touch_bytes / 1048576.0);
+        wb_skipped = wb_seals = wb_touches = wb_touch_bytes = 0;
+        plat_mutex_unlock(&wb_lock);
+    }
 }
 
 void vk_mem_dirty_submit(void) {
