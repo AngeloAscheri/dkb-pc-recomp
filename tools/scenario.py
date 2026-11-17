@@ -28,8 +28,11 @@ How a run ended is one of:
                    or the reporter itself failing); the exit code says how (0xC0000005 access violation, 0xC00000FD stack
                    overflow, 0xC0000409 fast fail)
   device lost      Vulkan lost the device; the log has the VK_EXT_device_fault report when the driver gives one
-  hung             no exit within the time limit (seconds x 6 + 180 s), or a log silent for STALL_S while the run was
-                   not over; before the kill, hang-stacks.txt gets every thread's stack (gdb attached, when installed)
+  hung             no exit within the time limit (seconds x 6 + 180 s), or, while the run was not over, STALL_S without
+                   a frame (the stall watchdog's "stall: no frame" lines, TOTK_STALL_DUMP) or without any other log
+                   line; before the kill, hang-stacks.txt gets every thread's stack (gdb attached, when installed)
+  warp failed      tools/save_warp.py could not move the profile copy to the stage (unknown save layout, a stage name
+                   too long for its field); no game was started and the batch goes on
   did not start    the exe could not be started (missing build, wrong path)
 Then the checks: a perf verdict (OK, HITCHY or SLOW, tools/perf_check.py); that the last frame is in the scene (its
 HUD band has bright pixels; a loading screen or fade has none, and then nothing about the picture is judged); and
@@ -220,7 +223,7 @@ def ending(code, text, timed_out):
     m = FATAL.search(text)
     if timed_out is True:
         if 'scenario: hung (log silent)' in text:
-            return 'hung', f'log silent for {STALL_S} s; stacks in hang-stacks.txt; killed'
+            return 'hung', f'no frame or log line for {STALL_S} s; stacks in hang-stacks.txt; killed'
         return 'hung', 'no exit within the time limit; killed'
     if lost:
         fault = re.search(r'.*device fault address \d+: .*', text)
@@ -354,13 +357,69 @@ def dump_nan(folder):
     return total
 
 
+STALL_LINE = re.compile(rb'stall: no frame for ([\d.]+) s')
+
+
+class LogTail:
+    """Reads only what the game appended to its log since the last call. shot: the end-of-run screenshot was logged;
+    progress: when a line other than the stall watchdog's last arrived; stall: (seconds without a frame, when read) of
+    the latest "stall: no frame" line, until a perf line shows frames again."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.rest = path, 0, b''
+        self.shot, self.progress, self.stall = False, None, None
+
+    def read(self, now):
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return
+        self.pos += len(data)
+        lines = (self.rest + data).split(b'\n')
+        self.rest = lines.pop()
+        for line in lines:
+            if b'boot: shot ' in line:
+                self.shot = True
+            m = STALL_LINE.search(line)
+            if m:
+                self.stall = (float(m[1]), now)
+                continue
+            if b'stall:' in line:   # the rest of the watchdog's dump
+                continue
+            self.progress = now
+            if b'perf: frame' in line:
+                self.stall = None
+
+    def stalled_for(self, now):
+        return 0.0 if self.stall is None else self.stall[0] + now - self.stall[1]
+
+
+def warp_failed(s, out, prof, warp, env_extra, exe, args, e):
+    """The result of a run whose profile could not be warped: no game started, the batch goes on."""
+    shutil.rmtree(prof, ignore_errors=True)
+    detail = f'{type(e).__name__}: {e}'
+    r = dict(scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe),
+             seconds=args.seconds or s['seconds'], wall_s=0.0, exit_code=None, ending='warp failed', ending_detail=detail,
+             perf='no data', fps=None, slow_windows=None, worst_frame_ms=None, major_episode_causes=[],
+             failed=[f'warp failed: {detail}'], ok=False, perf_judged=False, busy_machine=[], timings_reliable=False,
+             vram_peak_mib=None, vram_budget_mib=None, vram_over_budget=False, gpuav=None, black_share=None,
+             hud_bright=None, in_scene=None, nan_pixels=None, reference_frame=None, machine={})
+    (out / 'result.json').write_text(json.dumps(r, indent=2) + '\n', encoding='utf-8')
+    return r
+
+
 def run_once(s, exe, out, env_extra, args, warp=None):
     out.mkdir(parents=True)
     prof = out / 'profile'
     shutil.copytree(save_dir(s), prof)
     warp = warp or args.warp or s.get('warp')
     if warp:   # this run's profile copy starts in another stage (tools/save_warp.py); the private save is unchanged
-        save_warp.warp_profile(prof, warp)
+        try:
+            save_warp.warp_profile(prof, warp)
+        except (save_warp.SaveError, UnicodeEncodeError, OSError) as e:
+            return warp_failed(s, out, prof, warp, env_extra, exe, args, e)
     env = run_env(s, {**dump_env(s['checks']), **env_extra}, out, os.environ)
     seconds = args.seconds or s['seconds']
     cmd = [str(exe), '--profile', str(prof), '--seconds', str(seconds), '--shot', str(out / 'last.png')]
@@ -377,18 +436,24 @@ def run_once(s, exe, out, env_extra, args, warp=None):
         try:
             p = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
             finished = None   # when the game logged its end-of-run screenshot (runtime/boot.c)
-            last_size, last_write = -1, time.monotonic()
+            tail = LogTail(out / 'game.log')
+            last_write = time.monotonic()
             while code is None:
                 try:
                     code = p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     now = time.monotonic()
-                    if finished is None and b'boot: shot ' in (out / 'game.log').read_bytes()[-20000:]:
+                    tail.read(now)
+                    if finished is None and tail.shot:
                         finished = now
-                    size = (out / 'game.log').stat().st_size
-                    if size != last_size:
-                        last_size, last_write = size, now
-                    stalled = finished is None and now - last_write > STALL_S * (5 if args.safe_gpu else 1)
+                    if tail.progress is not None:
+                        last_write = max(last_write, tail.progress)
+                    stall_limit = STALL_S * (5 if args.safe_gpu else 1)
+                    # The stall watchdog (TOTK_STALL_DUMP, runtime/kernel.c stall_main) keeps logging while no frame
+                    # comes, so its lines are not progress: a hang is either a log silent apart from them, or a
+                    # "stall: no frame" that lasted the limit.
+                    stalled = finished is None and (now - last_write > stall_limit or
+                                                    tail.stalled_for(now) > stall_limit)
                     if now - start > limit or stalled or finished is not None and now - finished > EXIT_GRACE_S:
                         # Under the validation layer the process can hang in its teardown after the run is over.
                         timed_out = 'exit' if finished is not None else True

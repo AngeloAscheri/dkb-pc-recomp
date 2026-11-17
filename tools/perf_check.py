@@ -86,9 +86,12 @@ def parse(path):
                 if m:
                     summaries.append(dict(what=m['what'], frames=int(m['frames']), secs=float(m['secs']),
                                           fps=float(m['fps']), low=float(m['low'])))
-    out = []
+    out, prev_total = [], 0.0
     for frame in sorted(windows):
         w = windows[frame]
+        # The perf line's "N translated" is the run's total so far (gfx_shader_counts): keep the window's own count.
+        if w['translated'] is not None:
+            w['translated'], prev_total = max(0.0, w['translated'] - prev_total), w['translated']
         w['gpu'], w['bound'] = gpu.get(frame, (None, None))
         # Host-call refusals per present since the previous kernel line: how often a waiting thread found the core's
         # owner inside a host call (kernel.c ap_try). A jump means game threads sit in host code.

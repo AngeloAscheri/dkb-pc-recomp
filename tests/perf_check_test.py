@@ -98,6 +98,15 @@ class PerfCheck(unittest.TestCase):
                 r = self.analyse(log(STEADY, w, STEADY))
                 self.assertEqual(r['episodes'][0]['cause'], want)
 
+    def test_translated_is_a_run_total(self):
+        # The perf line's count is the run's total: a slow window with a little compile time after boot, when nothing
+        # new was translated, is not a compile window; one where the total grew is.
+        boot = dict(avg=16.7, translated=500)
+        same = dict(avg=80.0, busy=10.0, pacing=0, bound='cpu', xlate=3, pipeline=3, translated=500)
+        grew = dict(same, translated=512)
+        self.assertEqual(self.analyse(log(boot, same, boot))['episodes'][0]['cause'], 'game-cpu')
+        self.assertEqual(self.analyse(log(boot, grew, dict(boot, translated=512)))['episodes'][0]['cause'], 'compile')
+
     def test_skip_world_leaves_out_loading(self):
         text = log(dict(avg=300.0), dict(avg=300.0), STEADY, STEADY)   # worlds 1 and 2 s: the load
         self.assertEqual(self.analyse(text, skip_world=2.5)['verdict'], 'OK')

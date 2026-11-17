@@ -2,8 +2,10 @@
 stage name); no game files. Run: python tests/save_warp_test.py
 """
 import importlib.util
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +95,12 @@ class SaveWarp(unittest.TestCase):
         long_name = 'X' * 60
         with self.assertRaisesRegex(sw.SaveError, 'does not fit'):
             sw.warp_profile(self.profile, long_name, known=KNOWN + [long_name])
+
+    def test_save_names_stay_under_saves(self):
+        for name in ('..', '../escape', 'a/b', '.'):
+            with self.subTest(name), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(sw.main(['some-save', name, 'BetaLevelStage']), 1)
+                self.assertIn('is not a save name', out.getvalue())
 
 
 if __name__ == '__main__':

@@ -193,6 +193,35 @@ class Files(unittest.TestCase):
         self.assertEqual(sc.ending(None, 'FATAL: vk: upload submit failed (-4)', 'exit')[0], 'device lost')
         self.assertEqual(sc.ending(None, '', True)[0], 'hung')
 
+    def test_log_tail_reads_new_lines_and_sees_stalls(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'game.log'
+            path.write_bytes(b'[host] perf: frame 60: interval avg 16 ms\n[host] stall: no fr')
+            t = sc.LogTail(path)
+            t.read(100.0)
+            self.assertEqual((t.progress, t.stall, t.shot), (100.0, None, False))
+            with open(path, 'ab') as f:   # the rest of a stall line, then the watchdog's dump
+                f.write(b'ame for 5.0 s after frame 60\n[host] stall: core 0 free\n')
+            t.read(110.0)
+            self.assertEqual(t.progress, 100.0)   # watchdog lines are not progress
+            self.assertAlmostEqual(t.stalled_for(130.0), 25.0)
+            with open(path, 'ab') as f:
+                f.write(b'[host] perf: frame 120: interval avg 16 ms\n[host] boot: shot last.png\n')
+            t.read(140.0)
+            self.assertEqual((t.progress, t.stall, t.shot), (140.0, None, True))
+            self.assertEqual(t.stalled_for(150.0), 0.0)
+
+    def test_warp_failure_is_a_failed_run(self):
+        class Args:
+            seconds = None
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / 'run-1'
+            out.mkdir()
+            r = sc.warp_failed(dict(name='x', seconds=60), out, out / 'profile', 'NoSuchStage', {}, 'dkb.exe', Args(),
+                               sc.save_warp.SaveError('no stage "NoSuchStage" in the RomFS'))
+            self.assertEqual((r['ok'], r['ending'], r['perf']), (False, 'warp failed', 'no data'))
+            self.assertTrue((out / 'result.json').is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

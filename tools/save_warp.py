@@ -147,6 +147,9 @@ def main(argv=None):
             return 0
         if not (a.source and a.dest and a.stage):
             ap.error('give SOURCE DEST STAGE, or --stages, or --show')
+        for name in (a.source, a.dest):   # a plain folder name under build/saves/, never a path out of it
+            if not name or Path(name).name != name or name in ('.', '..'):
+                raise SaveError(f'"{name}" is not a save name: give a folder name under {SAVES}')
         src, dst = SAVES / a.source, SAVES / a.dest
         if not (src / 'save').is_dir():
             raise SaveError(f'no save at {src}')
