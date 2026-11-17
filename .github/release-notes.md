@@ -1,3 +1,17 @@
+## Draft: next release (since 0.4.1)
+
+Draft, not released. The 0.4.1 notes follow below, unchanged.
+
+- HD rumble falls back to the two-motor path for the rest of the session when a pad disconnects after HD packets (#363, untested on that pad).
+- #354 Read indirect-reset pointer lists from guest memory instead of through a GPU read-back (TOTK_RESET_CPU_LIST) (@thatbananaman08, landed with a host-pool check)
+- #361 Scan a pool's pages for its mirror sync under the pool's own lock, and take mirror_lock only to queue the copies (@thatbananaman08)
+- #365 Skip the submit scans of copies that hold nothing for them (@thatbananaman08)
+- #366 Log the scheduler state when no frame has been presented for a while (TOTK_STALL_DUMP, default 5 s) (@thatbananaman08)
+- #367 Opt-in orders for consecutive dispatches: the game's barriers alone, or compute barriers (TOTK_CS_BARRIER) (@GlebShekovtsov)
+- #368 Apply the follow-ups from the review of #338: Anti-Lag 2 across a device restart, Auto's flight thumbnails, and the frame_gen_by text (@roverdrubber)
+
+---
+
 DKB Recomp 0.4.1: a static recompilation of *Donkey Kong Bananza* (Switch 2) to a native Windows exe with a Vulkan renderer. It is still experimental (0.x). This is a smaller release: what landed in the two days after 0.4.0, most of it from contributors.
 
 **The packages hold no game data, and no release ever will.** You build the game on your own PC from your own dump of **1.0.0 or the 3.2.0 update**, given as a `.nup` or `.nx` file or as ExeFS and RomFS folders. Other updates are not supported.
