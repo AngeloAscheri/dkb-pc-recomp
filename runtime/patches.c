@@ -121,19 +121,30 @@ static int guard_fail(const char *kind, uint64_t v, uint64_t w) {
 // pointer must also be readable over the bytes the code reads next. plat_mem_readable is a syscall, and the guards run
 // once per list entry (thousands a frame), so each thread keeps the last few pages it found readable: the valid entries
 // name a handful of layer records and cells, and only a stale pointer misses and pays the syscall.
+// rt_guard_stats counts the checks (in per-thread batches, the hit path stays free of shared writes) and the misses
+// (#317: on Windows a miss is a VirtualQuery, whose cost grows with the run of pages around the pointer).
 #define GUARD_PAGES 16
+#define GUARD_COUNT_BATCH 1024
 static _Thread_local uint64_t g_good[GUARD_PAGES];
-static _Thread_local unsigned g_good_next;
+static _Thread_local unsigned g_good_next, g_checks;
+static volatile int64_t g_check_total, g_miss_total;
 static int guard_readable(uint64_t p, uint64_t n) {
+    if (++g_checks == GUARD_COUNT_BATCH) __atomic_add_fetch(&g_check_total, GUARD_COUNT_BATCH, __ATOMIC_RELAXED), g_checks = 0;
     uint64_t first = p >> 12, last = (p + n - 1) >> 12;
     for (uint64_t pg = first; pg <= last; pg++) {
         int hit = 0;
         for (int i = 0; i < GUARD_PAGES && !hit; i++) hit = g_good[i] == pg + 1;
         if (hit) continue;
+        __atomic_add_fetch(&g_miss_total, 1, __ATOMIC_RELAXED);
         if (!plat_mem_readable(pg << 12, 1)) return 0;
         g_good[g_good_next++ % GUARD_PAGES] = pg + 1;
     }
     return 1;
+}
+
+void rt_guard_stats(uint64_t *checks, uint64_t *misses) {
+    *checks = (uint64_t)plat_xchg64(&g_check_total, 0);
+    *misses = (uint64_t)plat_xchg64(&g_miss_total, 0);
 }
 
 // A pointer the code reads from next: a layer record (+0x30, +0x40, +0x44), a cell's +0x48 target, a cell's element

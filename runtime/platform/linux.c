@@ -1601,6 +1601,14 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
 void plat_mem_walk(void (*fn)(uint64_t, uint64_t, int, void *), void *arg) { (void)fn, (void)arg; }
 // Not implemented on this host (the commit report is Windows only): reports 0.
 uint64_t plat_mem_resident(uint64_t base, uint64_t size) { (void)base, (void)size; return 0; }
+// No VirtualQuery-like scan here: nothing is counted.
+void plat_vm_stats(PlatVmStat out[PLAT_VM_N]) { memset(out, 0, PLAT_VM_N * sizeof *out); }
+
+uint64_t plat_self_cpu_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     *resident = *private_bytes = 0;
