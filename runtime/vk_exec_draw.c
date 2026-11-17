@@ -2485,7 +2485,11 @@ static void twin_prepare(VkExec *ex, const GfxShader *vs, const GfxShader *fs) {
 }
 
 #ifndef VK_EXEC_DRAW_HELPER   // the replay thread's, from vk_exec.c par_start
-static Twin *twin_par[TWINS];   // the twins vk_exec_draw_twins_copy copied for the pass about to begin
+// The twins vk_exec_draw_twins_copy copied for the pass about to begin, by value as each was copied: twin_update takes
+// twins[] slots round-robin, so a later id of the same pass may take the slot an earlier one's twin is in (its image
+// then goes after the submission, which holds the pass, and its views stay valid until then). The pointer stamps the
+// slot with the pass only while it still holds that twin.
+static struct { Twin *slot; VkImage img; typeof(((TwinSnap *)0)->t[0]) v; } twin_par[TWINS];
 static int twin_npar;
 
 int vk_exec_draw_twins_copy(VkExec *ex, const uint32_t *ids, int n, uint32_t *gone) {
@@ -2501,9 +2505,10 @@ int vk_exec_draw_twins_copy(VkExec *ex, const uint32_t *ids, int n, uint32_t *go
         }
         int skip = 0;   // an attachment of the pass is sampled as it is (twin_prepare)
         for (uint32_t k = 0; k < 9; k++) skip |= (k < 8 ? &ex->color[k] : &ex->depth)->image == img->image;
-        for (int k = 0; k < twin_npar; k++) skip |= twin_par[k]->src == img->image;
+        for (int k = 0; k < twin_npar; k++) skip |= twin_par[k].v.src == img->image;
         Twin *t = skip ? NULL : twin_update(ex, img);
-        if (t) twin_par[twin_npar++] = t;
+        if (t)
+            twin_par[twin_npar++] = (typeof(twin_par[0])){t, t->img, {t->src, t->w, t->h, t->layers, t->fmt, {t->view[0], t->view[1]}}};
     }
     vk_texture_unlock();
     if (twin_npar) DC_OF(ex)->frame->twin_sliced += (uint64_t)twin_npar;
@@ -2514,9 +2519,9 @@ void vk_exec_draw_twins_snap(VkExec *ex, int snap, int copied) {
     TwinSnap *s = &twin_snap[snap];
     s->n = 0;
     for (int i = 0; i < copied && i < twin_npar; i++) {
-        Twin *t = twin_par[i];
-        t->pass = ex->pass_serial;
-        s->t[s->n++] = (typeof(s->t[0])){t->src, t->w, t->h, t->layers, t->fmt, {t->view[0], t->view[1]}};
+        Twin *t = twin_par[i].slot;
+        if (t->img == twin_par[i].img) t->pass = ex->pass_serial;   // the slot still holds this twin
+        s->t[s->n++] = twin_par[i].v;
     }
     if (s->n) twin_pass = ex->pass_serial;
     twin_npar = 0;
