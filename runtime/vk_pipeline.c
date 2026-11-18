@@ -2422,13 +2422,15 @@ static void prebuild_report(void) {
 static void job_build(Job *j) {
     plat_mutex_unlock(&P.lock);
     VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+    const int stolen = j->worker == MAX_WORKERS;   // job_steal: the waiting draw's own thread built it
     plat_mutex_lock(&P.lock);
     if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
     if (pipe && j->p->fast) P.g.swaps++;
     j->p->building = 0;
     j->p->job = NULL;
     if (pipe) {
-        P.stats.graphics++, P.stats.async_built++;
+        P.stats.graphics++;
+        if (!stolen) P.stats.async_built++;   // a stolen job was built by the waiting draw: graphics() counts the wait
         if (!j->prebuild) keys_note(&j->s);
     } else {
         P.stats.failures++;
@@ -2442,7 +2444,7 @@ static void job_build(Job *j) {
     }
     if (!--A.inflight) plat_cond_broadcast(&A.idle);
     plat_cond_broadcast(&done_cv);
-    if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
+    if (pipe && !stolen && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
     free(j);
 }
 
@@ -2793,7 +2795,9 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     }
     if (p && p->building && !p->info.pipeline) {
         promote(p);
-        if (wait_ms && !P.gpl) job_steal(p);   // create_graphics counts its build as the render thread's pipeline time
+        // Only a one-shot draw (ONESHOT_WAIT_MS, seconds) steals: a full-screen draw's budget is a few ms, and a stolen
+        // build cannot be cut short, so stealing there would turn the budget's skip into a whole cold build.
+        if (wait_ms >= 1000 && !P.gpl) job_steal(p);   // create_graphics counts its build as the render thread's pipeline time
         uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
         double now;
         while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
@@ -3067,8 +3071,8 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             perf_end(PERF_PIPE, p0);
             double ms = ms_since(t0);
             static int slow_logs;
-            if (ms >= 20.0 && slow_logs++ < 64)
-                rt_log("vk_pipeline: frame %llu: a compute pipeline took %.1f ms to build on the replay thread",
+            if (ms >= 20.0 && __atomic_fetch_add(&slow_logs, 1, __ATOMIC_RELAXED) < 64)
+                rt_log("vk_pipeline: frame %llu: a compute pipeline took %.1f ms to build while the replay waited",
                        (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, ms);
             if (!pipe) why = "pipeline creation failed";
         }
