@@ -213,8 +213,9 @@ asks once. `--no-update-check` and `DKB_NO_UPDATE_CHECK=1` turn it off as well.
 A failure in the tools part (steps 1 to 4) changes nothing that runs: the installed version and the game folder are
 as they were. A failure or cancel of the setup run in step 6 leaves what the setup's resume handles. Before a rerun
 step finishes (the runner records a step only once it is done, and compile copies `dkb.exe` in at its end) the old
-game still plays and Play stays. After that, until the final check (`dkb_verify`) has run again, the home screen shows
-the game as not built (`guilogic.install_state`) and Install or rebuild finishes it from the steps already done. The previous version folder stays until the next update and is the one the launcher starts when the current one
+game still plays and Play stays. After a rerun compile or translator step, until the final check (`dkb_verify`) has
+run again, the home screen shows the game as not built (`guilogic.install_state`) and Install or rebuild finishes it
+from the steps already done. Steps the check does not depend on (shaders, wide layouts, prompts) never hold Play back. The previous version folder stays until the next update and is the one the launcher starts when the current one
 has lost its Python (an antivirus removing files). Older version folders are removed when a new version confirms its
 start; a folder still in use stays and goes at a later start.
 

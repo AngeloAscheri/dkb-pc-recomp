@@ -555,9 +555,32 @@ class WindowLogicTest(unittest.TestCase):
         steps = {'compile': {'finished': '2026-11-18T10:00:00Z'}, 'dkb_verify': {'finished': '2026-11-18T10:05:00Z'}}
         (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
         self.assertEqual(self.g.install_state(str(dest)), 'ready')
+        # A later setup run that reran only steps the check does not depend on: the runner skips the check, the run is
+        # finished and Play must stay (it once stayed off for good, since every later run skipped the check again)
+        for later in ('dkb_shaders', 'dkb_wide', 'dkb_prompts', 'dkb_data'):
+            steps[later] = {'finished': '2026-11-19T08:00:00Z'}
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'ready')
         steps['compile']['finished'] = '2026-11-19T09:00:00Z'   # an update recompiled; its check did not finish
         (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
         self.assertEqual(self.g.install_state(str(dest)), 'unfinished')
+        steps['compile']['finished'] = '2026-11-18T10:00:00Z'
+        steps['dkb_translator'] = {'finished': '2026-11-19T09:00:00Z'}   # so did a new translator
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'unfinished')
+
+    def test_verify_inputs_are_the_check_steps_key(self):
+        """install_state counts exactly the steps whose keys the runner puts into dkb_verify's key: those after which
+        the runner runs the check again."""
+        from installer import bananza
+
+        class Seen(dict):
+            def __getitem__(self, name):
+                self.setdefault('seen', set()).add(name)
+                return name
+        keys = Seen()
+        bananza.Prepare().key(type('Ctx', (), {'keys': keys, 'state': {'lang': 'en-US'}})())
+        self.assertEqual(dict.get(keys, 'seen'), set(self.g.VERIFY_INPUTS))
 
     def test_update_line(self):
         files = Files(self.work.name)

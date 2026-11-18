@@ -270,12 +270,17 @@ def default_dest(base):
     return str(Path(base).parent / 'DKB-Bananza')
 
 
+VERIFY_INPUTS = ('compile', 'dkb_translator')   # the steps whose keys make up dkb_verify's (installer/bananza.py Prepare.key)
+
+
 def install_state(dest):
     """'ready' when dest holds a finished Bananza install, 'unfinished' when it holds a started one, None when it holds
-    none. Finished: the game exe is there and the last step (dkb_verify, which runs the exe's self-test) is the newest
-    record. A setup run that stopped after a step it reran (an update's compile that put a new dkb.exe in place) leaves
-    a record newer than the check, so Play waits for the setup to finish; one that stopped earlier left the old game as
-    it was (the runner records a step only once it is done)."""
+    none. Finished: the game exe is there and the check (dkb_verify, which runs the exe's self-test) is newer than the
+    steps it checks, VERIFY_INPUTS. A setup run that stopped after one of them reran (an update's compile that put a new
+    dkb.exe in place) leaves a record newer than the check, so Play waits for the setup to finish; one that stopped
+    earlier left the old game as it was (the runner records a step only once it is done). Other steps (the shaders, the
+    wide layouts, the prompts) do not count: the runner itself does not run the check again after them, so a record
+    of theirs newer than the check is a finished setup run, not a stopped one."""
     if not dest or not dest.strip():
         return None
     try:
@@ -288,7 +293,7 @@ def install_state(dest):
     check = steps.get('dkb_verify')
     if not isinstance(check, dict) or not (Path(dest.strip()) / GAME_EXE).is_file():
         return 'unfinished'
-    newest = max((str(r.get('finished', '')) for r in steps.values() if isinstance(r, dict)), default='')
+    newest = max((str(steps[s].get('finished', '')) for s in VERIFY_INPUTS if isinstance(steps.get(s), dict)), default='')
     return 'ready' if str(check.get('finished', '')) >= newest else 'unfinished'
 
 
