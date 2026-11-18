@@ -376,12 +376,20 @@ def complete(folder, version):
     return all(p.is_file() for p in need)
 
 
-def remove_tree(path):
-    """path and what it holds, without following links; False when something is in use (it goes at a later run)."""
+def is_link(path):
+    """A symbolic link or a Windows junction (a mount point, which is_symlink() does not count): removed as itself,
+    never entered."""
     path = Path(path)
-    if not path.exists() and not path.is_symlink():
+    return path.is_symlink() or bool(getattr(path, 'is_junction', lambda: False)())
+
+
+def remove_tree(path):
+    """path and what it holds, without following links; False when something is in use (it goes at a later run). A
+    link or junction, path itself included, is removed as a link: what it points to stays."""
+    path = Path(path)
+    if not os.path.lexists(path):
         return True
-    if path.is_symlink() or path.is_file():
+    if is_link(path) or path.is_file():   # unlink removes a directory link or junction too, not its target
         try:
             path.unlink()
             return True

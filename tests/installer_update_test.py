@@ -645,6 +645,22 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(left, [busy.name] if os.name == 'nt' else [])
         self.assertTrue((self.base / 'versions' / 'v0.4.1').is_dir())
 
+    @unittest.skipUnless(os.name == 'nt', 'junctions exist on Windows only')
+    def test_prune_removes_junctions_without_entering_them(self):
+        """A junction is a folder to is_dir() but not a link to is_symlink(): remove_tree removes it as a link, at the
+        top (a version folder that is a junction) and inside a version, and never what it points to."""
+        import _winapi
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'save.txt').write_text('keep')
+        _winapi.CreateJunction(str(outside), str(self.base / 'versions' / 'v0.2.0'))
+        _winapi.CreateJunction(str(outside), str(self.base / 'versions' / 'v0.3.0' / 'link'))
+        self.assertTrue(update.is_link(self.base / 'versions' / 'v0.2.0'))
+        self.assertTrue(update.confirm_start(self.base, 'v0.5.0'))   # keeps v0.5.0 and v0.4.1
+        self.assertEqual(sorted(p.name for p in (self.base / 'versions').iterdir()),
+                         ['current.txt', 'previous.txt', 'v0.4.1', 'v0.5.0'])   # no .trash left either
+        self.assertEqual((outside / 'save.txt').read_text(), 'keep')
+
     def spawn(self, on_poll, seen):
         def spawn(cmd, cwd):
             seen.append((cmd, cwd))
