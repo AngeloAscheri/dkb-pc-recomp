@@ -8,6 +8,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -200,6 +202,175 @@ class ManifestTest(unittest.TestCase):
         for cut in (0, 10, good.index('tools'), good.index('launcher') + 12, len(good) - 30):
             with self.subTest(cut=cut), self.assertRaises(UpdateError):
                 update.parse_manifest(good[:cut])
+
+
+def find_clang():
+    """MSYS2 UCRT64's clang (docs/building.md) or one on PATH; None skips the tests that compile the launcher's C."""
+    for candidate in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+CLANG = find_clang() if os.name == 'nt' else None
+LAUNCHER_SRC = ROOT / 'installer' / 'launcher'
+
+
+@unittest.skipUnless(CLANG, 'needs clang (C:\\msys64\\ucrt64\\bin) on Windows')
+class ManifestParsersTest(unittest.TestCase):
+    """installer/launcher/manifest.c, the first install's reader, must accept exactly what parse_manifest accepts, and
+    read the same fields: both get the same good and bad manifests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.TemporaryDirectory()
+        cls.driver = Path(cls.work.name) / 'manifest_driver.exe'
+        subprocess.run([CLANG, '-O1', '-Wall', '-Werror', '-o', str(cls.driver), str(ROOT / 'tests' / 'launcher_manifest_driver.c'),
+                        str(LAUNCHER_SRC / 'manifest.c')], check=True, capture_output=True,
+                       env={**os.environ, 'PATH': str(Path(CLANG).parent) + os.pathsep + os.environ.get('PATH', '')})
+        cls.files = Files(cls.work.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.work.cleanup()
+
+    def c_parse(self, texts):
+        paths = []
+        for i, data in enumerate(texts):
+            path = Path(self.work.name) / f'm{i}.txt'
+            path.write_bytes(data)
+            paths.append(str(path))
+        out = subprocess.run([str(self.driver), *paths], capture_output=True, text=True, check=True).stdout
+        return out.splitlines()
+
+    @staticmethod
+    def py_parse(data):
+        try:
+            m = update.parse_manifest(data)
+        except UpdateError:
+            return 'bad'
+        return (f'ok {m.version} {m.tag} {m.tools.sha256} {m.tools.size} {m.tools.name} {m.tools.top} '
+                f'{m.launcher.sha256} {m.launcher.size} {m.launcher.name}')
+
+    def corpus(self):
+        good = self.files.text
+        tools = next(line for line in good.splitlines() if line.startswith('tools '))
+        launcher = next(line for line in good.splitlines() if line.startswith('launcher '))
+        sha, size, name, top = tools.split()[1:]
+        lines = good.splitlines()
+        cases = {
+            'good': good, 'crlf': good.replace('\n', '\r\n'), 'no final newline': good.rstrip('\n'),
+            'blank lines after the header': good.replace('\n', '\n\n\n', 2), 'trailing blank lines': good + '\n \n\t\n',
+            'shuffled fields': '\n'.join([lines[0], *reversed(lines[1:])]) + '\n',
+            'tabs and odd spaces': good.replace(' ', '\t').replace('tag\t', 'tag\x1c\x0b'),
+            'spaces around the header': '  dkb-release   1 \n' + good.split('\n', 1)[1],
+            'lone CR inside a line': good.replace('tag v', 'tag\rv'),
+            'unknown field': good + 'later-field x y z\n', 'unknown field with NUL': good + 'x\x00y 1\n',
+            'upper-case suffix': good.replace(name, name[:-4] + '.ZIP'),
+            'size with leading zeros': good.replace(f' {size} ', f' 000{size} '),
+            'version 0.5 for tag v0.5.0': good.replace('version 0.5.0+abc1234', 'version 0.5+abc1234'),
+            'version 00.5.0': good.replace('version 0.5.0+abc1234', 'version 00.5.0+abc1234'),
+            'tag v0.5.0.0': good.replace('tag v0.5.0', 'tag v0.5.0.0'),
+            'blank line before the header': '\n' + good, 'space line before the header': ' \n' + good,
+            'empty': '', 'header only': 'dkb-release 1\n', 'header 2': good.replace('dkb-release 1', 'dkb-release 2'),
+            'header 01': good.replace('dkb-release 1', 'dkb-release 01'),
+            'header with more': good.replace('dkb-release 1', 'dkb-release 1 x'),
+            'header not first': good.replace('dkb-release 1\n', '') + 'dkb-release 1\n',
+            'no launcher line': good.replace(launcher + '\n', ''), 'no tools line': good.replace(tools + '\n', ''),
+            'launcher with a fourth word': good.replace(launcher, launcher + ' extra'),
+            'tools with a fifth word': good.replace(tools, tools + ' extra'),
+            'version with two words': good.replace('version 0.5.0+abc1234', 'version 0.5.0 +abc1234'),
+            'hash too long': good.replace(sha, sha + 'a'), 'hash digit run-on': good.replace(f'{sha} {size}', f'{sha}5 {size}'),
+            'hash too short': good.replace(sha, sha[:-1]), 'hash upper case': good.replace(sha, sha.upper()),
+            'size zero': good.replace(f' {size} ', ' 0 '), 'size signed': good.replace(f' {size} ', f' +{size} '),
+            'size negative': good.replace(f' {size} ', ' -5 '),
+            'size over the limit': good.replace(f' {size} ', f' {(8 << 30) + 1} '),
+            'size at the limit': good.replace(f' {size} ', f' {8 << 30} '),
+            'size huge': good.replace(f' {size} ', ' 99999999999999999999999999 '),
+            'launcher over 16 MiB': good.replace(launcher.split()[2], str((16 << 20) + 1)),
+            'name with a folder': good.replace(name, 'x/' + name), 'name starting with _': good.replace(name, '_' + name),
+            'name starting with +': good.replace(name, '+' + name), 'name not a zip': good.replace(name, name + '.exe'),
+            'name of 129 characters': good.replace(name, 'a' * 125 + '.zip'),
+            'name of 128 characters': good.replace(name, 'a' * 124 + '.zip'),
+            'top ..': good.replace(f' {top}\n', ' ..\n'), 'top with a colon': good.replace(f' {top}\n', ' C:x\n'),
+            'tag of another version': good.replace('tag v0.5.0', 'tag v0.6.0'),
+            'tag pre-release': good.replace('tag v0.5.0', 'tag v0.5.0-rc1'),
+            'tag of five numbers': good.replace('tag v0.5.0', 'tag v0.5.0.0.0'),
+            'tag 32 characters': good.replace('tag v0.5.0', 'tag v0.5.0.' + '0' * 26).replace(
+                'version 0.5.0+abc1234', 'version 0.5.0.' + '0' * 26),
+            'version 64 characters': good.replace('version 0.5.0+abc1234', 'version 0.5.0+' + 'a' * 50),
+            'version 63 characters': good.replace('version 0.5.0+abc1234', 'version 0.5.0+' + 'a' * 49),
+            'version plus nothing': good.replace('version 0.5.0+abc1234', 'version 0.5.0+'),
+            'version plus dash': good.replace('version 0.5.0+abc1234', 'version 0.5.0+abc-1'),
+            'version dev': good.replace('version 0.5.0+abc1234', 'version 0.5.0-dev'),
+            'version NUL': good.replace('version 0.5.0+abc1234', 'version 0.5.0\x00'),
+            'tag twice': good + 'tag v0.5.0\n', 'unknown field twice': good + 'x 1\nx 2\n',
+        }
+        data = {k: v.encode('latin-1') for k, v in cases.items()}
+        data['byte above 127'] = good.encode() + b'\xff\n'
+        data['byte above 127 in an unknown field'] = good.encode() + b'note caf\xc3\xa9\n'
+        return data
+
+    def test_same_verdict_and_fields(self):
+        corpus = self.corpus()
+        c = dict(zip(corpus, self.c_parse(list(corpus.values()))))
+        accepted = []
+        for name, data in corpus.items():
+            with self.subTest(name):
+                self.assertEqual(c[name], self.py_parse(data))
+            if c[name] != 'bad':
+                accepted.append(name)
+        # the corpus holds both kinds, so the agreement is not one of refusing everything
+        self.assertIn('good', accepted)
+        self.assertNotIn('no launcher line', accepted)
+        self.assertGreater(len(accepted), 10)
+        self.assertGreater(len(corpus) - len(accepted), 30)
+
+    def test_same_tags(self):
+        tags = ['v1', 'v0.4.1', 'v1.2.3.4', 'v1.2.3.4.5', 'v', 'v01', 'v1.', 'v.1', 'V1', 'v1-rc1', 'v1..2', 'v1 ',
+                '1.2', 'v' + '1' * 30, 'v' + '1' * 31, '..\\..\\evil', '']
+        out = subprocess.run([str(self.driver), '--tag', *tags], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.split('\n')[:len(tags)], ['1' if update.TAG_RE.fullmatch(t) else '0' for t in tags])
+
+
+@unittest.skipUnless(CLANG, 'needs clang (C:\\msys64\\ucrt64\\bin) on Windows')
+class LauncherBuildTest(unittest.TestCase):
+    """The launcher builds tools/make_release.py makes: the release has no test overrides, the TotK setup none of the
+    download code."""
+
+    def build(self, *flags_and_sources, name):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import make_release
+        work = Path(self.work.name)
+        make_release.launcher_header(work / 'launcher_text.h', 'dkb')
+        out = work / name
+        subprocess.run([CLANG, '-O1', '-mwindows', '-municode', '-Wall', '-Werror', '-Wno-missing-field-initializers',
+                        '-I', str(work), *map(str, flags_and_sources), '-o', str(out)], check=True, capture_output=True,
+                       env={**os.environ, 'PATH': str(Path(CLANG).parent) + os.pathsep + os.environ.get('PATH', '')})
+        return out.read_bytes()
+
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+
+    def test_release_build_has_no_test_overrides(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import make_release
+        sources = make_release.launcher_sources('dkb')
+        release = self.build(*sources, name='release.exe')
+        test = self.build('-DDKB_LAUNCHER_TEST', *sources, name='test.exe')
+        marker = 'DKB_LAUNCHER_'.encode('utf-16-le')
+        self.assertEqual(release.count(marker), 0)   # DKB_LAUNCHER_BASE, _MANIFEST, _DOWNLOAD, _LOG are compiled out
+        self.assertGreater(test.count(marker), 3)
+        self.assertIn(b'WINHTTP.DLL', release.upper())
+
+    def test_totk_setup_has_no_download_code(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import make_release
+        exe = self.build(*make_release.launcher_sources('totk'), name='totk.exe').upper()
+        self.assertNotIn(b'WINHTTP.DLL', exe)
+        self.assertNotIn(b'BCRYPT.DLL', exe)
+        self.assertNotIn('dkb-release.txt'.upper().encode('utf-16-le'), exe)
 
 
 class CheckTest(unittest.TestCase):
@@ -672,14 +843,23 @@ class ReleaseToolTest(unittest.TestCase):
     def test_launcher_loads_its_dlls_from_system32_only(self):
         """The launcher is run from Downloads: its static imports (winhttp.dll, bcrypt.dll) must not be looked for
         beside it, where a downloaded DLL of that name would be loaded instead of Windows' own."""
-        commands = []
-        out = Path(self.work.name) / 'out'
-        with patch.object(self.m, 'run', side_effect=lambda cmd, **kw: commands.append([str(c) for c in cmd])), \
-                patch.object(self.m, 'launcher_header'), patch.object(self.m, 'clean_env', return_value={}):
-            self.m.build_launcher(out, Path(self.work.name) / 'llvm')
-        link = next(c for c in commands if Path(c[0]).name == 'clang.exe')
-        self.assertIn('-Wl,--dependent-load-flag=0x800', link)
-        self.assertIn('-lwinhttp', link)
+        for game in ('dkb', 'totk'):
+            commands = []
+            out = Path(self.work.name) / 'out'
+            with patch.object(self.m, 'run', side_effect=lambda cmd, **kw: commands.append([str(c) for c in cmd])), \
+                    patch.object(self.m, 'launcher_header'), patch.object(self.m, 'clean_env', return_value={}), \
+                    patch.object(self.m, 'GAME', game):
+                self.m.build_launcher(out, Path(self.work.name) / 'llvm')
+            link = next(c for c in commands if Path(c[0]).name == 'clang.exe')
+            self.assertIn('-Wl,--dependent-load-flag=0x800', link, game)
+            sources = {Path(c).name for c in link if c.endswith('.c')}
+            if game == 'dkb':
+                self.assertEqual(sources, {'launcher.c', 'manifest.c', 'fetch.c'})
+                self.assertIn('-DDKB_LAUNCHER', link)
+                self.assertIn('-lwinhttp', link)
+            else:   # the TotK setup stays MIT: fetch.c (GPL-3.0-or-later) is neither compiled nor linked
+                self.assertEqual(sources, {'launcher.c'})
+                self.assertFalse([c for c in link if c.startswith('-D') or c.startswith('-l')])
 
     def test_manifest_and_launcher_beside_the_zip(self):
         folder = Path(self.work.name) / 'DKB-Setup'

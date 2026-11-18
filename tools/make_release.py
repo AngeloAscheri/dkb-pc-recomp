@@ -494,8 +494,19 @@ def build_launcher(out, llvm):
     # folder: a DLL of that name left in Downloads beside DKB-Launcher.exe would run inside it. 0x800 is
     # LOAD_LIBRARY_SEARCH_SYSTEM32, which the loader then uses for every static import of the exe.
     run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-municode', '-Wall', '-Wl,-s',
-         f'-Wl,--dependent-load-flag={DEPENDENT_LOAD_FLAG}', '-I', work, ROOT / 'installer' / 'launcher' / 'launcher.c',
-         res, '-lwinhttp', '-lbcrypt', '-lcomctl32', '-o', out / (GAMES[GAME]['name'] + '.exe')], env=env)
+         f'-Wl,--dependent-load-flag={DEPENDENT_LOAD_FLAG}', '-I', work, *launcher_sources(GAME), res,
+         '-o', out / (GAMES[GAME]['name'] + '.exe')], env=env)
+
+
+def launcher_sources(game):
+    """The launcher's sources and libraries. TotK's is only the setup: launcher.c, MIT, nothing else. Bananza's is also
+    the launcher that installs a release, which adds manifest.c (MIT) and fetch.c, adapted from Longshot and Project
+    ReLink under the GPL-3.0-or-later (THIRD_PARTY_NOTICES.md), with the network and hash libraries."""
+    folder = ROOT / 'installer' / 'launcher'
+    if game != 'dkb':
+        return [folder / 'launcher.c']
+    return ['-DDKB_LAUNCHER', folder / 'launcher.c', folder / 'manifest.c', folder / 'fetch.c',
+            '-lwinhttp', '-lbcrypt', '-lcomctl32']
 
 
 def write_launcher_release(out, zip_path):

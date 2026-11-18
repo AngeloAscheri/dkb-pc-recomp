@@ -56,8 +56,9 @@ TOOLS_LIMIT = 8 << 30
 LAUNCHER_LIMIT = 16 << 20
 LAUNCHER_EXE = 'DKB-Setup.exe'   # the launcher inside the release zip; DKB-Launcher.exe is the same file
 
-TAG_RE = re.compile(r'v\d+(?:\.\d+){0,3}')
-VERSION_RE = re.compile(r'\d+(?:\.\d+){0,3}(?:\+[0-9A-Za-z.]+)?')
+# The lengths are the buffers of installer/launcher/manifest.h, so the two readers accept the same manifests
+TAG_RE = re.compile(r'(?=.{2,31}\Z)v\d+(?:\.\d+){0,3}')
+VERSION_RE = re.compile(r'(?=.{1,63}\Z)\d+(?:\.\d+){0,3}(?:\+[0-9A-Za-z.]+)?')
 NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}')
 SHA_RE = re.compile(r'[0-9a-f]{64}')
 

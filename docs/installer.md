@@ -149,15 +149,25 @@ Bananza release must include the complete runtime source/dependencies rather tha
 ## Launcher and updates (Windows)
 
 `DKB-Launcher.exe` on the release page is the one file a player downloads (about 100 KB). It is the same program as
-the zip's `DKB-Setup.exe` (`installer/launcher/launcher.c`): beside a `python\` folder it starts the setup window as
-before and passes its own arguments on, anywhere else it is the launcher.
+the zip's `DKB-Setup.exe`: beside a `python\` folder it starts the setup window as before and passes its own arguments
+on, anywhere else it is the launcher. It is built from three files in `installer/launcher/`:
+
+- `launcher.c` (MIT, from TotK Recomp): the setup, the start of the installed version (`current.txt`, else
+  `previous.txt`), the arguments and the catalog strings. `TotK-Setup.exe` is this file alone.
+- `manifest.c` (MIT): reads `dkb-release.txt`, accepting exactly what `installer/update.py parse_manifest` accepts
+  (`ManifestParsersTest` feeds both the same files).
+- `fetch.c` (GPL-3.0-or-later): the first install, that is the download, the checks, the unpack and the progress
+  window. It is adapted from Longshot's and Project ReLink's setup programs (`THIRD_PARTY_NOTICES.md`), and only the
+  Bananza build compiles it (`tools/make_release.py launcher_sources`).
 
 What the player does:
 
 1. Puts `DKB-Launcher.exe` in a folder of its own (for example `C:\Games\DKB\`) and starts it.
 2. The first start asks before it downloads anything, then reads `dkb-release.txt` of the latest release, downloads
    the tools zip it names (the same `DKB-Setup-<version>-windows.zip`), checks its size and SHA-256 and unpacks it
-   with Windows' own `tar.exe`. A file that does not match is deleted and nothing is unpacked or run.
+   with Windows' own `tar.exe`. A file that does not match is deleted and nothing is unpacked or run. Closing the
+   progress window cancels: during the download at once, during the unpack once `tar.exe` is done; either way nothing
+   is kept or started. A second launcher started meanwhile waits for the first one's install and then starts it.
 3. The setup window opens with the install folder proposed beside the launcher's folder (`DKB-Bananza`); the player
    picks the `.nup` or the ExeFS and RomFS folders, as with the zip, and the setup builds the game.
 4. From then on the launcher opens on its home screen: Play (starts `dkb.exe` from the install folder and closes the
@@ -239,9 +249,11 @@ tag, checks that the manifest names that tag and the zip it lists before it publ
 must be `v` and the repository's `VERSION`. Older releases have no manifest: the launcher's first start then says so
 and points to the release page.
 
-**Testing without a release.** `DKB_LAUNCHER_BASE` replaces the `DKB-Recomp` folder, `DKB_LAUNCHER_MANIFEST` and
-`DKB_LAUNCHER_DOWNLOAD` the manifest link and the download prefix (http is accepted only for 127.0.0.1 and
-localhost). `tests/installer_update_test.py` covers the manifest (good, tampered, truncated), the check (newer, same,
+**Testing without a release.** A launcher built with `-DDKB_LAUNCHER_TEST` (never a release: the release build has no
+such variables) reads `DKB_LAUNCHER_BASE` in place of the `DKB-Recomp` folder, `DKB_LAUNCHER_MANIFEST` and
+`DKB_LAUNCHER_DOWNLOAD` in place of the manifest link and the download prefix (http is accepted only for 127.0.0.1),
+and with `DKB_LAUNCHER_LOG` set it shows no window: its messages go to that file and its questions are answered yes.
+`tests/installer_update_test.py` covers the manifest (good, tampered, truncated), the check (newer, same,
 older, downgrade, offline, API fallback, mismatching digests), the download (good, tampered, truncated, interrupted,
 too long, cancelled), the unpack (good, members leaving the folder, wrong version, damaged zip), the switch of versions
 (confirmed, failed, slow start), the launcher's replacement and the window's settings, all with an injected opener and
