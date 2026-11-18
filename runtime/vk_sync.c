@@ -977,6 +977,8 @@ void vk_sync_shutdown(void) {
         perf_gpu_stats = NULL;
         if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
         ts_pool = VK_NULL_HANDLE;
+        if (c && mk_pool) vkDestroyQueryPool(c->device, mk_pool, NULL);   // TOTK_PASS_GPU marks
+        mk_pool = VK_NULL_HANDLE;
         ts_state = 0;
         ts_last_end = 0;
         memset((void *)ts_busy, 0, sizeof ts_busy);
