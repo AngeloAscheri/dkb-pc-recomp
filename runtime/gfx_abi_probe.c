@@ -64,6 +64,10 @@ static void check_write_watch(void) {
     uint64_t m = mem_written_pages(heap, 0x200000, pages + 2, 6);
     printf("write-watch: three pages written, max 2: %llu then %llu\n", (unsigned long long)n, (unsigned long long)m);
     CHECK(n == 2 && m == 1, "max 2 reported %llu, then %llu (want 2, 1)", (unsigned long long)n, (unsigned long long)m);
+    // In address order: vk_memory.c ww_stamp starts its next query after the last page a full answer held.
+    CHECK(pages[0] == heap + 0x7000 && pages[1] == heap + 0x9000 && pages[2] == heap + 0xA000,
+          "pages not in address order: +%#llx +%#llx then +%#llx", (unsigned long long)(pages[0] - heap),
+          (unsigned long long)(pages[1] - heap), (unsigned long long)(pages[2] - heap));
 
     // Frozen region: read-only until the first write thaws it (the write lands and is reported); mem_thaw (a file
     // read) thaws it and holds it thawed; SetHeapSize below decommits it.
