@@ -2878,6 +2878,26 @@ static BigMirror big_mirror;
 #define STG_CHUNK (16ull << 20)   // a piece of the first fill: STG_SLOTS of them fit the staging pool's kept blocks
 #define STG_SLOTS 4
 
+// TOTK_STAGED_INJECT (a test of the failure paths, off by default; logged when on):
+// - import: every staged pool's mirror is refused (as a failed device-local allocation) and its import after all
+//   fails (staged_import): the uses of its spans must skip them, as those of a pool whose first-use import failed;
+// - fence: from the batch of the first piece of the first staged_fill that will reuse a staging buffer, every upload
+//   batch reads as on a lost device (batch_status, upload_wait_locked): the fill's wait for that buffer must end the
+//   process with the fault report instead of spinning.
+enum { INJECT_NONE, INJECT_IMPORT, INJECT_FENCE };
+static int staged_inject(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("TOTK_STAGED_INJECT");
+        int m = !e || !*e ? INJECT_NONE : !strcmp(e, "import") ? INJECT_IMPORT : !strcmp(e, "fence") ? INJECT_FENCE : -1;
+        if (m < 0) rt_log("mem: TOTK_STAGED_INJECT=%s is not import or fence: ignored", e), m = INJECT_NONE;
+        if (m) rt_log("mem: TOTK_STAGED_INJECT=%s: %s", e, m == INJECT_IMPORT ? "staged pools get neither a mirror nor an import"
+                      : "upload batches from a staged first fill's on read as on a lost device");
+        mode = m;
+    }
+    return mode;
+}
+
 // The write-backs of one submission: one job per submission while the mode is on, queued for its fence when its
 // recording begins. Ranges: offsets from import_lo of their pool, sorted by pool and offset, merged; roff where each
 // sits in the readback buffer; lo and serial identify the live pool at the fence.
@@ -3765,6 +3785,20 @@ static void ft_log(uint64_t frame) {
            (long long)plat_xchg64(&ft_bad, 0), (long long)plat_xchg64(&ft_skip, 0));
 }
 
+// TOTK_STAGED_INJECT=import: the import fails as lazy_import's does (no GPU buffer, counted in n_import_failures). The
+// caller holds pool_lock shared.
+static int inject_import_fail(PoolRec *r) {
+    plat_mutex_lock(&lazy_lock);
+    if (r->lazy) {
+        long n = plat_inc32(&n_import_failures);
+        if (n <= 8) rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far; TOTK_STAGED_INJECT=import)",
+                           (unsigned long long)r->lo, r->flags, (unsigned long long)r->size, n);
+        __atomic_store_n(&r->lazy, 0, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&lazy_lock);
+    return r->buf != VK_NULL_HANDLE;
+}
+
 // The span's pool resolved without a buffer (staged_pending) and the mirror cannot serve this use: import it after
 // all, as lazy_import does on a first GPU use. Logged once per pool (the first 32) and counted by reason (stc: an MR_
 // reason of the refused mirror, SI_HELPER or SI_GONE). When the import fails too, the pool ends as one whose first-use
@@ -3780,7 +3814,7 @@ static void staged_import(VkMemSpan *sp, int why) {
     PoolRec *r = sp->pool;
     uint64_t t0 = qpc();
     pool_lock_shared();   // as resolve_locked: the record stays alive while lazy_import runs
-    int ok = lazy_import(r, -1, "for a staged pool after all");
+    int ok = staged_inject() == INJECT_IMPORT ? inject_import_fail(r) : lazy_import(r, -1, "for a staged pool after all");
     plat_mutex_unlock_shared(&pool_lock);
     if (!ok) {
         sp->buffer = VK_NULL_HANDLE;
@@ -3829,6 +3863,7 @@ static uint64_t staged_runs(PoolRec *r, MRange **a, int *n, int *cap) {
 }
 
 static void upload_wait(uint64_t seq);
+static volatile uint64_t inject_lost;
 
 // The first fill of a large staged mirror (over STG_SMALL), on the thread that made it, mirror_lock let go (see
 // above): the pages staged_runs finds are copied in, the rest of the mirror is zeroed on the GPU. A staging buffer is
@@ -3880,6 +3915,10 @@ static void staged_fill(PoolRec *r, const BigMirror *bm) {
         cb = vk_upload_begin();
         vkCmdCopyBuffer(cb, s->buf, r->mbuf, (uint32_t)k, reg);
         s->seq = vk_upload_seq();
+        // TOTK_STAGED_INJECT=fence: this piece's batch and every later one read as lost (retire, upload_wait_locked),
+        // when a later piece will wait for this buffer.
+        if (!pieces && copied > STG_SLOTS * STG_CHUNK && staged_inject() == INJECT_FENCE && !inject_lost)
+            __atomic_store_n(&inject_lost, s->seq, __ATOMIC_RELAXED);
         vk_upload_end();
         vk_upload_flush(0);
     }
@@ -4370,6 +4409,7 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
     r->mgen = gen_now;   // the whole-range copy below holds every write observed so far
     plat_mutex_unlock(&gen_lock);
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
+    if (staged && staged_inject() == INJECT_IMPORT) return refuse(r, MR_ALLOC, "TOTK_STAGED_INJECT=import");
     uint64_t t3 = qpc();
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -5591,13 +5631,23 @@ static void free_staging(VkCtx *c, Batch *b) {
     b->nstg = 0;
 }
 
+// TOTK_STAGED_INJECT=fence (staged_inject): the first upload batch that reads as on a lost device, and every later one;
+// 0 none. Their fence status and fence wait give VK_ERROR_DEVICE_LOST, so retire stops in front of them as on a real
+// loss.
+static volatile uint64_t inject_lost;
+
+static VkResult batch_status(VkCtx *c, const Batch *b) {
+    uint64_t l = __atomic_load_n(&inject_lost, __ATOMIC_RELAXED);
+    return l && b->seq >= l ? VK_ERROR_DEVICE_LOST : vkGetFenceStatus(c->device, b->fence);
+}
+
 // Batches complete in submission order (one queue): retire from the front while their fences are signalled.
 static void retire(VkCtx *c, int wait_all) {
     int k = 0;
     for (; k < ninflight; k++) {
         Batch *b = &inflight[k];
         if (wait_all) vkWaitForFences(c->device, 1, &b->fence, VK_TRUE, UINT64_MAX);
-        else if (vkGetFenceStatus(c->device, b->fence) != VK_SUCCESS) break;
+        else if (batch_status(c, b) != VK_SUCCESS) break;
         uint64_t v[2];
         if (b->timed && vkGetQueryPoolResults(c->device, up_pool, 2 * (uint32_t)b->ts, 2, sizeof v, v, sizeof v[0],
                                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && v[1] >= v[0]) {
@@ -5772,7 +5822,8 @@ static void upload_wait_locked(VkCtx *c, uint64_t seq) {
         VkFence f = inflight[0].fence;
         uint64_t fseq = inflight[0].seq;
         if (unlocked) pinned = fseq, pinned_done = 0, plat_rmutex_unlock(&cmd_lock);
-        VkResult w = vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
+        uint64_t lost = __atomic_load_n(&inject_lost, __ATOMIC_RELAXED);
+        VkResult w = lost && fseq >= lost ? VK_ERROR_DEVICE_LOST : vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
         if (unlocked) plat_rmutex_lock(&cmd_lock);
         if (w != VK_SUCCESS && w != VK_TIMEOUT) {
             vk_device_fault_report(w);
@@ -5782,7 +5833,7 @@ static void upload_wait_locked(VkCtx *c, uint64_t seq) {
         // The wait said signalled and retire's vkGetFenceStatus did not: a lost device may answer a wait with
         // VK_SUCCESS and the status query with VK_ERROR_DEVICE_LOST, and the loop would spin on the same fence.
         if (w == VK_SUCCESS && ninflight && inflight[0].seq == fseq) {
-            VkResult s = vkGetFenceStatus(c->device, f);
+            VkResult s = batch_status(c, &inflight[0]);
             if (s != VK_SUCCESS) {
                 vk_device_fault_report(s);
                 rt_fatal("vk: upload batch %llu: its fence wait returned, its status is %d", (unsigned long long)fseq, (int)s);
