@@ -385,6 +385,7 @@ runtime/              libtotkrt.a and the headers the generated code and modules
 bin/                  totk_xlate.exe, hactool.exe, SDL3.dll, libopus-0.dll, ninja.exe
 data/                 shader_list.tsv (MacNativeGames, MIT)
 THIRD_PARTY_NOTICES.md
+LICENSE, LICENSE-MIT  the project's terms (GPL-3.0-or-later; MIT for the files that came from TotK Recomp)
 totk.ini.example, VERSION  the default ini; the release string (the repository's VERSION plus the commit)
 ```
 
