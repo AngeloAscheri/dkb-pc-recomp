@@ -98,6 +98,9 @@ def main(argv=None):
     ap.add_argument('--dll-dir', type=Path, help='runtime DLL directory (Windows)')
     ap.add_argument('--translator', type=Path, help='prebuilt translator, with matching .id beside it')
     ap.add_argument('--dotnet', type=Path, help='portable .NET 10 dotnet executable, when building the translator')
+    ap.add_argument('--fsr4', choices=('accept', 'off'),
+                    help='Bananza: accept: fetch AMD FSR 4 (FidelityFX SDK, installer/fsr4.py) next to dkb.exe, having '
+                         'read and accepted AMD\'s license of that release; off: stop fetching it')
     ap.add_argument('--jobs', type=int, default=6, help='Bananza worker limit (default 6)')
     ap.add_argument('--no-update-check', action='store_true',
                     help='do not ask GitHub for a newer release (also DKB_NO_UPDATE_CHECK=1)')
