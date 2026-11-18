@@ -12,7 +12,8 @@ dkb-release.txt (tools/make_release.py write_manifest), the tools zip it names a
     start_version()    the new version's window, started by the old one, which waits until it confirms its start
     confirm_start()    called by every window the launcher starts: its own tag becomes current.txt, the one before it
                        previous.txt. A version that never gets this far leaves the old one current
-    replace_launcher() the running launcher exe renamed to .old and the new one renamed into its place
+    replace_launcher() the launcher exe replaced by the new release's in one rename (a running one is renamed to .old
+                       first)
 
 The base folder (launcher.c makes it: DKB-Recomp beside DKB-Launcher.exe):
 

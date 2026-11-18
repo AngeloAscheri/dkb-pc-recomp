@@ -210,14 +210,18 @@ asks once. `--no-update-check` and `DKB_NO_UPDATE_CHECK=1` turn it off as well.
    or space, no device name such as `CON` or `NUL.txt`). The members together may unpack to at most 20 times the zip's
    size, never less than 1 GiB and never more than 64 GiB (`update.unpack_limit`). It then checks that the result holds
    the manifest's `VERSION`, its Python and the installer, and renames it to `versions/<tag>`. Any failure removes the
-   `.part` folder; the installed version is untouched. Closing the window during the update asks first. The download
-   then stops and its `.part` file is deleted; an unpack runs to its end but nothing starts.
+   `.part` folder; the installed version is untouched. Cancel stops the download at its next block and deletes its
+   `.part` file; a Cancel that comes as the last block arrives deletes the checked zip without unpacking it, one
+   during the unpack keeps the unpacked folder for the next try; nothing starts in either case. Closing the window
+   during the update asks first, then does the same and closes once the worker is done.
 4. It starts the new version's window with `--after-update` and waits until that window confirms its start: it writes
    its own tag to `current.txt` and the old one to `previous.txt`. If the new window exits first, `current.txt` still
    names the old version, the old window says so and the next start of the launcher runs the old version.
 5. The new window replaces the launcher exe with its own `DKB-Setup.exe` when they differ (the file came in the checked
-   zip): Windows does not let a running exe be overwritten but does let it be renamed, so the running file becomes
-   `DKB-Launcher.exe.old`, deleted at a later start, and the new one is copied in under the old name and checked again.
+   zip): a copy, `DKB-Launcher.exe.new`, is checked again and renamed over the launcher in one step, which works because
+   the launcher has exited by then. A launcher that still runs (started a second time) cannot be overwritten but can be
+   renamed: it becomes `DKB-Launcher.exe.old`, deleted at a later start, and the copy takes its name. No `.new` copy is
+   left behind.
 6. It runs the setup on the recorded install folder (`--dest` only, as a resume). The step keys decide what runs
    again: a release that changes the runtime recompiles, one that changes the lifter relifts, one that changes nothing
    game-derived skips the build. For 3.2.0 the generated code and objects in the shared `temp/` are reused. The dump
