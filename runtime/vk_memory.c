@@ -77,11 +77,14 @@ typedef struct PoolRec {
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
     // Staged mirror (TOTK_MIRROR_STAGED, "staged mirror" below). staged is set by vk_pool_init and never changes;
     // sfeed is set by mirror_create before it stores MS_ON and never changes.
-    uint8_t staged;                    // large lazy pool: its first GPU use makes a mirror instead of importing it
+    uint8_t staged;                    // lazy pool of TOTK_MIRROR_STAGED's size: its first GPU use makes a mirror, no import
     uint8_t sfeed;                     // its mirror is filled from staging buffers and written back through readbacks
+    uint8_t szero;                     // mirror_lock: a small staged mirror the next prologue zeroes and fills (staged_upload)
+    uint8_t mrefused;                  // 1 + the MR_ reason of a refused mirror (refuse), for staged_import's count
     volatile int32_t sfell;            // imported after all (staged_import): the line is logged once
     struct KeptRange *own;             // own_lock, TOTK_STAGED_WB=fault: bytes only the mirror holds (staged_fetch)
     int nown, cown;
+    int own_ix;                        // own_lock: 1 + its place in st_own while own holds a range, else 0
     uint8_t *cpu_read;                 // per page: the CPU fetched it, so GPU writes to it go back at the fence
 } PoolRec;
 
@@ -98,10 +101,12 @@ static void shadow_forget(PoolRec *r);
 static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_retire (or vk_mem_shutdown)
 static void mirror_retire(void *arg);    // completion thread: destroys a finalized mirrored pool's record
 static void grow(void **arr, int *cap, size_t elem);
-static uint64_t staged_min;              // TOTK_MIRROR_STAGED in bytes (mirror_mode): 0 off
+static uint64_t staged_min;              // TOTK_MIRROR_STAGED in bytes (mirror_mode): 0 off, 1 every lazy pool
+#define STG_SMALL (16ull << 20)          // a staged mirror up to this size is first filled in a prologue (staged_upload)
 static int staged_fault = 1;             // TOTK_STAGED_WB (mirror_mode): 1 fault (GPU-owned pages), 0 fence (copy-back)
 static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel);
 static void staged_forget(PoolRec *r);   // vk_pool_fini: a staged pool's owned pages open without a fetch
+static void staged_frame_log(uint64_t frame);   // vk_mem_census: what the staged pools did in the frame
 // A staged pool that has not been imported: lazy stays 1 until staged_import imports it after all, and lazy_import
 // stores 0 with release order only once r->buf is complete, so a reader that sees 0 here may read r->buf.
 static inline int staged_pending(const PoolRec *r) { return r->staged && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE); }
@@ -530,9 +535,12 @@ static void pool_fini_note(uint64_t size, uint64_t flush_ns, uint64_t wait_ns) {
                (unsigned long long)(size >> 20), flush_ns / 1e6, wait_ns / 1e6, n, (pf_flush_ns + pf_wait_ns) / 1e6);
 }
 
+static void staged_released(const PoolRec *r, int imported, uint64_t ns);
+
 void vk_pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) return;
+    uint64_t t_fini = qpc();
     pidx_ent e;
     plat_mutex_lock(&pool_lock);
     int had = pidx_remove(&pool_index, p, &e);
@@ -558,10 +566,17 @@ void vk_pool_fini(pool_t *p) {
     if (r->smap) shadow_forget(r);
     if (r->sfeed && staged_fault) staged_forget(r);   // its owned pages open without a fetch: the storage goes away
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
+    // A pool never imported (a staged pool, TOTK_MIRROR_STAGED, the only lazy pool a resolve marks used): the GPU never
+    // read or wrote its storage, only the VRAM mirror and staging buffers that the CPU filled at record time, and its
+    // write-backs into guest memory check at the fence that the pool is still live (staged_wb_done). So its release
+    // waits for nothing: with hundreds of small pools staged, a layer's exit released about 215 pools in a row, and
+    // the queue-idle wait below costs a driver round trip each even with the GPU idle. No resolve finds the pool once it
+    // is out of the index, so no import can start after this read.
+    int never_imported = r->kind == POOL_IMPORT && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE);
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
     // guest gets the storage back when this returns.
     vk_texture_range_gone(r->lo, r->size, r->alloc);
-    if (r->used && r->kind != POOL_VIRT) {
+    if (r->used && r->kind != POOL_VIRT && !never_imported) {
         uint64_t t0 = qpc();
         vk_upload_flush(1);
         uint64_t t1 = qpc();
@@ -569,6 +584,7 @@ void vk_pool_fini(pool_t *p) {
         pool_fini_note(r->size, t1 - t0, qpc() - t1);
     }
     vk_mem_collect();
+    if (r->staged) staged_released(r, !never_imported, qpc() - t_fini);   // before the record may go
     // A mirrored pool's record and buffers outlive the submission being recorded, whose sync copies and write-backs may
     // name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be queued).
     if (r->mbuf) mirror_retiring(r), vk_completion_add(vk_sync_issued() + 1, mirror_retire, r);
@@ -905,6 +921,7 @@ void vk_mem_census(uint64_t frame) {
     if (report_every < 0) report_every = cfg_int("TOTK_MEM_REPORT");
     __atomic_store_n(&mem_probe_frame, frame, __ATOMIC_RELAXED);
     lazy_frame_log(frame);
+    staged_frame_log(frame);
     if (report_every > 0 && frame % (uint64_t)report_every == 0) {
         char when[32];
         snprintf(when, sizeof when, "frame %llu", (unsigned long long)frame);
@@ -1942,25 +1959,36 @@ static void mirror_mode(int discrete, uint32_t vendor) {
 #endif
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
                           sh && *sh ? " (TOTK_SHADOW)" : "");
-    // TOTK_MIRROR_STAGED=<MiB> ("staged mirror" below): off (0) by default. It needs the mirror, the deferred imports
-    // (a pool imported at nvnMemoryPoolInitialize has paid the import already) and no shadow storage.
+    // TOTK_MIRROR_STAGED=<MiB>, <KiB>k or all ("staged mirror" below): off (0) by default. It needs the mirror, the
+    // deferred imports (a pool imported at nvnMemoryPoolInitialize has paid the import already) and no shadow storage.
+    // all stages every lazily imported pool (staged_min 1 byte), the small ones included.
     const char *ms = cfg_get("TOTK_MIRROR_STAGED");
-    uint64_t mib = ms && *ms ? strtoull(ms, NULL, 10) : 0;
-    if (mib) {
+    uint64_t want = 0;
+    if (ms && *ms) {
+        char *end = NULL;
+        uint64_t v = strtoull(ms, &end, 10);
+        want = !strcmp(ms, "all") ? 1 : end && (*end == 'k' || *end == 'K') ? v << 10 : v << 20;
+    }
+    if (want) {
         const char *lz = cfg_get("TOTK_POOL_LAZY");
         const char *off = !vk_mirror_on ? "the VRAM mirror is off" : shadow_on ? "shadow storage is on"
                         : lz && !strcmp(lz, "0") ? "TOTK_POOL_LAZY=0 imports every pool at once" : NULL;
         if (off) rt_log("mem: TOTK_MIRROR_STAGED=%s ignored: %s", ms, off);
         else {
-            staged_min = mib << 20;
+            staged_min = want;
             const char *wb = cfg_get("TOTK_STAGED_WB");
             staged_fault = !(wb && !strcmp(wb, "fence"));
             if (wb && *wb && strcmp(wb, "fence") && strcmp(wb, "fault"))
                 rt_log("mem: TOTK_STAGED_WB=%s is not fence or fault: fault", wb);
-            rt_log("mem: imported pools of %llu MiB or more are not imported: their VRAM mirror is filled from staging "
-                   "buffers, and the bytes the GPU writes %s (TOTK_MIRROR_STAGED, TOTK_STAGED_WB=%s)", (unsigned long long)mib,
+            char which[64];
+            if (want == 1) snprintf(which, sizeof which, "of every size");
+            else if (want % (1ull << 20)) snprintf(which, sizeof which, "of %llu KiB or more", (unsigned long long)(want >> 10));
+            else snprintf(which, sizeof which, "of %llu MiB or more", (unsigned long long)(want >> 20));
+            rt_log("mem: imported pools %s are not imported: their VRAM mirror is filled from staging buffers (pools up "
+                   "to %llu MiB in the prologue of the part that first uses them), and the bytes the GPU writes %s "
+                   "(TOTK_MIRROR_STAGED=%s, TOTK_STAGED_WB=%s)", which, (unsigned long long)(STG_SMALL >> 20),
                    staged_fault ? "stay in it until a CPU access fetches them" : "go back to guest memory at each fence",
-                   staged_fault ? "fault" : "fence");
+                   ms, staged_fault ? "fault" : "fence");
 #ifdef _WIN32
             if (staged_fault) mem_guard_hook(staged_fetch);
 #else
@@ -2294,6 +2322,7 @@ static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags
 }
 
 static void refuse(PoolRec *r, int why, const char *what) {
+    r->mrefused = (uint8_t)(why + 1);   // before the state: vk_mem_use reads it after MS_REFUSED (staged_import)
     ms_set(r, MS_REFUSED);
     uint64_t n = r->import_hi - r->import_lo;
     if (plat_inc64(&m_refused_n[why]) <= 4) {
@@ -2320,28 +2349,41 @@ typedef struct {
 } BigMirror;
 static BigMirror big_mirror;
 
-// ---- staged mirror (TOTK_MIRROR_STAGED=<MiB>, off by default)
+// ---- staged mirror (TOTK_MIRROR_STAGED=<MiB>, <KiB>k or all; off by default)
 // An imported pool of at least that size is never imported for the mirror's sake: the terrain arena of each layer of
 // Surf Hills is a 450 MiB CPU_CACHED pool, and its import at the first GPU use (65-85 ms in vkAllocateMemory on NVIDIA)
 // plus the full copy import -> mirror stalled one frame (#397). Importing it earlier only moved the cost: the driver
-// made the next vkQueueSubmit2 wait about as long. Here the pool keeps a VRAM mirror as any buffer-bound pool does, and
-// the bytes travel through host-visible staging memory that the CPU fills:
+// made the next vkQueueSubmit2 wait about as long. The same frame also imported about 276 small pools (73 MiB: 197 of
+// 256 KiB, the rest 4 to 28 KiB) in 36-42 ms, almost all of it a per-call cost of vkAllocateMemory (about 0.1 ms
+// whatever the size), and about 215 more on each reload of the layer; all stages them too. Here the pool keeps a VRAM
+// mirror as any buffer-bound pool does, and the bytes travel through host-visible staging memory that the CPU fills:
 // - Resolve: resolve_locked does not import the pool; its spans carry no buffer until VK_MEM_USE or VK_MEM_PICK gives
 //   them the mirror (vk_mem_use makes it on the first use, as for other pools). A path that needs the pool's own buffer
-//   imports it then (staged_import, logged once per pool with the reason): a mirror refused (budget, overlap, no write
-//   watch, allocation) or the first use on a TOTK_REPLAY_PAR helper thread, which may not make a mirror. Every buffer
-//   user of a resolved span calls VK_MEM_USE or VK_MEM_PICK first (vk_exec*.c, vk_dump.c); the rest only read guest
-//   memory on the CPU or ask whether an address is backed.
-// - First fill (staged_fill): the thread that made the mirror zeroes it on the GPU and copies the pages ever written
-//   in STG_CHUNK pieces, with mirror_lock let go, through STG_SLOTS staging buffers of the upload batch's staging pool,
-//   each piece a copy in an upload batch of its own that goes to the queue at once (vk_upload_flush(0)); a buffer is
-//   reused once its batch is done. The batches precede in queue order every part that uses the mirror, since no part that records a use of it
-//   is submitted before the recording of the thread that fills it is done.
+//   imports it then (staged_import, logged once per pool with the reason and counted by reason in the staged line): a
+//   mirror refused (budget, overlap, no write watch, allocation) or the first use on a TOTK_REPLAY_PAR helper thread,
+//   which may not make a mirror. Every buffer user of a resolved span calls VK_MEM_USE or VK_MEM_PICK first
+//   (vk_exec*.c, vk_dump.c): binds, draws, indirect-reset targets and aligned bind_range descriptors use, copies, fills,
+//   updates and vk_exec_read_buffer pick, and a pick of a staged pool makes its mirror as a use does. The rest only read
+//   guest memory on the CPU (the uniform snapshot, vk_usnap.c; the indirect-reset list read from guest memory,
+//   vk_exec_draw.c vk_exec_reset_indirect; counter words, unaligned bind_range copies, dumps) or ask whether an address
+//   is backed, so a pool that only those reach is never imported nor mirrored (the first-use census of the small pools
+//   had 70 of 276 first reached by the uniform snapshot).
+// - First fill of a large pool (staged_fill, over STG_SMALL): the thread that made the mirror zeroes it on the GPU and
+//   copies the pages ever written in STG_CHUNK pieces, with mirror_lock let go, through STG_SLOTS staging buffers of the
+//   upload batch's staging pool, each piece a copy in an upload batch of its own that goes to the queue at once
+//   (vk_upload_flush(0)); a buffer is reused once its batch is done. The batches precede in queue order every part that
+//   uses the mirror, since no part that records a use of it is submitted before the recording of the thread that fills
+//   it is done.
+// - First fill of a small pool (STG_SMALL or less): mirror_create queues the whole mirror in pend and marks it szero;
+//   the prologue of the part that made it (staged_upload) zeroes it and copies the pages ever written along with that
+//   prologue's other staged uploads, through the same staging buffers. The 276 small pools of a layer's first frame
+//   thus cost no submission of their own, where staged_fill would submit one upload batch or more for each.
 // - CPU -> mirror after that: mirror_sync queues the written pages as for any mirror, and the prologue
-//   (vk_mem_mirror_prologue) copies them from guest memory into a staging buffer it frees at the submission's fence
+//   (vk_mem_mirror_prologue) copies them from guest memory into staging buffers it frees at the submission's fence
 //   (staged_upload), outside mirror_lock, then records staging -> mirror. Bytes of a write-back of an earlier
 //   submission still in flight (below) are left out: guest memory gets them only at that fence, and the mirror
 //   already holds them, as shadow_copy does for the shadow storage.
+// - Release: a pool never imported releases without waiting for the GPU (vk_pool_fini, staged_released).
 // - GPU -> guest: vk_mem_mirror_end records mirror -> readback buffer for these pools' write-back ranges
 //   (staged_wb_record), and at the fence, before the submission's other callbacks report the writes (the job is queued
 //   at vk_mem_mirror_begin), the completion thread copies the bytes into guest memory (staged_wb_done). That copy is a
@@ -2349,7 +2391,15 @@ static BigMirror big_mirror;
 //   staged line as upload). A held part's early write-back (TOTK_WB_EARLY, vk_mem_mirror_wb_held) leaves these
 //   ranges to vk_mem_mirror_end (wb_early_takes): it copies into a pool's import, which a staged pool lacks.
 // - TOTK_MEMORY=verify works unchanged: it compares the mirror with guest memory. Pages a staged write-back just
-//   wrote count as written since their sync and are skipped.
+//   wrote count as written since their sync and are skipped. It also checks the zero fills: a page with no stamp
+//   whose guest bytes are not zero would show as a mismatch.
+// Eglantine (Eden) never imports guest memory for its buffers either: video_core/buffer_cache/buffer_cache.h
+// BufferCache::CreateBuffer makes a device buffer over the used range and clears it on the GPU (ClearBuffer),
+// SynchronizeBuffer collects the CPU-modified ranges minus the GPU-modified ones, and MappedUploadMemory copies them
+// into one staging buffer and records staging -> buffer in the command stream, as staged_upload does. Differences: Eden
+// makes buffers over the ranges the GPU uses (64 KiB pages, joining overlaps), here one mirror covers one pool; and its
+// memory tracker starts every page CPU-modified (video_core/buffer_cache/word_manager.h WordManager), so its first
+// sync uploads the whole range, where the write-watch stamps here leave the never-written pages to the zero fill.
 // Changes outside this file: vk_exec.c vk_exec_read_buffer picks before it tests the buffer, vk_sync.c passes the
 // fence to vk_mem_mirror_prologue.
 #define STG_CHUNK (16ull << 20)   // a piece of the first fill: STG_SLOTS of them fit the staging pool's kept blocks
@@ -2382,6 +2432,60 @@ static int nst_blk, cst_blk, st_blk_dirty = 1;
 static uint64_t st_blk_fence;           // st_lock: the prologue fence it was built for
 static volatile int32_t n_staged_imports, n_staged_fills;
 static volatile int64_t st_fill_ns, st_fill_bytes, st_wbcpu_ns, st_wbcpu_bytes;
+// What became of the staged pools, [0] since the start (the staged line), [1] since the last present (staged_frame_log):
+// mirrors whose first fill went into a prologue (small: count, mirror bytes, written bytes copied, CPU copy time) or
+// through staged_fill (big); imports after all by reason (the MR_ reasons of a refused mirror, then the first use on a
+// helper thread and a refusal without a reason, as for a pool finalized meanwhile) with their bytes; releases (all,
+// never imported and so with no GPU wait, of those the ones only CPU paths had resolved, with a mirror, imported after
+// all) and the time vk_pool_fini took for them.
+enum { SI_HELPER = MR_N, SI_GONE, SI_N };
+static const char *const si_name[SI_N] = {"budget", "untracked", "overlapping", "allocation", "helper thread", "other"};
+typedef struct {
+    int64_t small_n, small_bytes, small_copied, small_ns, big_n, imp_n[SI_N], imp_bytes[SI_N];
+    int64_t rel_n, rel_never, rel_cpu, rel_mirror, rel_imported, rel_ns;
+    int64_t drop_n, drop_bytes;   // released pools that dropped GPU-owned bytes unfetched (staged_forget), and the bytes
+} StCount;
+static volatile StCount stc[2];
+#define ST_ADD(field, v) (plat_add64(&stc[0].field, (int64_t)(v)), plat_add64(&stc[1].field, (int64_t)(v)))
+
+// Every present (vk_mem_census): a frame in which staged pools got a mirror, were imported after all or were released
+// gets a line (the first 256), so the first frame of a layer and the frames of its release show what the staged
+// path did there, beside lazy_frame_log's imports.
+static void staged_frame_log(uint64_t frame) {
+    static int lines;
+    if (!staged_min || lines >= 256) return;
+    volatile int64_t *src = (volatile int64_t *)&stc[1];   // StCount is all int64_t counters
+    int any = 0;
+    for (size_t i = 0; i < sizeof(StCount) / sizeof(int64_t) && !any; i++) any = src[i] != 0;
+    if (!any) return;
+    StCount c;
+    int64_t *d = (int64_t *)&c;
+    for (size_t i = 0; i < sizeof c / sizeof(int64_t); i++) d[i] = plat_xchg64(&src[i], 0);
+    lines++;
+    const double M = 1048576.0;
+    int64_t imp = 0;
+    for (int k = 0; k < SI_N; k++) imp += c.imp_n[k];
+    rt_log("mem: frame %llu: staged pools: %lld mirrors filled in a prologue (%.1f MiB, %.1f MiB of written pages "
+           "copied in %.1f ms), %lld by staged_fill; imported after all %lld (budget %lld, untracked %lld, overlapping %lld, "
+           "allocation %lld, helper thread %lld, other %lld); released %lld in %.1f ms (never imported %lld, with a mirror "
+           "%lld, imported %lld), %lld of them dropping %.3f MiB of GPU-owned bytes unfetched",
+           (unsigned long long)frame, (long long)c.small_n, c.small_bytes / M, c.small_copied / M, c.small_ns / 1e6,
+           (long long)c.big_n, (long long)imp, (long long)c.imp_n[MR_BUDGET], (long long)c.imp_n[MR_UNTRACKED],
+           (long long)c.imp_n[MR_OVERLAP], (long long)c.imp_n[MR_ALLOC], (long long)c.imp_n[SI_HELPER],
+           (long long)c.imp_n[SI_GONE], (long long)c.rel_n, c.rel_ns / 1e6, (long long)c.rel_never,
+           (long long)c.rel_mirror, (long long)c.rel_imported, (long long)c.drop_n, c.drop_bytes / M);
+}
+
+// vk_pool_fini, the pool out of the index and its record still alive: the release's counts (stc).
+static void staged_released(const PoolRec *r, int imported, uint64_t ns) {
+    ST_ADD(rel_n, 1), ST_ADD(rel_ns, ns);
+    if (imported) ST_ADD(rel_imported, 1);
+    else {
+        ST_ADD(rel_never, 1);
+        if (!r->mbuf && r->used) ST_ADD(rel_cpu, 1);   // resolved, but only by paths that read guest memory
+    }
+    if (r->mbuf) ST_ADD(rel_mirror, 1);
+}
 
 typedef struct { VkBuffer buf; VmaAllocation alloc; } StBuf;
 static void staged_free_buffer(void *arg) {   // completion thread: a prologue's staging buffer, after its fence
@@ -2445,6 +2549,8 @@ static void staged_free_buffer(void *arg) {   // completion thread: a prologue's
 static PlatMutex own_lock = PLAT_MUTEX_INIT;   // st_pools and every pool's own list; taken after pool_lock, st_lock
 static PoolRec **st_pools;              // own_lock: the live staged mirrors by import_lo (staged_fetch finds the pool here)
 static int nst_pools, cst_pools;
+static PoolRec **st_own;                // own_lock: those whose own list holds a range (PoolRec.own_ix), in no order
+static int nst_own, cst_own;
 static volatile uint64_t own_gen;       // own_lock: bumped by every change of an own list (st_blk_update)
 // Since the last staged line: protection changes, fetches by [write][game thread] and by kernel paths, their pages,
 // bytes and time, the longest; owned bytes now.
@@ -2455,6 +2561,7 @@ static volatile int64_t own_seen[3], own_pushed, own_take_ns, own_pfail;   // ow
 // to the fence copy-back (r->cpu_read), and the write-back pieces and bytes of CPU-read pages that the fence copied
 // back (staged_split_own).
 static volatile int64_t own_fempty, own_long, own_switched, own_fb_ranges, own_fb_bytes;
+static volatile int64_t own_drop_bytes;   // since the start: owned bytes released pools dropped unfetched (staged_forget)
 // Since the last staged line: copy-back pages found owned again that opened without a fetch, copy-back pieces kept
 // owned instead (staged_copy_back), and fetches the completion thread made inside staged_wb_done (none expected).
 static volatile int64_t own_cb_opened, own_cb_kept, own_cfetch;
@@ -2468,7 +2575,10 @@ typedef struct { uint64_t frame, addr, rip, ns; int write, guest, kernel, pages;
 static OwnRec own_rec[OWN_LOG];
 static volatile int32_t own_nrec, own_logged;
 
-// own_lock held: the index of the first staged pool whose import_lo is above a (st_pools is sorted by address).
+// With TOTK_MIRROR_STAGED=all there are hundreds to thousands of staged mirrors, and few of them own any byte: the
+// lookups below are binary searches of st_pools, and the loops that want the owned bytes (st_blk_update, own_log) walk
+// st_own, not every staged pool.
+// own_lock held: the index of the first staged pool whose import_lo is above a.
 static int st_upper(uint64_t a) {
     int lo = 0, hi = nst_pools;
     while (lo < hi) {
@@ -2483,6 +2593,20 @@ static int st_upper(uint64_t a) {
 static PoolRec *st_find(uint64_t a) {
     int i = st_upper(a) - 1;
     return i >= 0 && a < st_pools[i]->import_hi ? st_pools[i] : NULL;
+}
+
+// own_lock held, after r->own changed: r is on st_own while its list holds a range.
+static void own_listed(PoolRec *r) {
+    if (r->nown && !r->own_ix) {
+        if (nst_own == cst_own) grow((void **)&st_own, &cst_own, sizeof *st_own);
+        st_own[nst_own++] = r;
+        r->own_ix = nst_own;
+    } else if (!r->nown && r->own_ix) {
+        PoolRec *last = st_own[--nst_own];   // the last one takes r's place (r itself when it is the last)
+        st_own[r->own_ix - 1] = last;
+        last->own_ix = r->own_ix;
+        r->own_ix = 0;
+    }
 }
 
 // own_lock held: the sorted ranges add[0..n) (one pool's, offsets) joined to r->own.
@@ -2503,6 +2627,7 @@ static void own_merge(PoolRec *r, const StRange *add, int n) {
     int c = r->cown;
     r->own = out, r->cown = cout, r->nown = o;
     out = old, cout = c;
+    own_listed(r);
 }
 
 // own_lock held: the sorted, disjoint pieces cut[0..n) (offsets) leave r->own.
@@ -2529,6 +2654,7 @@ static void own_cut(PoolRec *r, const struct KeptRange *cut, int n) {
     int c = r->cown;
     r->cown = cout, cout = c;
     r->nown = o;
+    own_listed(r);
 }
 
 // vk_mem_mirror_end, fault mode: the staged write-back ranges in stw split by page; those on pages the CPU has read
@@ -2845,14 +2971,18 @@ static void staged_forget(PoolRec *r) {
     for (int k = 0; k < r->nown; k++) bytes += r->own[k].hi - r->own[k].lo;
     free(r->own);
     r->own = NULL, r->nown = r->cown = 0;
+    own_listed(r);
     __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&own_lock);
-    uint64_t frame = __atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED);
-    if (plat_inc32(&logged) <= 32)
-        rt_log("mem: staged pool %#llx of %.0f MiB released at frame %llu: %d owned ranges (%.1f MiB) dropped unfetched, "
+    uint64_t frame = __atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED), n = r->import_hi - r->import_lo;
+    plat_add64(&own_drop_bytes, (int64_t)bytes);
+    if (bytes) ST_ADD(drop_n, 1), ST_ADD(drop_bytes, bytes);
+    // The first 32 that dropped or opened anything, or are large: with all pools staged, a layer's exit releases
+    // hundreds of small pools that own nothing, and the staged frame line counts those.
+    if ((ranges || opened || claimed || n >= BIG_MIRROR) && plat_inc32(&logged) <= 32)
+        rt_log("mem: staged pool %#llx of %.2f MiB released at frame %llu: %d owned ranges (%.1f MiB) dropped unfetched, "
                "%d pages opened, %d left to the threads that claimed them, %.2f ms", (unsigned long long)r->lo,
-               (r->import_hi - r->import_lo) / 1048576.0, (unsigned long long)frame, ranges, bytes / 1048576.0, opened,
-               claimed, qpc_ms(qpc() - t0));
+               n / 1048576.0, (unsigned long long)frame, ranges, bytes / 1048576.0, opened, claimed, qpc_ms(qpc() - t0));
 }
 
 // vk_mem_shutdown, the device idle, before the pools and the staging pool go: the owned pages are fetched while the
@@ -2875,9 +3005,9 @@ static void staged_own_shutdown(VkCtx *c) {
         int claimed;
         mem_guard_drop(r->import_lo, r->import_hi - r->import_lo, &claimed);
         free(r->own);
-        r->own = NULL, r->nown = r->cown = 0;
+        r->own = NULL, r->nown = r->cown = r->own_ix = 0;
     }
-    nst_pools = 0;
+    nst_pools = nst_own = 0;
     __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
     if (fc.pool) {   // the command buffer goes with its pool
         vkDestroyFence(c->device, fc.fence, NULL);
@@ -2892,10 +3022,15 @@ static void own_log(uint64_t frame, double f) {
     uint64_t bytes = 0, cpu_read = 0;
     int ranges = 0;
     plat_mutex_lock(&own_lock);
-    for (int i = 0; i < nst_pools; i++) {
-        const PoolRec *r = st_pools[i];
+    for (int i = 0; i < nst_own; i++) {
+        const PoolRec *r = st_own[i];
         ranges += r->nown;
         for (int k = 0; k < r->nown; k++) bytes += r->own[k].hi - r->own[k].lo;
+    }
+    // Every staged pool's marks: a byte a page, about 0.3 MB for the arena and all the small pools of a layer, once a
+    // summary line (every 60 frames with TOTK_TRACE=perf).
+    for (int i = 0; i < nst_pools; i++) {
+        const PoolRec *r = st_pools[i];
         for (uint64_t p = 0; p <= (r->import_hi - r->import_lo) >> 12; p++) cpu_read += r->cpu_read[p];
     }
     plat_mutex_unlock(&own_lock);
@@ -2945,9 +3080,14 @@ static void own_log(uint64_t frame, double f) {
 }
 
 // The span's pool resolved without a buffer (staged_pending) and the mirror cannot serve this use: import it after
-// all, as lazy_import does on a first GPU use. Logged once per pool, with why. Neither a mirror nor an import is the
-// one case a resolved span cannot be given a buffer, so it stops the game with a line instead of binding no buffer.
-static void staged_import(VkMemSpan *sp, const char *why) {
+// all, as lazy_import does on a first GPU use. Logged once per pool (the first 32) and counted by reason (stc: an MR_
+// reason of the refused mirror, SI_HELPER or SI_GONE). Neither a mirror nor an import is the one case a resolved span
+// cannot be given a buffer, so it stops the game with a line instead of binding no buffer.
+static void staged_import(VkMemSpan *sp, int why) {
+    static const char *const text[SI_N] = {"its VRAM mirror does not fit the budget", "its range is not write-watched",
+                                           "it overlaps or shares a page with another pool",
+                                           "the device-local allocation failed",
+                                           "first used on a TOTK_REPLAY_PAR helper thread", "its VRAM mirror was refused"};
     PoolRec *r = sp->pool;
     uint64_t t0 = qpc();
     pool_lock_shared();   // as resolve_locked: the record stays alive while lazy_import runs
@@ -2955,32 +3095,26 @@ static void staged_import(VkMemSpan *sp, const char *why) {
     plat_mutex_unlock_shared(&pool_lock);
     if (!ok)
         rt_fatal("mem: staged pool %#llx+%#llx has neither a mirror nor an import (%s)", (unsigned long long)r->lo,
-                 (unsigned long long)r->size, why);
+                 (unsigned long long)r->size, text[why]);
     if (!plat_xchg32(&r->sfell, 1)) {
         long n = plat_inc32(&n_staged_imports);
+        ST_ADD(imp_n[why], 1), ST_ADD(imp_bytes[why], r->size);
         if (n <= 32)
             rt_log("mem: staged pool %#llx+%#llx imported after all: %s (%.1f ms; %ld so far)", (unsigned long long)r->lo,
-                   (unsigned long long)r->size, why, qpc_ms(qpc() - t0), n);
+                   (unsigned long long)r->size, text[why], qpc_ms(qpc() - t0), n);
     }
     sp->buffer = r->buf;
 }
 
-// The first fill of a staged mirror, on the thread that made it, mirror_lock let go (see above). bm: mirror_create's
-// times, for the line.
-// Only the pages the write-watch ever saw written are copied; the rest of the mirror is zeroed on the GPU. Guest
+// The pages of staged pool r the write-watch ever saw written, as runs (offsets from import_lo) appended to *a, from
+// the page generations; returns their bytes. A first fill copies only these and zeroes the rest of the mirror. Guest
 // memory is write-watched from its reservation (memory.c watched, win32.c plat_mem_reserve), and mirror_create's
 // snapshot has just stamped every page written since the last query, so a page with no stamp has never been written
 // and still holds the zeros it was committed with. Reading such pages is what made a full copy slow: in the Hilltop
 // Layer the 450 MiB arena had little written, and the copy of all of it ran at 2 GiB/s (219 ms), a demand-zero or
 // lazy-heap commit fault per page. A page written after the scan is stamped after the mirror's mgen and copied in by
 // the next sync, as with the full copy.
-static void staged_fill(PoolRec *r, const BigMirror *bm) {
-    VkCtx *c = vk_ctx();
-    uint64_t n = r->import_hi - r->import_lo, t0 = qpc(), t_alloc = 0, t_copy = 0, t_wait = 0, t_scan, pieces = 0;
-    // The written pages as runs (offsets from import_lo), from the page generations.
-    static _Thread_local MRange *run;
-    static _Thread_local int nrun, crun;
-    nrun = 0;
+static uint64_t staged_runs(PoolRec *r, MRange **a, int *n, int *cap) {
     uint64_t copied = 0;
     plat_mutex_lock_shared(&gen_lock);
     for (uint64_t x = r->import_lo; x < r->import_hi;) {
@@ -2989,10 +3123,23 @@ static void staged_fill(PoolRec *r, const BigMirror *bm) {
         const uint32_t *ch = gen_chunk[x >> GEN_CHUNK_SHIFT];
         for (; ch && x < ce; x += 1ull << GEN_PAGE_SHIFT)
             if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)])
-                range_add(&run, &nrun, &crun, r, x - r->import_lo, 1ull << GEN_PAGE_SHIFT), copied += 1ull << GEN_PAGE_SHIFT;
+                range_add(a, n, cap, r, x - r->import_lo, 1ull << GEN_PAGE_SHIFT), copied += 1ull << GEN_PAGE_SHIFT;
         x = ce;
     }
     plat_mutex_unlock_shared(&gen_lock);
+    return copied;
+}
+
+// The first fill of a large staged mirror (over STG_SMALL), on the thread that made it, mirror_lock let go (see
+// above): the pages staged_runs finds are copied in, the rest of the mirror is zeroed on the GPU. bm: mirror_create's
+// times, for the line.
+static void staged_fill(PoolRec *r, const BigMirror *bm) {
+    VkCtx *c = vk_ctx();
+    uint64_t n = r->import_hi - r->import_lo, t0 = qpc(), t_alloc = 0, t_copy = 0, t_wait = 0, t_scan, pieces = 0;
+    static _Thread_local MRange *run;
+    static _Thread_local int nrun, crun;
+    nrun = 0;
+    uint64_t copied = staged_runs(r, &run, &nrun, &crun);
     t_scan = qpc() - t0;
     VkCommandBuffer cb = vk_upload_begin();
     vkCmdFillBuffer(cb, r->mbuf, 0, VK_WHOLE_SIZE, 0);   // the pages never written
@@ -3047,6 +3194,7 @@ static void staged_fill(PoolRec *r, const BigMirror *bm) {
     plat_add64(&st_fill_ns, (int64_t)total);
     plat_add64(&st_fill_bytes, (int64_t)copied);
     long nf = plat_inc32(&n_staged_fills);
+    ST_ADD(big_n, 1);
     if (nf <= 32)
         rt_log("mem: staged mirror of %.0f MiB at %#llx made in %.1f ms on first use (after %.1f ms waiting for the walk "
                "and the mirror lock): pool lookup %.1f, budget check %.1f, snapshot %.1f (%llu queries, %llu written "
@@ -3079,12 +3227,14 @@ static void st_blk_update(uint64_t fence) {
         for (int i = 0; i < j->no; i++) range_add(&st_blk, &nst_blk, &cst_blk, j->o[i].r, j->o[i].off, j->o[i].size);
     }
     if (staged_fault) {   // the bytes only the mirrors hold: guest memory there is stale
+        // The pools whose own list holds a range, not every staged pool: with TOTK_MIRROR_STAGED=all hundreds to
+        // thousands of them, a cache miss each, at every prologue after an own list changed (most fences).
         plat_mutex_lock(&own_lock);
         og = __atomic_load_n(&own_gen, __ATOMIC_ACQUIRE);
-        for (int i = 0; i < nst_pools; i++)
-            for (int k = 0; k < st_pools[i]->nown; k++)
-                range_add(&st_blk, &nst_blk, &cst_blk, st_pools[i], st_pools[i]->own[k].lo,
-                          st_pools[i]->own[k].hi - st_pools[i]->own[k].lo);
+        for (int i = 0; i < nst_own; i++)
+            for (int k = 0; k < st_own[i]->nown; k++)
+                range_add(&st_blk, &nst_blk, &cst_blk, st_own[i], st_own[i]->own[k].lo,
+                          st_own[i]->own[k].hi - st_own[i]->own[k].lo);
         plat_mutex_unlock(&own_lock);
     }
     owngen = og;
@@ -3100,17 +3250,57 @@ static void st_blk_update(uint64_t fence) {
     st_blk_dirty = 0, st_blk_fence = fence;
 }
 
+// staged_upload: a piece of staging is full (used bytes) and the copies out of it are recorded; freed at the fence.
+static void staged_piece_done(VkBuffer sb, VmaAllocation sa, uint64_t used, uint64_t fence) {
+    vmaFlushAllocation(vk_ctx()->vma, sa, 0, used);
+    StBuf *s = malloc(sizeof *s);
+    if (!s) rt_fatal("vk: out of memory");
+    *s = (StBuf){sb, sa};
+    vk_completion_add(fence, staged_free_buffer, s);
+}
+
 // Replay thread, in the prologue of the part (fence: its submission's), mirror_lock not held: the ranges in stq go
-// from guest memory into one staging buffer and from there into their mirrors, minus the write-back bytes in flight.
-// The barriers around it are the prologue's.
-static void staged_upload(VkCommandBuffer cb, uint64_t fence) {
+// from guest memory into staging buffers and from there into their mirrors, minus the write-back bytes in flight.
+// A small staged mirror made during the part (szero, mirror_create) is zeroed first, and the pages ever written
+// (staged_runs) take the place of its queued whole range: the first fills of a layer's 276 small pools go into this one
+// prologue, with no submission of their own. Staging comes in pieces of at most STG_CHUNK from the staging pool's kept
+// blocks (vk_staging), so the up to 73 MiB of such a frame need no vkAllocateMemory of a larger buffer.
+// The barriers around it are the prologue's. Returns whether it recorded zero fills: the prologue's last barrier then
+// covers clears as well as copies.
+static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
     static MRange *sbuf, *cut;
     static size_t scap;
     static int ncut, ccut;
     static VkBufferCopy *reg;
     static int creg;
+    static PoolRec **zl;   // the pools first filled here, in stq's order (by address of the record)
+    static int nzl, czl;
     uint64_t t0 = qpc();
     sort_ranges(stq, (size_t)nstq, &sbuf, &scap);
+    nzl = 0;
+    int m = 0;
+    for (int i = 0; i < nstq; i++) {
+        PoolRec *r = stq[i].r;
+        if (r->szero) {   // replay thread only from mirror_create's store on (mirror_lock taken since, by the prologue)
+            r->szero = 0;
+            if (nzl == czl) grow((void **)&zl, &czl, sizeof *zl);
+            zl[nzl++] = r;
+        }
+        if (nzl && zl[nzl - 1] == r) continue;   // its ranges are the whole mirror (and syncs of it, none yet)
+        stq[m++] = stq[i];
+    }
+    nstq = m;
+    uint64_t z_bytes = 0, z_copied = 0, z_ns = 0;
+    for (int z = 0; z < nzl; z++) {
+        vkCmdFillBuffer(cb, zl[z]->mbuf, 0, VK_WHOLE_SIZE, 0);   // the pages never written
+        z_bytes += zl[z]->import_hi - zl[z]->import_lo;
+        z_copied += staged_runs(zl[z], &stq, &nstq, &cstq);
+    }
+    if (nzl) {
+        mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT);   // the written pages land over the zeros
+        sort_ranges(stq, (size_t)nstq, &sbuf, &scap);
+    }
     // A job leaves st_jobs only after its bytes are in guest memory or on the pool's own list (staged_wb_done), so a
     // range blocked here has its bytes in the mirror and one not blocked has them in guest memory; the copies need not
     // hold the lock. No job ends meanwhile: vk_mem_mirror_end runs on this thread. A fetch that empties an own range
@@ -3145,32 +3335,45 @@ static void staged_upload(VkCommandBuffer cb, uint64_t fence) {
     }
     plat_mutex_unlock(&st_lock);
     if (total) {
-        VkBuffer sb;
-        VmaAllocation sa;
-        uint8_t *map = vk_staging(total, &sb, &sa), *p = map;
+        VkBuffer sb = VK_NULL_HANDLE;
+        VmaAllocation sa = NULL;
+        uint8_t *map = NULL;
+        uint64_t used = 0, room = 0, left = total;
         int probe = staged_fault;   // owned pages: copied without opening them
-        for (int i = 0; i < ncut;) {
+        for (int i = 0, zi = 0; i < ncut;) {
             PoolRec *r = cut[i].r;
+            while (zi < nzl && (uintptr_t)zl[zi] < (uintptr_t)r) zi++;
+            int first = zi < nzl && zl[zi] == r;   // its first fill: timed apart
+            uint64_t tz = first ? qpc() : 0;
             int k = 0;
-            for (; i < ncut && cut[i].r == r; i++) {
+            for (uint64_t done = 0; i < ncut && cut[i].r == r;) {
+                if (used == room) {   // the next piece of staging; the copies out of the full one first
+                    if (k) vkCmdCopyBuffer(cb, sb, r->mbuf, (uint32_t)k, reg), k = 0;
+                    if (sb) staged_piece_done(sb, sa, used, fence);
+                    room = left < STG_CHUNK ? left : STG_CHUNK;
+                    map = vk_staging(room, &sb, &sa);
+                    used = 0;
+                }
+                uint64_t len = cut[i].size - done, src = r->import_lo + cut[i].off + done;
+                if (len > room - used) len = room - used;
+                if (probe) mem_probe_copy(map + used, src, len);   // the guard stays on
+                else memcpy(map + used, (const void *)(uintptr_t)src, len);
                 if (k == creg) grow((void **)&reg, &creg, sizeof *reg);
-                if (probe) mem_probe_copy(p, r->import_lo + cut[i].off, cut[i].size);   // the guard stays on
-                else memcpy(p, (const void *)(uintptr_t)(r->import_lo + cut[i].off), cut[i].size);
-                reg[k++] = (VkBufferCopy){(VkDeviceSize)(p - map), cut[i].off, cut[i].size};
-                p += cut[i].size;
+                reg[k++] = (VkBufferCopy){used, cut[i].off + done, len};
+                used += len, left -= len, done += len;
+                if (done == cut[i].size) i++, done = 0;
             }
-            vkCmdCopyBuffer(cb, sb, r->mbuf, (uint32_t)k, reg);
+            if (k) vkCmdCopyBuffer(cb, sb, r->mbuf, (uint32_t)k, reg);
+            if (first) z_ns += qpc() - tz;
         }
-        vmaFlushAllocation(vk_ctx()->vma, sa, 0, total);
-        StBuf *s = malloc(sizeof *s);
-        if (!s) rt_fatal("vk: out of memory");
-        *s = (StBuf){sb, sa};
-        vk_completion_add(fence, staged_free_buffer, s);
+        if (sb) staged_piece_done(sb, sa, used, fence);
     }
+    if (nzl) ST_ADD(small_n, nzl), ST_ADD(small_bytes, z_bytes), ST_ADD(small_copied, z_copied), ST_ADD(small_ns, z_ns);
     mrep.upload_bytes += total, mrep.upload_copies += (uint64_t)ncut;   // the mirror line's totals include them
     mrep.st_up_bytes += total, mrep.st_up_ranges += (uint64_t)ncut, mrep.st_skip_bytes += skipped;
     mrep.st_up_t += qpc() - t0;
     nstq = 0;
+    return nzl > 0;
 }
 
 // vk_mem_mirror_end: the write-back ranges of staged mirrors (stw) go mirror -> a readback buffer of the submission's
@@ -3412,8 +3615,9 @@ static void staged_shutdown(VkCtx *c) {
     plat_mutex_unlock(&st_lock);
 }
 
-// Replay thread: the pool's mirror on its first buffer use. A staged pool's mirror is not filled here: fill->pending
-// tells the caller to fill it (staged_fill) once mirror_lock is let go, with the times of this part in *fill.
+// Replay thread: the pool's mirror on its first buffer use. A staged pool's mirror is not filled here: for a large one
+// fill->pending tells the caller to fill it (staged_fill) once mirror_lock is let go, with the times of this part in
+// *fill; a small one is filled by the next prologue (staged_upload).
 static void mirror_create(PoolRec *r, BigMirror *fill) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
@@ -3429,9 +3633,16 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
     while (i >= 0 && pool_index.e[i].buf != r) i--;
     int alone = i >= 0 && (i == 0 || pool_index.maxhi[i - 1] <= pool_index.e[i].lo) &&
                 (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= pool_index.e[i].hi);
+    // A staged mirror's GPU-owned bytes are protected, fetched and dropped by 4 KiB page, with the page given to the
+    // one pool whose import range holds it (staged_fetch): no other pool may reach into its pages. NVN pools are 4 KiB
+    // aligned and sized, so this holds unless the import alignment is coarser than a page.
+    int apart = alone && (!staged || !staged_fault ||
+                          ((i == 0 || pool_index.maxhi[i - 1] <= r->import_lo) &&
+                           (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= r->import_hi)));
     plat_mutex_unlock_shared(&pool_lock);
     if (i < 0) return ms_set(r, MS_REFUSED);   // finalized meanwhile
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
+    if (!apart) return refuse(r, MR_OVERLAP, "its staged mirror would share a page with another pool");
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return refuse(r, MR_UNTRACKED, "outside the write-watched address space");
     uint64_t t1 = qpc();
@@ -3486,10 +3697,14 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
         nst_pools++;
         plat_mutex_unlock(&own_lock);
     }
+    // A small staged mirror is first filled by the prologue of this part (staged_upload): the whole range queued here
+    // stands for the zero fill and the written pages, so that the prologue runs (vk_mem_mirror_pending) and the range
+    // goes the staged way (sfeed). Before MS_ON, like the other fields; under mirror_lock when shared, like pend.
+    if (staged && n <= STG_SMALL) r->szero = 1, range_add(&pend, &npend, &cpend, r, 0, n);
     ms_set(r, MS_ON);   // after mbuf, acc_sub and sfeed: what a reader of MS_ON goes on to read
     BigMirror bm = {1, r->lo, n, 0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, qpc() - t0, q, wpages};
-    if (staged) *fill = bm;   // filled by the caller, which logs it
-    else {
+    if (staged && n > STG_SMALL) *fill = bm;   // filled by the caller (staged_fill), which logs it
+    else if (!staged) {
         range_add(&pend, &npend, &cpend, r, 0, n);
         if (n >= BIG_MIRROR) big_mirror = bm;
     }
@@ -3684,7 +3899,7 @@ void vk_mem_use(VkMemSpan *sp) {
         // still recorded: a staged pool's span gets the import there.
         if (vk_spec_helper()) {
             vk_spec_fail(VK_SPEC_MIRROR);
-            if (!sp->buffer) staged_import(sp, "first used on a TOTK_REPLAY_PAR helper thread");
+            if (!sp->buffer) staged_import(sp, SI_HELPER);
             return;
         }
         uint64_t t0 = qpc();
@@ -3704,7 +3919,7 @@ void vk_mem_use(VkMemSpan *sp) {
         state = ms_get(r);
     }
     if (state != MS_ON) {
-        if (!sp->buffer) staged_import(sp, "its VRAM mirror was refused");   // a staged pool that stays without one
+        if (!sp->buffer) staged_import(sp, r->mrefused ? r->mrefused - 1 : SI_GONE);   // a staged pool that stays without one
         return;
     }
     if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) mirror_sync(r);
@@ -4006,9 +4221,10 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence) {
         }
     }
     mirror_unlock(locked);
-    if (nstq) staged_upload(cb, fence);   // the replay thread's list: no other thread adds to it
+    int fills = nstq ? staged_upload(cb, fence) : 0;   // the replay thread's list: no other thread adds to it
     if (any)
-        mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        mbarrier(cb, fills ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
 }
 
@@ -4458,6 +4674,22 @@ static void mirror_log(uint64_t frame) {
                qpc_ms(a.st_up_t) / f, a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
+        const volatile StCount *s = &stc[0];
+        char imp[192];
+        size_t o = 0;
+        imp[0] = 0;
+        for (int k = 0; k < SI_N && o < sizeof imp; k++)
+            if (s->imp_n[k])
+                o += (size_t)snprintf(imp + o, sizeof imp - o, ", %s %lld (%.1f MiB)", si_name[k], (long long)s->imp_n[k],
+                                      s->imp_bytes[k] / M);
+        rt_log("mem: staged pools frame %llu: so far: mirrors with the first fill in a prologue %lld (%.1f MiB, %.1f MiB of "
+               "written pages copied in %.1f ms), by staged_fill %lld; imported after all %d%s; released %lld in %.1f ms "
+               "(never imported, no GPU wait: %lld, %lld of them resolved only by CPU paths; with a mirror %lld; imported "
+               "%lld), owned bytes dropped unfetched %.2f MiB",
+               (unsigned long long)frame, (long long)s->small_n, s->small_bytes / M, s->small_copied / M,
+               s->small_ns / 1e6, (long long)s->big_n, n_staged_imports, imp, (long long)s->rel_n, s->rel_ns / 1e6,
+               (long long)s->rel_never, (long long)s->rel_cpu, (long long)s->rel_mirror, (long long)s->rel_imported,
+               own_drop_bytes / M);
         if (staged_fault) own_log(frame, f);
     }
 
