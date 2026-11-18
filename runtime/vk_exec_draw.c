@@ -3673,6 +3673,11 @@ static int pipe_skip_mode(void) {
 // 5070 Ti, 5080, 5090). On a replayed route that faulted in every run that drew it, zeroing its attribute or uniform
 // values only avoided the fault where that culls the instance (Location 6.w is its draw-or-not test), so as in #9 the
 // fault does not follow the values. Skipping it by name gave 0 faults in 7 runs that reached the spot.
+//
+// Vertex stage 45e1a6f48cb7872e (fragment stage d8fd5bc376a98b3d) loses the device at the first checkpoint of the
+// Landfill Layer on 3.2.0 (#304, RTX 5070 and RTX 5090, driver 621.24): the GPU checkpoints name it as the last draw
+// that started on 0.4.1, and skip_vs of it with 347fa80c9be79539 avoided the device loss for the reporter. It does not
+// fault on our RTX 5060 Ti, so it is skipped by name like ba1dd1e7ae8abb33.
 static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const GfxShader *fs) {
     DrawCtx *const dc = DC_OF(ex);
     static int on = -1;
@@ -3686,6 +3691,10 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
     const uint64_t vs_origin = stage_origin(dc, ex->prog, NVN_STAGE_VS);
     if (vs_origin == 0xba1dd1e7ae8abb33ull) {
         warn_once(W_FAULT_SKIP2, "the light quads of NVN 2 vertex stage ba1dd1e7ae8abb33 are skipped (#196, #197)");
+        return 1;
+    }
+    if (vs_origin == 0x45e1a6f48cb7872eull) {
+        warn_once(W_FAULT_SKIP, "the draws of NVN 2 vertex stage 45e1a6f48cb7872e are skipped (#304)");
         return 1;
     }
     // The #9 part (cae0ef8e9fe9147f and the c0+0x530 family) is off unless TOTK_FIX_VS_FAULT=9: on current builds the
