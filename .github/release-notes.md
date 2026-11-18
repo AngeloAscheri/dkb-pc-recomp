@@ -6,6 +6,7 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - #372 Leave the translator's emulated compare-exchange loop after 1024 attempts (@roverdrubber)
 - dotnet no longer adds a dead folder to the user's PATH on each install (c222918).
 - The draws of vertex stage 45e1a6f48cb7872e are skipped on NVIDIA, for the device loss at the Landfill Layer's first checkpoint on 3.2.0 (#304).
+- HD rumble is off by default (`rumble_hd = auto` turns it on): three third-party Switch Pro pads broke with it (#363, #383).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
 - The radial blur a smash starts ends above 60 fps with `realtime = 1` on 1.0.0 too, as #159 did for 3.2.0 (#389, #390).
