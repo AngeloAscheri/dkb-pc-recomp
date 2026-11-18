@@ -42,7 +42,8 @@ void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recordi
 // time, for the parts where waiting and working are to be told apart.
 enum { PERF_PH_IMPORT = PERF_N, PERF_PH_MIRROR, PERF_PH_MIRROR_BEGIN, PERF_PH_MSYNC, PERF_PH_WW, PERF_PH_SHADER,
        PERF_PH_IMAGE, PERF_PH_DLSS_CREATE, PERF_PH_DLSS_EVAL, PERF_PH_TEMPORAL, PERF_PH_SPIRV_HASH, PERF_PH_SLICE_START,
-       PERF_PH_SLICE_WAIT, PERF_PH_SUBMIT, PERF_PH_USNAP, PERF_PH_BUDGET, PERF_PH_PROLOGUE, PERF_PH_MIRROR_END, PERF_PH_N };
+       PERF_PH_SLICE_WAIT, PERF_PH_SUBMIT, PERF_PH_USNAP, PERF_PH_BUDGET, PERF_PH_PROLOGUE, PERF_PH_MIRROR_END,
+       PERF_PH_WB_LISTS, PERF_PH_ST_SPLIT, PERF_PH_WB_HELD, PERF_PH_N };
 int perf_ph_replay_begin(void);                 // returns what perf_ph_replay_end takes
 void perf_ph_replay_end(int prev);
 int perf_ph_worker_begin(void);                 // a slice worker records a slice: its parts go to a bank of their own

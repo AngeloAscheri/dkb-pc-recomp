@@ -430,7 +430,9 @@ static const char *const ph_name[PERF_PH_N] = {
     [PERF_PH_SPIRV_HASH] = "SPIR-V hashes (upscaler match)", [PERF_PH_SLICE_START] = "slice worker start",
     [PERF_PH_SLICE_WAIT] = "waits for slices", [PERF_PH_SUBMIT] = "part submits",
     [PERF_PH_USNAP] = "uniform snapshot", [PERF_PH_BUDGET] = "VRAM budget queries",
-    [PERF_PH_PROLOGUE] = "mirror prologues", [PERF_PH_MIRROR_END] = "mirror end (write-back recording)"};
+    [PERF_PH_PROLOGUE] = "mirror prologues", [PERF_PH_MIRROR_END] = "mirror end (write-back recording)",
+    [PERF_PH_WB_LISTS] = "write-back lists taken", [PERF_PH_ST_SPLIT] = "staged write-backs split and recorded",
+    [PERF_PH_WB_HELD] = "held parts' write-back checks"};
 
 // TOTK_PERF_PARTS=1 (with TOTK_TRACE=perf; off by default): the same parts summed over the 60 frames of each perf line
 // and printed per frame (perf: frame N: replay by part per frame), for the steady state, where no frame is slow enough

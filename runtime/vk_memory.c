@@ -5300,6 +5300,7 @@ static void wb_shutdown(VkCtx *c) {   // vk_mem_shutdown, the device idle: the p
 void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes) {
     if (!vk_mirror_on) return;
     // Enough to be worth a command buffer? The walk's own list here, the slice threads' under their locks.
+    uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
     uint64_t bytes = 0;
     for (int i = 0; i < nwbl; i++) bytes += wb_early_takes(&wbl[i], upto) ? wbl[i].size : 0;
     for (WbLocal *w = __atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE); w && bytes < min_bytes; w = w->next) {
@@ -5307,6 +5308,7 @@ void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes) {
         for (int i = 0; i < w->n; i++) bytes += wb_early_takes(&w->a[i], upto) ? w->a[i].size : 0;
         plat_mutex_unlock(&w->lock);
     }
+    perf_ph_end(PERF_PH_WB_HELD, ph);
     if (bytes < min_bytes) return;
     WbJob j = {fence, upto, msub, min_bytes, NULL, 0};
     int cown = 0;
@@ -5326,6 +5328,7 @@ void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes) {
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay inside the mirror end (perf.c ph_frame)
     wb_jobs_wait();   // their copies go to the queue ahead of the last part, and the lists are this thread's again
     if (WB.t) {
         plat_mutex_lock(&WB.lock);
@@ -5335,6 +5338,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         plat_mutex_unlock(&WB.lock);
     }
     if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take(), kept_take();
+    perf_ph_end(PERF_PH_WB_LISTS, ph);
     if (nwbl) {
         VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_COPY_BIT;
         VkAccessFlags2 reads = VK_ACCESS_2_TRANSFER_READ_BIT, writes = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -5354,9 +5358,11 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
                 else wbl[k++] = wbl[i];
         }
         if (k) rec += copy_ranges(cb, wbl, k, 0, &mrep.wb_bytes, &mrep.wb_copies, fence);
+        uint64_t ps = perf_ph_begin_cpu();
         if (nstw && staged_fault) staged_split_own();   // most stay in the mirror; pages the CPU read go back
         if (fetch_test && st_cur && st_cur->no) rec += staged_ref_record(cb);   // TOTK_STAGED_FETCH_TEST
         if (nstw) rec += staged_wb_record(cb);
+        perf_ph_end(PERF_PH_ST_SPLIT, ps);
         rec += 2;
         mbarrier(cb, stage, writes,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
