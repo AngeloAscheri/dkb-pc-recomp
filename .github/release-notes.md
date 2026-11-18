@@ -9,6 +9,7 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - #393 Copy the indirect reset's disjoint records in address order (@wrothgaril)
 - #400 Log where a large pool's first GPU use spends its time, and resume write-watch queries where a full answer stopped (@wrothgaril)
 - #409 Save TOTK_SHOTS and --shot pictures of an RGB10A2 (HDR) presented image (@wrothgaril)
+- #378 Lazy write-back of shader storage writes on Linux, off by default (@roverdrubber)
 - HD rumble is off by default (`rumble_hd = auto` turns it on): three third-party Switch Pro pads broke with it (#363, #383).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
