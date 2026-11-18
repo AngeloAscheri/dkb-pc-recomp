@@ -3813,9 +3813,12 @@ static uint64_t staged_runs(PoolRec *r, MRange **a, int *n, int *cap) {
     return copied;
 }
 
+static void upload_wait(uint64_t seq);
+
 // The first fill of a large staged mirror (over STG_SMALL), on the thread that made it, mirror_lock let go (see
-// above): the pages staged_runs finds are copied in, the rest of the mirror is zeroed on the GPU. bm: mirror_create's
-// times, for the line.
+// above): the pages staged_runs finds are copied in, the rest of the mirror is zeroed on the GPU. A staging buffer is
+// reused once the batch of its previous piece is done, waited for on that batch's fence (upload_wait), which reports a
+// lost device. bm: mirror_create's times, for the line.
 static void staged_fill(PoolRec *r, const BigMirror *bm) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo, t0 = qpc(), t_alloc = 0, t_copy = 0, t_wait = 0, t_scan, pieces = 0;
@@ -3842,7 +3845,7 @@ static void staged_fill(PoolRec *r, const BigMirror *bm) {
             s->map = vk_staging(STG_CHUNK, &s->buf, &s->alloc);
             t_alloc += qpc() - t;
         } else {
-            while (!vk_upload_done(s->seq)) plat_yield();   // its previous piece's batch: a copy of 16 MiB, about 1 ms
+            upload_wait(s->seq);   // its previous piece's batch: a copy of 16 MiB, about 1 ms
             t_wait += qpc() - t;
         }
         t = qpc();
@@ -5711,66 +5714,99 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     return info.pMappedData;
 }
 
+// cmd_lock held: the open batch goes to the queue.
+static void submit_open_locked(VkCtx *c) {
+    if (!open_active) return;
+    for (int i = 0; i < open_b.nstg; i++) vmaFlushAllocation(c->vma, open_b.stg[i].alloc, 0, VK_WHOLE_SIZE);
+    vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
+    if (open_b.timed)
+        vkCmdWriteTimestamp(open_b.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, up_pool, 2 * (uint32_t)open_b.ts + 1);
+    vkEndCommandBuffer(open_b.cb);
+    plat_inc64(&up_batches);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
+    rec_submit_wait();   // a replay part the recorder thread is still submitting precedes this batch (vk_rec.c rec_submit)
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: upload submit failed (%d)", (int)r);
+    }
+    if (ninflight == cap_inflight) grow((void **)&inflight, &cap_inflight, sizeof *inflight);
+    inflight[ninflight++] = open_b;
+    open_active = 0;
+}
+
+// cmd_lock held: waits until every upload batch up to seq has completed; they are all submitted. Without cmd_lock
+// while it waits when this thread holds it once (a caller holding it around the flush keeps it for the wait). Each wait
+// is on the oldest batch's fence. A lost device ends the process with the fault report: retire stops at the first
+// fence that is not signalled, so done_seq would never reach seq and a loop on it would spin forever (a thread at 100%
+// of a core and an idle GPU, with no fault reported). Eglantine (Eden) ends the same way: vulkan_wrapper.h
+// Semaphore::Wait, under MasterSemaphore::Wait, throws vk::Exception on any result but VK_SUCCESS and VK_TIMEOUT.
+static void upload_wait_locked(VkCtx *c, uint64_t seq) {
+    uint64_t w0 = ninflight && done_seq < seq ? kern_now_ns() : 0;
+    int unlocked = cmd_lock.depth == 1;
+    if (unlocked && ninflight && done_seq < seq) {
+        plat_rmutex_unlock(&cmd_lock);
+        plat_mutex_lock(&wait_lock);
+        plat_rmutex_lock(&cmd_lock);
+    }
+    while (ninflight && done_seq < seq) {
+        VkFence f = inflight[0].fence;
+        uint64_t fseq = inflight[0].seq;
+        if (unlocked) pinned = fseq, pinned_done = 0, plat_rmutex_unlock(&cmd_lock);
+        VkResult w = vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
+        if (unlocked) plat_rmutex_lock(&cmd_lock);
+        if (w != VK_SUCCESS && w != VK_TIMEOUT) {
+            vk_device_fault_report(w);
+            rt_fatal("vk: upload wait for batch %llu failed (%d)", (unsigned long long)fseq, (int)w);
+        }
+        retire(c, 0);
+        // The wait said signalled and retire's vkGetFenceStatus did not: a lost device may answer a wait with
+        // VK_SUCCESS and the status query with VK_ERROR_DEVICE_LOST, and the loop would spin on the same fence.
+        if (w == VK_SUCCESS && ninflight && inflight[0].seq == fseq) {
+            VkResult s = vkGetFenceStatus(c->device, f);
+            if (s != VK_SUCCESS) {
+                vk_device_fault_report(s);
+                rt_fatal("vk: upload batch %llu: its fence wait returned, its status is %d", (unsigned long long)fseq, (int)s);
+            }
+        }
+        if (unlocked) {
+            if (pinned_done) {
+                if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
+                spare[nspare++] = pinned_batch;
+            }
+            pinned = 0, pinned_done = 0;
+        }
+    }
+    if (unlocked && w0) plat_mutex_unlock(&wait_lock);
+    if (w0) plat_add64(&up_wait_ns, (int64_t)(kern_now_ns() - w0));
+}
+
 uint64_t vk_upload_flush(int wait) {
     plat_once(&cmd_once, cmd_init, NULL);
     plat_rmutex_lock(&cmd_lock);
     VkCtx *c = vk_ctx();
     uint64_t seq = next_seq;
-    if (c && open_active) {
-        for (int i = 0; i < open_b.nstg; i++) vmaFlushAllocation(c->vma, open_b.stg[i].alloc, 0, VK_WHOLE_SIZE);
-        vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
-        if (open_b.timed)
-            vkCmdWriteTimestamp(open_b.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, up_pool, 2 * (uint32_t)open_b.ts + 1);
-        vkEndCommandBuffer(open_b.cb);
-        plat_inc64(&up_batches);
-        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
-        rec_submit_wait();   // a replay part the recorder thread is still submitting precedes this batch (vk_rec.c rec_submit)
-        vk_queue_lock();
-        VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
-        vk_queue_unlock();
-        if (r != VK_SUCCESS) {
-            vk_device_fault_report(r);
-            rt_fatal("vk: upload submit failed (%d)", (int)r);
-        }
-        if (ninflight == cap_inflight) grow((void **)&inflight, &cap_inflight, sizeof *inflight);
-        inflight[ninflight++] = open_b;
-        open_active = 0;
-    }
-    if (c && wait) {
-        uint64_t w0 = ninflight && done_seq < seq ? kern_now_ns() : 0;
-        // Without cmd_lock when this thread holds it once (a caller holding it around the flush keeps it for the wait).
-        int unlocked = cmd_lock.depth == 1;
-        if (unlocked && ninflight && done_seq < seq) {
-            plat_rmutex_unlock(&cmd_lock);
-            plat_mutex_lock(&wait_lock);
-            plat_rmutex_lock(&cmd_lock);
-        }
-        while (ninflight && done_seq < seq) {
-            VkFence f = inflight[0].fence;
-            if (unlocked) pinned = inflight[0].seq, pinned_done = 0, plat_rmutex_unlock(&cmd_lock);
-            // A lost device returns at once and its fence never signals: without this check the loop spins forever
-            // (a guest thread at 100% of a core and an idle GPU, with no fault reported).
-            VkResult w = vkWaitForFences(c->device, 1, &f, VK_TRUE, UINT64_MAX);
-            if (unlocked) plat_rmutex_lock(&cmd_lock);
-            if (w != VK_SUCCESS && w != VK_TIMEOUT) {
-                vk_device_fault_report(w);
-                rt_fatal("vk: upload wait failed (%d)", (int)w);
-            }
-            retire(c, 0);
-            if (unlocked) {
-                if (pinned_done) {
-                    if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
-                    spare[nspare++] = pinned_batch;
-                }
-                pinned = 0, pinned_done = 0;
-            }
-        }
-        if (unlocked && w0) plat_mutex_unlock(&wait_lock);
-        if (w0) plat_add64(&up_wait_ns, (int64_t)(kern_now_ns() - w0));
-    }
+    if (c) submit_open_locked(c);
+    if (c && wait) upload_wait_locked(c, seq);
     if (c) collect_locked(c);
     plat_rmutex_unlock(&cmd_lock);
     return seq;
+}
+
+// Waits until the upload batch seq (vk_upload_seq, vk_upload_flush) has completed, submitting it first if it is still
+// open; the batches after it are left to run.
+static void upload_wait(uint64_t seq) {
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    VkCtx *c = vk_ctx();
+    if (c && done_seq < seq) {
+        if (open_active && open_b.seq <= seq) submit_open_locked(c);
+        upload_wait_locked(c, seq);
+        collect_locked(c);
+    }
+    plat_rmutex_unlock(&cmd_lock);
 }
 
 int vk_upload_done(uint64_t seq) {
