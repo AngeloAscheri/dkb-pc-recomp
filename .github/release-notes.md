@@ -1,3 +1,7 @@
+## Draft: next release (since 0.4.2)
+
+- #419 Keep the Bananza installer tests independent of the host's free space and symlink rights (@wrothgaril)
+
 DKB Recomp 0.4.2: a static recompilation of *Donkey Kong Bananza* (Switch 2) to a native Windows exe with a Vulkan renderer. It is still experimental (0.x). A small release: fixes and community pull requests from the day after 0.4.1, with most of the work on frame drops in heavy scenes, on first runs and on PCs with fewer CPU threads.
 
 **The packages hold no game data, and no release ever will.** You build the game on your own PC from your own dump of **1.0.0 or the 3.2.0 update**, given as a `.nup` or `.nx` file or as ExeFS and RomFS folders. Other updates are not supported.
