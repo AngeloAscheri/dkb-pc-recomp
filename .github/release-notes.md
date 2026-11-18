@@ -1,5 +1,6 @@
 ## Draft: next release (since 0.4.2)
 
+- The replay and its Vulkan recorder run above normal priority while a frame is submitted, so the game's loading threads no longer starve them on CPUs with few cores: on 6 logical processors a level transition's replay fell from about 11 ms a frame to 0.25 ms.
 - #419 Keep the Bananza installer tests independent of the host's free space and symlink rights (@wrothgaril)
 
 DKB Recomp 0.4.2: a static recompilation of *Donkey Kong Bananza* (Switch 2) to a native Windows exe with a Vulkan renderer. It is still experimental (0.x). A small release: fixes and community pull requests from the day after 0.4.1, with most of the work on frame drops in heavy scenes, on first runs and on PCs with fewer CPU threads.
