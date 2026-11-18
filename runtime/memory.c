@@ -103,6 +103,11 @@ static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCo
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+// mem_freeze's refusals by reason (host.h MEM_FRZ_NO_N): a guarded page in the region (GPU-owned or the read probe's),
+// a thaw less than FRZ_HOLD_MS ago, a region that never freezes (sealed pages), a page that is not committed read-write
+// or a lazy-heap hole (or more runs than freeze_locked keeps, or a failed protection change).
+enum { FRZ_NO_GUARD, FRZ_NO_HELD, FRZ_NO_NEVER, FRZ_NO_STATE };
+static volatile int64_t frz_refused[MEM_FRZ_NO_N];
 // TOTK_FRZ_WHOLE=0 (an A/B of the thaw, TOTK_TRACE=perf shows the difference): every region is thawed the way one with
 // holes is, a query per read-only run, from the bottom up. Read at the first freeze (frz_lock), before which nothing
 // is thawed.
@@ -241,24 +246,27 @@ static int prb_held(uint64_t a, uint64_t n);
 // guarded page (GPU-owned or the read probe's, below) is refused: such a page is PAGE_NOACCESS, which the query sees,
 // or claimed and read-write for a moment while a thread settles it, which prb_held sees. Guards change protections
 // under frz_lock only, so none lands between the query and the protection change here.
-static int freeze_locked(uint64_t r) {
+// *why (when 0 is returned): the FRZ_NO_ reason, for mem_freeze's counts.
+static int freeze_locked(uint64_t r, int *why) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
     int n = 0;
-    if (prb_held(a, FRZ_SIZE)) return 0;
+    if (prb_held(a, FRZ_SIZE)) return *why = FRZ_NO_GUARD, 0;
     for (uint64_t x = a, y; x < end; x = y) {
         int st = plat_mem_state(x, end, &y);
         if (st >= PLAT_PROT_NONE) {
-            if (st != PLAT_PROT_RW || n == 16) return 0;
+            if (st != PLAT_PROT_RW || n == 16) return *why = FRZ_NO_STATE, 0;
             run[n][0] = x, run[n][1] = y, n++;
-        } else if (st != PLAT_MEM_RESERVED || (heap_lazy() && x >= L.heap.base && x < L.heap.base + heap_size)) return 0;
+        } else if (st != PLAT_MEM_RESERVED || (heap_lazy() && x >= L.heap.base && x < L.heap.base + heap_size))
+            return *why = FRZ_NO_STATE, 0;
         // (a lazy-heap hole may be committed by fault_veh at any moment, so such a region is never frozen)
     }
     for (int i = 0; i < n; i++)
         if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_READ)) {
             while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
-            return 0;
+            return *why = FRZ_NO_STATE, 0;
         }
-    return !n ? 0 : n == 1 && run[0][0] == a && run[0][1] == end && frz_whole ? FRZ_WHOLE : FRZ_HOLES;
+    if (!n) return *why = FRZ_NO_STATE, 0;
+    return n == 1 && run[0][0] == a && run[0][1] == end && frz_whole ? FRZ_WHOLE : FRZ_HOLES;
 }
 
 int mem_freeze(uint64_t a) {
@@ -272,15 +280,17 @@ int mem_freeze(uint64_t a) {
         frz_whole = !(e && !strcmp(e, "0"));
         if (!frz_whole) rt_log("mem: frozen regions are thawed with a query per read-only run (TOTK_FRZ_WHOLE=0)");
     }
+    int why = -1;
     if (frz[r]) ok = 1;
-    else if (frz_never[r]) ok = 0;
-    else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
-    else if ((how = freeze_locked(r))) {
+    else if (frz_never[r]) why = FRZ_NO_NEVER;
+    else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) why = FRZ_NO_HELD;   // |1 may be ahead
+    else if ((how = freeze_locked(r, &why))) {
         __atomic_store_n(&frz[r], (uint8_t)how, __ATOMIC_RELEASE);
         plat_inc32(&nfrz);
         plat_inc64(&frz_count[0]);
         ok = 1;
     }
+    if (!ok && why >= 0) plat_inc64(&frz_refused[why]);
     plat_mutex_unlock(&frz_lock);
     plat_op_end(op, 0);
     return ok;
@@ -704,6 +714,10 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
     *freezes = (uint64_t)plat_xchg64(&frz_count[0], 0);
     *fault_thaws = (uint64_t)plat_xchg64(&frz_count[1], 0);
     *other_thaws = (uint64_t)plat_xchg64(&frz_count[2], 0) + (uint64_t)plat_xchg64(&frz_count[3], 0);
+}
+
+void mem_freeze_refusals(uint64_t out[MEM_FRZ_NO_N]) {
+    for (int i = 0; i < MEM_FRZ_NO_N; i++) out[i] = (uint64_t)plat_xchg64(&frz_refused[i], 0);
 }
 
 // The first write into a frozen region thaws it and retries. A fault in a region another thread thawed meanwhile

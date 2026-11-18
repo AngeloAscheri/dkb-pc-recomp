@@ -2371,6 +2371,10 @@ typedef struct {
     // Staged mirrors (staged_upload, staged_wb_record): bytes and ranges copied in through staging, write-back bytes
     // in flight left out, CPU time of the prologue's part; write-back bytes and ranges, their recording time.
     uint64_t st_up_bytes, st_up_ranges, st_skip_bytes, st_up_t, st_wb_bytes, st_wb_ranges, st_wb_t;
+    // TOTK_TRACE=perf: the CPU time of every prologue (vk_mem_mirror_prologue, both kinds of mirror), and staged_upload's
+    // by part: the blocked ranges (rebuilds of the union and the ranges they put in it, their time), the staging
+    // buffers it took and their time, the copies out of guest memory.
+    uint64_t pro_t, st_blk_t, st_blk_n, st_blk_ranges, st_stg_n, st_stg_t, st_cpy_t;
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -3978,6 +3982,7 @@ static void st_blk_update(uint64_t fence) {
         plat_mutex_unlock(&own_lock);
     }
     owngen = og;
+    mrep.st_blk_n++, mrep.st_blk_ranges += (uint64_t)nst_blk;   // replay thread (staged_upload)
     sort_ranges(st_blk, (size_t)nst_blk, &sbuf, &scap);
     int o = 0;
     for (int i = 0; i < nst_blk; i++) {
@@ -4046,7 +4051,9 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
     // hold the lock. No job ends meanwhile: vk_mem_mirror_end runs on this thread. A fetch that empties an own range
     // after this only makes guest memory equal the mirror there.
     plat_mutex_lock(&st_lock);
+    uint64_t tb = qpc();
     st_blk_update(fence);
+    mrep.st_blk_t += qpc() - tb;
     ncut = 0;
     uint64_t total = 0, skipped = 0;
     for (int i = 0; i < nstq;) {   // merged per pool, clamped to the mirror, then the blocked bytes cut out
@@ -4088,16 +4095,20 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
             int k = 0;
             for (uint64_t done = 0; i < ncut && cut[i].r == r;) {
                 if (used == room) {   // the next piece of staging; the copies out of the full one first
+                    uint64_t ts = qpc();
                     if (k) vkCmdCopyBuffer(cb, sb, r->mbuf, (uint32_t)k, reg), k = 0;
                     if (sb) staged_piece_done(sb, sa, used, fence);
                     room = left < STG_CHUNK ? left : STG_CHUNK;
                     map = vk_staging(room, &sb, &sa);
                     used = 0;
+                    mrep.st_stg_n++, mrep.st_stg_t += qpc() - ts;
                 }
                 uint64_t len = cut[i].size - done, src = r->import_lo + cut[i].off + done;
                 if (len > room - used) len = room - used;
+                uint64_t tc = qpc();
                 if (probe) mem_probe_copy(map + used, src, len);   // the guard stays on
                 else memcpy(map + used, (const void *)(uintptr_t)src, len);
+                mrep.st_cpy_t += qpc() - tc;
                 if (k == creg) grow((void **)&reg, &creg, sizeof *reg);
                 reg[k++] = (VkBufferCopy){used, cut[i].off + done, len};
                 used += len, left -= len, done += len;
@@ -4964,6 +4975,7 @@ void vk_mem_mirror_begin(void) {
 int vk_mem_mirror_pending(void) { return __atomic_load_n(&npend, __ATOMIC_RELAXED); }
 
 void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence) {
+    uint64_t tp = qpc();
     int locked = mirror_lock_if_shared();   // a helper may be queueing a sync
     int any = npend > 0;
     if (npend) {
@@ -4999,6 +5011,7 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, fills ? VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    mrep.pro_t += qpc() - tp;
 }
 
 // ---- verify mode
@@ -5385,12 +5398,16 @@ static void mirror_log(uint64_t frame) {
     ww_last = frame;
     uint64_t fz, ff, ft, fo;
     mem_freeze_stats(&fz, &ff, &ft, &fo);
+    uint64_t fr[MEM_FRZ_NO_N];
+    mem_freeze_refusals(fr);
     if (rt_trace & RT_TRACE_PERF)
         rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
                "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
-               "or mapping change %llu, refused %llu",
+               "or mapping change %llu, refused %llu (a guarded page %llu, held after a thaw %llu, never frozen %llu, page "
+               "states %llu)",
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
-               fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr);
+               fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr,
+               (unsigned long long)fr[0], (unsigned long long)fr[1], (unsigned long long)fr[2], (unsigned long long)fr[3]);
     if (rt_trace & RT_TRACE_PERF) {
         // #317: the queries' wall time against their CPU time, the slowest one, and what else asked the kernel about
         // guest memory meanwhile (VirtualQuery and VirtualProtect by kind, the pointer guards' cache misses).
@@ -5428,24 +5445,28 @@ static void mirror_log(uint64_t frame) {
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, own GPU writes not copied in %.3f MiB, write-back %.3f MiB in %.1f ranges "
            "(before the end: %.2f command buffers, %.3f MiB), flush calls %.1f (%.3f MiB), queries %.1f pre-snap (%.1f MiB) + %.1f sync, "
-           "prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f), sync snaps %.1f MiB, pre-snapped pools %.1f "
-           "(used %.1f, unused %.1f MiB)%s",
+           "prologues %.2f (cpu %.3f ms), tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f), sync snaps %.1f MiB, "
+           "pre-snapped pools %.1f (used %.1f, unused %.1f MiB)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.own_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f,
            a.early_n / f, a.early_bytes / f / M, fc / f, fb / f / M,
-           a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
+           a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.pro_t) / f,
+           qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, a.sync_bytes / f / M, a.presnap_pools / f, a.presnap_used / f,
            a.presnap_unused_bytes / f / M, ver);
     if (staged_min) {
         int64_t wn = plat_xchg64(&st_wbcpu_ns, 0), wb = plat_xchg64(&st_wbcpu_bytes, 0);
         rt_log("mem: staged frame %llu: per frame: upload %.3f MiB in %.1f ranges (%.3f MiB of write-backs in flight "
-               "left out), CPU copy %.3f ms; write-back %.3f MiB in %.1f ranges, recorded in %.3f ms, %.3f MiB copied into "
-               "guest memory in %.3f ms (completion thread); so far: first fills %d (%.0f MiB, %.1f ms in all), pools "
-               "imported after all %d",
+               "left out), CPU copy %.3f ms (blocked ranges %.3f ms in %.2f rebuilds of %.0f ranges, staging buffers %.2f "
+               "in %.3f ms, copies from guest memory %.3f ms); write-back %.3f MiB in %.1f ranges, recorded in %.3f ms, "
+               "%.3f MiB copied into guest memory in %.3f ms (completion thread); so far: first fills %d (%.0f MiB, %.1f "
+               "ms in all), pools imported after all %d",
                (unsigned long long)frame, a.st_up_bytes / f / M, a.st_up_ranges / f, a.st_skip_bytes / f / M,
-               qpc_ms(a.st_up_t) / f, a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f, wb / f / M,
+               qpc_ms(a.st_up_t) / f, qpc_ms(a.st_blk_t) / f, a.st_blk_n / f, a.st_blk_n ? (double)a.st_blk_ranges / a.st_blk_n : 0.0,
+               a.st_stg_n / f, qpc_ms(a.st_stg_t) / f, qpc_ms(a.st_cpy_t) / f,
+               a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
         const volatile StCount *s = &stc[0];
