@@ -2786,7 +2786,8 @@ static int merge_walk(VkExec *ex, const op_hdr **hp) {
 // views, as resolve_rt would derive them for a plain colour or depth target (la_set_rt). TOTK_LOOKAHEAD=0 turns it off.
 #define LOOKAHEAD_DRAWS 256
 #define LOOKAHEAD_OPS 16384
-#define LOOKAHEAD_NS 3000000
+#define LOOKAHEAD_NS 20000000   // only a one-shot wait looks ahead, and it waits 60-90 ms for its own cold build: 3 ms
+                                // covered 9 draws of a burst and left the first cold stall at 4.1 s against 3.0 s
 static _Thread_local const op_hdr *walk_at;              // the op walk replays on the replay thread's context X
 static _Thread_local const op_hdr *walk_ret[CALL_DEPTH];  // where the calls walk is inside return to
 static _Thread_local int walk_depth;                     // walk_at's call depth
