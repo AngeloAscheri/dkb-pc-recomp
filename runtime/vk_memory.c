@@ -80,6 +80,9 @@ typedef struct PoolRec {
     uint8_t staged;                    // large lazy pool: its first GPU use makes a mirror instead of importing it
     uint8_t sfeed;                     // its mirror is filled from staging buffers and written back through readbacks
     volatile int32_t sfell;            // imported after all (staged_import): the line is logged once
+    struct KeptRange *own;             // own_lock, TOTK_STAGED_WB=fault: bytes only the mirror holds (staged_fetch)
+    int nown, cown;
+    uint8_t *cpu_read;                 // per page: the CPU fetched it, so GPU writes to it go back at the fence
 } PoolRec;
 
 // A pool's mirror state. The replay thread stores it with release order after the mirror's buffer exists, and every
@@ -96,6 +99,9 @@ static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_ret
 static void mirror_retire(void *arg);    // completion thread: destroys a finalized mirrored pool's record
 static void grow(void **arr, int *cap, size_t elem);
 static uint64_t staged_min;              // TOTK_MIRROR_STAGED in bytes (mirror_mode): 0 off
+static int staged_fault = 1;             // TOTK_STAGED_WB (mirror_mode): 1 fault (GPU-owned pages), 0 fence (copy-back)
+static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel);
+static void staged_forget(PoolRec *r);   // vk_pool_fini: a staged pool's owned pages open without a fetch
 // A staged pool that has not been imported: lazy stays 1 until staged_import imports it after all, and lazy_import
 // stores 0 with release order only once r->buf is complete, so a reader that sees 0 here may read r->buf.
 static inline int staged_pending(const PoolRec *r) { return r->staged && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE); }
@@ -410,6 +416,8 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
     free(r->kept);
+    free(r->own);
+    free(r->cpu_read);
     free(r);
 }
 
@@ -548,6 +556,7 @@ void vk_pool_fini(pool_t *p) {
     if (r->kind == POOL_IMPORT) vk_texture_descriptors_retire(r->lo, r->size, 0);
     else if (r->kind == POOL_PHYS) vk_texture_descriptors_retire(0, 0, r->storage_serial);
     if (r->smap) shadow_forget(r);
+    if (r->sfeed && staged_fault) staged_forget(r);   // its owned pages open without a fetch: the storage goes away
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
     // guest gets the storage back when this returns.
@@ -894,6 +903,7 @@ void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
     static int report_every = -1;   // TOTK_MEM_REPORT, read on the first present
     if (report_every < 0) report_every = cfg_int("TOTK_MEM_REPORT");
+    __atomic_store_n(&mem_probe_frame, frame, __ATOMIC_RELAXED);
     lazy_frame_log(frame);
     if (report_every > 0 && frame % (uint64_t)report_every == 0) {
         char when[32];
@@ -1883,7 +1893,7 @@ static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
 static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
 static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
-static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
+static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch, v_owned;
 
 static void sparse_cache_open(void);
 
@@ -1943,8 +1953,19 @@ static void mirror_mode(int discrete, uint32_t vendor) {
         if (off) rt_log("mem: TOTK_MIRROR_STAGED=%s ignored: %s", ms, off);
         else {
             staged_min = mib << 20;
+            const char *wb = cfg_get("TOTK_STAGED_WB");
+            staged_fault = !(wb && !strcmp(wb, "fence"));
+            if (wb && *wb && strcmp(wb, "fence") && strcmp(wb, "fault"))
+                rt_log("mem: TOTK_STAGED_WB=%s is not fence or fault: fault", wb);
             rt_log("mem: imported pools of %llu MiB or more are not imported: their VRAM mirror is filled from staging "
-                   "buffers and written back through readbacks (TOTK_MIRROR_STAGED)", (unsigned long long)mib);
+                   "buffers, and the bytes the GPU writes %s (TOTK_MIRROR_STAGED, TOTK_STAGED_WB=%s)", (unsigned long long)mib,
+                   staged_fault ? "stay in it until a CPU access fetches them" : "go back to guest memory at each fence",
+                   staged_fault ? "fault" : "fence");
+#ifdef _WIN32
+            if (staged_fault) mem_guard_hook(staged_fetch);
+#else
+            if (staged_fault) rt_log("mem: TOTK_STAGED_WB=fault needs page faults this platform does not route: fence"), staged_fault = 0;
+#endif
         }
     }
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
@@ -2343,6 +2364,8 @@ typedef struct StJob {
     int ended;                          // st_lock: recorded (vk_mem_mirror_end): its ranges block the later uploads
     StRange *w;
     int n, cap;
+    StRange *o;                         // TOTK_STAGED_WB=fault: the GPU writes that stay in the mirror (own_take)
+    int no, co;
     uint64_t bytes;
     VkBuffer buf;
     VmaAllocation alloc;
@@ -2365,6 +2388,560 @@ static void staged_free_buffer(void *arg) {   // completion thread: a prologue's
     StBuf *s = arg;
     vmaDestroyBuffer(vk_ctx()->vma, s->buf, s->alloc);
     free(s);
+}
+
+// ---- GPU-owned pages (TOTK_STAGED_WB=fault, the default with TOTK_MIRROR_STAGED)
+// A staged mirror's write-backs are not copied into guest memory: the mirror alone holds the bytes the GPU wrote, and
+// the pool keeps them as a list of byte ranges (r->own, offsets from import_lo, sorted and disjoint). At the fence of
+// the submission that wrote them (staged_wb_done, ahead of the submission's other callbacks, so before the game sees
+// the fence), the ranges join the list and their pages become PAGE_NOACCESS (memory.c mem_guard_own), unless already
+// owned: the GPU rewrites the same pages every frame, so in steady state no protection changes. The first CPU access
+// to such a page, a game thread's or ours, faults into memory.c probe_fault, which calls staged_fetch: it copies the
+// owned bytes of the page and of the other owned pages of its 64 KiB block from the mirror into guest memory, through
+// a command buffer of its own it waits for, drops them from the list, and opens the pages. The access then runs on the merged
+// page: the GPU's bytes where it wrote, the guest's elsewhere, as an import would hold them. A host path that hands the
+// range to the kernel or a driver fetches the same way (memory.c mem_thaw, mem_touch, win32.c plat_mem_read); a pool
+// that goes away drops its pages unfetched (staged_forget). plat_mem_readable counts owned pages as readable.
+// Uploads into the mirror leave the owned bytes out (st_blk_update), and copy the other bytes of an owned page without
+// opening it (memory.c mem_probe_copy). A page a fetch brought owned bytes in for is marked CPU-read (r->cpu_read): the
+// GPU's later writes to it go back at the fence as with TOTK_STAGED_WB=fence (vk_mem_mirror_end), so a page the CPU
+// keeps reading does not fault every frame.
+// Why at the fence and not when the write is recorded: at the fence every owned range is complete in the mirror, so a
+// fetch only waits for its own copy (queued after everything submitted) and never for a submission still being
+// recorded, which the faulting thread could itself be recording, or need own_lock for (its prologue's st_blk_update)
+// while the fetch holds it. A CPU access between the GPU's write and the end of its submission sees the guest's old
+// bytes, as it does with a mirrored imported pool until the end-of-submission write-back runs. Past that the window is
+// longer than an import's: the timeline value is reached with guest memory still stale and the pages still open until
+// the completion thread runs staged_wb_done. What the game can learn completion from (NVN front end, nvn_api_*.c):
+// - syncs: nvnSyncWait (nvn_api_core.c, a poll with timeout 0), nvnQueueFinish (vk_backend.c vk_be_finish), a command
+//   buffer's WaitSync (nvn_api_cmd.c wait_submission) and TotK's LOD guard all ask vk_sync.c vk_sync_fence_done or
+//   vk_sync_fence_wait, whose done value completion_main stores only after every callback of the values reached has
+//   run, staged_wb_done among them;
+// - event values (nvnCommandBufferSignalEvent, read with nvnEventGetValue or from the event's pool memory) and counter
+//   and occlusion reports (nvnCommandBufferReportCounter): the completion thread writes them into guest memory in
+//   callbacks the recording queues (vk_exec_xfer.c event_cb, counter_cb, oq_cb), after staged_wb_done, which
+//   vk_mem_mirror_begin queues before the recording starts; the queue runs in the order callbacks were added;
+// - window syncs (nvn_api_obj.c nvnWindowAcquireTexture) are signalled at once and say nothing about the GPU's work;
+// - memory the GPU writes, polled by the game. A staged pool's GPU writes reach guest memory only through
+//   staged_wb_done's copy-back or a fetch, never early, and staged_wb_done protects a submission's owned ranges before
+//   its copy-back bytes go in, so a flag the copy-back carries is not seen ahead of data the same submission left
+//   owned. GPU writes into an imported pool (below the TOTK_MIRROR_STAGED size, imported after all, or never given a
+//   mirror) land in guest memory before the timeline value is signalled: at the GPU's own pace without a mirror, in
+//   the end-of-submission write-back copy with one. A game that polls such a flag, written by the GPU after data in a
+//   staged pool, could see the flag and then the stale data. Ordering that would take protecting the pages when the
+//   write is recorded and a fetch that waits for an unfinished submission without own_lock (see above); with
+//   TOTK_MIRROR_STAGED=all only the pools imported after all are such writers, and the staged line counts them. With
+//   an import (TOTK_MEMORY=import) there is no window.
+// Eglantine (Eden) does the same on a guest CPU read of GPU-written buffer memory: video_core/gpu.cpp OnCPURead
+// downloads the page-aligned area at once and waits for it (RasterizerVulkan::GetFlushArea, FlushRegion,
+// BufferCache::DownloadMemory), and BufferCache::NoteCpuRead remembers those pages so that later GPU writes to them
+// are copied back at fences (cpu_read_ranges). Differences: Eden finds the read through its page table
+// (core/memory.cpp HandleRasterizerDownload), here a page protection fault does; Eden flushes on CPU reads only, here a
+// CPU write to an owned page fetches first too, since the guest bytes of the rest of the page must be merged with the
+// GPU's; and the area here is the 64 KiB block of owned pages (NVN's pool page size), where Eden downloads the read's
+// pages, so a CPU scan through a GPU-written buffer pays one GPU round trip per 64 KiB instead of per 4 KiB.
+#define OWN_BLOCK 0x10000ull
+#define OWN_LOG 32
+static PlatMutex own_lock = PLAT_MUTEX_INIT;   // st_pools and every pool's own list; taken after pool_lock, st_lock
+static PoolRec **st_pools;              // own_lock: the live staged mirrors by import_lo (staged_fetch finds the pool here)
+static int nst_pools, cst_pools;
+static volatile uint64_t own_gen;       // own_lock: bumped by every change of an own list (st_blk_update)
+// Since the last staged line: protection changes, fetches by [write][game thread] and by kernel paths, their pages,
+// bytes and time, the longest; owned bytes now.
+static volatile int64_t own_protects, own_fetch[2][2], own_kfetch, own_fpages, own_fbytes, own_fns, own_fmax;
+static volatile int64_t own_seen[3], own_pushed, own_take_ns, own_pfail;   // own_take: pages by state, queued, time,
+                                                                           // protection failures
+// Since the last staged line: fetches that found no owned byte, fetches whose copy waited over a second, pages switched
+// to the fence copy-back (r->cpu_read), and the write-back pieces and bytes of CPU-read pages that the fence copied
+// back (staged_split_own).
+static volatile int64_t own_fempty, own_long, own_switched, own_fb_ranges, own_fb_bytes;
+// Since the last staged line: copy-back pages found owned again that opened without a fetch, copy-back pieces kept
+// owned instead (staged_copy_back), and fetches the completion thread made inside staged_wb_done (none expected).
+static volatile int64_t own_cb_opened, own_cb_kept, own_cfetch;
+// Since the last staged line, own_take's time by part (ns): thawing frozen regions, committing lazy-heap pages,
+// protecting, the runs of pages it protected, and the merge and page scan under own_lock.
+static volatile int64_t own_take_part[5];
+static volatile int64_t st_wbdone_max;   // since the last staged line: the longest staged_wb_done (ns), a fence's delay
+static _Thread_local int st_in_wb;   // staged_wb_done runs on this thread now: staged_fetch counts a fetch it causes
+static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; } fc;   // own_lock: staged_fetch's copy
+typedef struct { uint64_t frame, addr, rip, ns; int write, guest, kernel, pages; } OwnRec;
+static OwnRec own_rec[OWN_LOG];
+static volatile int32_t own_nrec, own_logged;
+
+// own_lock held: the index of the first staged pool whose import_lo is above a (st_pools is sorted by address).
+static int st_upper(uint64_t a) {
+    int lo = 0, hi = nst_pools;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (st_pools[mid]->import_lo <= a) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// own_lock held: the staged pool whose mirror holds address a, or NULL.
+static PoolRec *st_find(uint64_t a) {
+    int i = st_upper(a) - 1;
+    return i >= 0 && a < st_pools[i]->import_hi ? st_pools[i] : NULL;
+}
+
+// own_lock held: the sorted ranges add[0..n) (one pool's, offsets) joined to r->own.
+static void own_merge(PoolRec *r, const StRange *add, int n) {
+    static struct KeptRange *out;
+    static int cout;
+    while (cout < r->nown + n) grow((void **)&out, &cout, sizeof *out);
+    int i = 0, j = 0, o = 0;
+    while (i < r->nown || j < n) {
+        struct KeptRange x;
+        if (j >= n || (i < r->nown && r->own[i].lo <= add[j].off)) x = r->own[i++];
+        else x = (struct KeptRange){add[j].off, add[j].off + add[j].size}, j++;
+        if (o && x.lo <= out[o - 1].hi) {
+            if (x.hi > out[o - 1].hi) out[o - 1].hi = x.hi;
+        } else out[o++] = x;
+    }
+    struct KeptRange *old = r->own;
+    int c = r->cown;
+    r->own = out, r->cown = cout, r->nown = o;
+    out = old, cout = c;
+}
+
+// own_lock held: the sorted, disjoint pieces cut[0..n) (offsets) leave r->own.
+static void own_cut(PoolRec *r, const struct KeptRange *cut, int n) {
+    static struct KeptRange *out;
+    static int cout;
+    while (cout < r->nown + n) grow((void **)&out, &cout, sizeof *out);
+    struct KeptRange *in = r->own;
+    int i = 0, o = 0;
+    for (int j = 0; j < n && i < r->nown; j++) {
+        uint64_t a = cut[j].lo, b = cut[j].hi;
+        while (i < r->nown && in[i].hi <= a) out[o++] = in[i++];
+        while (i < r->nown && in[i].lo < b) {
+            if (in[i].lo < a) out[o++] = (struct KeptRange){in[i].lo, a};
+            if (in[i].hi > b) {
+                in[i].lo = b;
+                break;
+            }
+            i++;
+        }
+    }
+    while (i < r->nown) out[o++] = in[i++];
+    r->own = out, out = in;
+    int c = r->cown;
+    r->cown = cout, cout = c;
+    r->nown = o;
+}
+
+// vk_mem_mirror_end, fault mode: the staged write-back ranges in stw split by page; those on pages the CPU has read
+// (fetched) stay in stw for the fence copy-back, the rest become the job's owned ranges.
+static void staged_split_own(void) {
+    static MRange *sbuf, *fb;
+    static size_t scap;
+    static int nfb, cfb;
+    StJob *j = st_cur;
+    if (!j) rt_fatal("mem: a staged write-back outside a submission's recording");
+    sort_ranges(stw, (size_t)nstw, &sbuf, &scap);
+    nfb = 0;
+    for (int i = 0; i < nstw; i++) {
+        PoolRec *r = stw[i].r;
+        uint64_t lim = r->import_hi - r->import_lo, a = stw[i].off, b = a + stw[i].size;
+        if (b > lim) b = lim;
+        for (uint64_t x = a; x < b;) {
+            uint64_t e = (x & ~0xfffull) + 0x1000;
+            if (e > b) e = b;
+            if (r->cpu_read && __atomic_load_n(&r->cpu_read[x >> 12], __ATOMIC_RELAXED)) {
+                range_add(&fb, &nfb, &cfb, r, x, e - x);
+            } else if (j->no && j->o[j->no - 1].r == r && j->o[j->no - 1].off + j->o[j->no - 1].size >= x) {
+                StRange *l = &j->o[j->no - 1];
+                if (e > l->off + l->size) l->size = e - l->off;
+            } else {
+                if (j->no == j->co) grow((void **)&j->o, &j->co, sizeof *j->o);
+                j->o[j->no++] = (StRange){r, r->lo, r->storage_serial, x, e - x, 0};
+            }
+            x = e;
+        }
+    }
+    nstw = 0;
+    uint64_t fbb = 0;
+    for (int i = 0; i < nfb; i++) range_add(&stw, &nstw, &cstw, fb[i].r, fb[i].off, fb[i].size), fbb += fb[i].size;
+    plat_add64(&own_fb_ranges, nfb), plat_add64(&own_fb_bytes, (int64_t)fbb);
+}
+
+static void own_settle_failed(PoolRec *r, const uint64_t *pg, int n);
+
+// staged_wb_done, the pool found live: the job's owned ranges of pool r (sorted) join its list, and the pages that were
+// not owned yet are protected, a run of them at a time (memory.c mem_guard_own_range); those that could not be are
+// settled at once (own_settle_failed). Without pool_lock: the protection of the first GPU writes into a new layer's
+// terrain arena took up to about 120 ms, and a game thread that initializes or finalizes a pool meanwhile waits for
+// pool_lock exclusively, and every resolve then waits behind it (the reloads of the Hilltop route showed waits of
+// 122-172 ms). The record stays alive without it: a staged mirror's record is freed by mirror_retire, on this thread;
+// a pool released meanwhile has left st_pools (staged_forget, under own_lock), and then nothing is taken.
+static void own_take(PoolRec *r, const StRange *add, int n) {
+    static uint64_t *pg, *fl;   // completion thread: pages to protect, pages whose protection failed
+    static int npg, cpg, cfl;
+    int nfl = 0;
+    npg = 0;
+    uint64_t t0 = qpc();
+    plat_mutex_lock(&own_lock);
+    if (st_find(r->import_lo) != r) {   // released since staged_wb_done found it live
+        plat_mutex_unlock(&own_lock);
+        return;
+    }
+    own_merge(r, add, n);
+    for (int i = 0; i < n; i++)
+        for (uint64_t p = (r->import_lo + add[i].off) & ~0xfffull; p < r->import_lo + add[i].off + add[i].size; p += 0x1000) {
+            // Owned: protected already. Busy: a fetch that waits for own_lock (it will take these ranges too), or a claim
+            // of a moment: memory.c probe_fault claims the state of every page that faults in a chunk with guards, a
+            // lazy-heap commit or a frozen region's write as well, and leaving such a page out would leave its owned
+            // bytes on an open page. mem_guard_own_range waits the claim out and protects the page if it is open then; after
+            // a fetch that protects a page with nothing owned on it, whose next access fetches nothing and opens it.
+            int st = mem_guard_state(p);
+            plat_inc64(&own_seen[st]);
+            if (st == 1 || (npg && pg[npg - 1] == p)) continue;
+            if (npg == cpg) grow((void **)&pg, &cpg, sizeof *pg);
+            pg[npg++] = p;
+        }
+    __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&own_lock);
+    plat_add64(&own_take_part[4], (int64_t)(qpc() - t0));   // the part under own_lock
+    for (int i = 0; i < npg;) {
+        int k = i + 1;
+        while (k < npg && pg[k] == pg[k - 1] + 0x1000) k++;
+        // A frozen region could not catch writes to pages opened later. A page of the lazy heap the CPU never touched is
+        // still reserved, and VirtualProtect fails there (the arena's pages are mostly such at its first use): a run
+        // whose protection fails is committed (mem_touch_keep) and protected again. Committing every run first, as
+        // before, asked VirtualQuery about each run's 64 KiB, about 90% of own_take's time, and at the first fences
+        // of a reloaded layer, whose new arena the GPU writes in thousands of scattered pages, one staged_wb_done took
+        // 125-163 ms, a delay of every later fence the game waits for.
+        uint64_t n_run = pg[k - 1] + 0x1000 - pg[i], ta = qpc();
+        mem_thaw_keep(pg[i], n_run);
+        uint64_t tb = qpc(), t_commit = 0;
+        int failed, made = mem_guard_own_range(pg[i], n_run, &failed);
+        if (failed) {
+            uint64_t tc = qpc();
+            mem_touch_keep(pg[i], n_run);
+            t_commit = qpc() - tc;
+            made += mem_guard_own_range(pg[i], n_run, &failed);
+        }
+        plat_add64(&own_protects, made);
+        plat_add64(&own_take_part[0], (int64_t)(tb - ta)), plat_add64(&own_take_part[1], (int64_t)t_commit);
+        plat_add64(&own_take_part[2], (int64_t)(qpc() - tb - t_commit)), plat_inc64(&own_take_part[3]);
+        for (; failed && i < k; i++)
+            if (!mem_guard_state(pg[i])) {   // still open: VirtualProtect refused it
+                plat_inc64(&own_pfail);
+                if (nfl == cfl) grow((void **)&fl, &cfl, sizeof *fl);
+                fl[nfl++] = pg[i];
+            }
+        i = k;
+    }
+    if (nfl) own_settle_failed(r, fl, nfl);
+    plat_add64(&own_pushed, npg);
+    plat_add64(&own_take_ns, (int64_t)(qpc() - t0));
+}
+
+// own_lock held (it guards fc): the regions reg[0..n) of r's mirror (srcOffset) copied into a new staging buffer of
+// total bytes (dstOffset) and waited for; returns its mapping, *sb and *sa for the caller to destroy. A command buffer
+// and fence of their own, not the upload batch: the faulting thread may be recording into the open batch (a texture
+// upload copying pool bytes), which a flush here would end under it. The copy runs after everything submitted so far
+// (queue order); the owned ranges' writers finished at their fences already. page: for the line of a long wait.
+static const uint8_t *own_gpu_read(PoolRec *r, const VkBufferCopy *reg, int n, uint64_t total, VkBuffer *sb,
+                                   VmaAllocation *sa, uint64_t page) {
+    VkCtx *c = vk_ctx();
+    if (!fc.pool) {
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                                      .queueFamilyIndex = c->gfx_family};
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateCommandPool(c->device, &pi, NULL, &fc.pool) != VK_SUCCESS || (ai.commandPool = fc.pool,
+            vkAllocateCommandBuffers(c->device, &ai, &fc.cb) != VK_SUCCESS) ||
+            vkCreateFence(c->device, &fi, NULL, &fc.fence) != VK_SUCCESS)
+            rt_fatal("vk: command buffer for staged fetches");
+    }
+    const uint8_t *map = vk_staging(total, sb, sa);
+    vkResetCommandBuffer(fc.cb, 0);
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(fc.cb, &bi);
+    mbarrier(fc.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+             VK_ACCESS_2_TRANSFER_READ_BIT);
+    vkCmdCopyBuffer(fc.cb, r->mbuf, *sb, (uint32_t)n, reg);
+    mbarrier(fc.cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+             VK_ACCESS_2_HOST_READ_BIT);
+    vkEndCommandBuffer(fc.cb);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &fc.cb};
+    vkResetFences(c->device, 1, &fc.fence);
+    vk_queue_lock();
+    VkResult res = vkQueueSubmit(c->gfx_queue, 1, &si, fc.fence);
+    vk_queue_unlock();
+    for (int waited = 0; res == VK_SUCCESS;) {   // a wait over a second gets a line each second (a hang, not a slow GPU)
+        res = vkWaitForFences(c->device, 1, &fc.fence, VK_TRUE, 1000000000ull);
+        if (res != VK_TIMEOUT) break;
+        res = VK_SUCCESS;
+        if (!waited++) plat_inc64(&own_long);
+        rt_log("mem: a staged fetch at %#llx (%s) has waited %d s for its copy", (unsigned long long)page,
+               kern_cpu() ? "game thread" : "runtime thread", waited);
+    }
+    if (res != VK_SUCCESS) {
+        vk_device_fault_report(res);
+        rt_fatal("vk: staged fetch failed (%d)", (int)res);
+    }
+    vmaInvalidateAllocation(c->vma, *sa, 0, VK_WHOLE_SIZE);
+    return map;
+}
+
+// own_take, completion thread: VirtualProtect refused to make these pages of r PAGE_NOACCESS
+// (memory.c mem_guard_own), so owned bytes sit on open pages, where a CPU read gets the guest's stale bytes and a CPU
+// write would be overwritten by the next fetch. Before, only own_pfail counted them. Now their owned bytes are fetched
+// at once, a GPU round trip on the completion thread for a case that should not arise (own_take commits lazy-heap
+// pages and thaws frozen regions first), and the pages are marked CPU-read, so the GPU's later writes to them go back
+// at the fence instead of being owned. Nothing stops the CPU touching such a page before the bytes are in, and a CPU
+// write to an owned byte in that time is lost; the first 16 pages get a line.
+static void own_settle_failed(PoolRec *r, const uint64_t *pg, int npg) {
+    static struct KeptRange *cut;
+    static VkBufferCopy *reg;
+    static int ccut, creg;
+    static volatile int32_t logged;
+    int n = 0;
+    uint64_t total = 0;
+    plat_mutex_lock(&own_lock);
+    for (int i = 0; i < npg && st_find(r->import_lo) == r; i++) {   // (a pool released meanwhile: nothing to repair)
+        if (mem_guard_state(pg[i])) continue;   // owned or claimed by now: not one of the open pages this repairs
+        uint64_t lo = pg[i] - r->import_lo, hi = lo + 0x1000;
+        int k = 0, m = r->nown;
+        while (k < m) {   // the first owned range ending above lo
+            int mid = (k + m) / 2;
+            if (r->own[mid].hi <= lo) k = mid + 1;
+            else m = mid;
+        }
+        uint64_t bytes = 0;
+        for (; k < r->nown && r->own[k].lo < hi; k++) {
+            uint64_t a = r->own[k].lo > lo ? r->own[k].lo : lo, b = r->own[k].hi < hi ? r->own[k].hi : hi;
+            if (n == ccut) grow((void **)&cut, &ccut, sizeof *cut);
+            if (n == creg) grow((void **)&reg, &creg, sizeof *reg);
+            cut[n] = (struct KeptRange){a, b}, reg[n] = (VkBufferCopy){a, total, b - a}, n++;
+            total += b - a, bytes += b - a;
+        }
+        if (!__atomic_exchange_n(&r->cpu_read[lo >> 12], 1, __ATOMIC_RELAXED)) plat_inc64(&own_switched);
+        if (plat_inc32(&logged) <= 16)
+            rt_log("mem: staged pool %#llx: page %#llx could not be protected for its GPU-owned bytes; %llu bytes fetched "
+                   "at once and the page goes back to the fence copy-back", (unsigned long long)r->lo,
+                   (unsigned long long)pg[i], (unsigned long long)bytes);
+    }
+    if (total) {
+        VkBuffer sb;
+        VmaAllocation sa;
+        const uint8_t *map = own_gpu_read(r, reg, n, total, &sb, &sa, pg[0]);
+        for (int i = 0; i < n; i++)   // open pages, read-write (own_take thawed and committed them)
+            memcpy((void *)(uintptr_t)(r->import_lo + cut[i].lo), map + reg[i].dstOffset, cut[i].hi - cut[i].lo);
+        vmaDestroyBuffer(vk_ctx()->vma, sb, sa);
+        own_cut(r, cut, n);
+        __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&own_lock);
+}
+
+// memory.c probe_fault and prb_release: page (claimed, read-write) is GPU-owned. kernel: a host path that hands it to
+// the kernel or a driver (rip: its caller). Fetches the owned bytes of the page and of the other owned pages of its
+// 64 KiB block that no other thread is settling, then clears them (mem_guard_clear) before own_lock goes, so a range
+// staged_wb_done adds meanwhile either is in this fetch or finds the page open and protects it again.
+static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel) {
+    uint64_t t0 = qpc();
+    plat_mutex_lock(&own_lock);
+    PoolRec *r = st_find(page);
+    if (!r) {   // the pool went away (staged_forget) while this thread waited for the lock
+        mem_guard_clear(page);
+        plat_mutex_unlock(&own_lock);
+        return 1;
+    }
+    uint64_t w0 = page & ~(OWN_BLOCK - 1), w1 = w0 + OWN_BLOCK;
+    if (w0 < r->import_lo) w0 = r->import_lo;
+    if (w1 > r->import_hi) w1 = r->import_hi;
+    uint32_t mine = 0;   // bit k: page w0 + k * 4 KiB is claimed here
+    for (uint64_t p = w0; p < w1; p += 0x1000)
+        if (p == page || mem_guard_tryclaim(p)) mine |= 1u << ((p - w0) >> 12);
+    static struct KeptRange *cut;   // own_lock
+    static VkBufferCopy *reg;
+    static int ccut, creg;
+    uint32_t got = 0;   // bit k: page w0 + k * 4 KiB had owned bytes this fetch brings in
+    int n = 0;
+    uint64_t total = 0, lo = w0 - r->import_lo, hi = w1 - r->import_lo;
+    int k = 0, m = r->nown;
+    while (k < m) {   // first owned range ending above lo
+        int mid = (k + m) / 2;
+        if (r->own[mid].hi <= lo) k = mid + 1;
+        else m = mid;
+    }
+    for (; k < r->nown && r->own[k].lo < hi; k++) {
+        uint64_t a = r->own[k].lo > lo ? r->own[k].lo : lo, b = r->own[k].hi < hi ? r->own[k].hi : hi;
+        for (uint64_t x = a; x < b;) {
+            uint64_t e = (x & ~0xfffull) + 0x1000;
+            if (e > b) e = b;
+            if (mine >> ((x - lo) >> 12) & 1) {
+                got |= 1u << ((x - lo) >> 12);
+                if (n == ccut) grow((void **)&cut, &ccut, sizeof *cut);
+                if (n == creg) grow((void **)&reg, &creg, sizeof *reg);
+                if (n && cut[n - 1].hi == x) cut[n - 1].hi = e, reg[n - 1].size += e - x;
+                else cut[n] = (struct KeptRange){x, e}, reg[n] = (VkBufferCopy){x, total, e - x}, n++;
+                total += e - x;
+            }
+            x = e;
+        }
+    }
+    if (total) {
+        VkBuffer sb;
+        VmaAllocation sa;
+        const uint8_t *map = own_gpu_read(r, reg, n, total, &sb, &sa, page);
+        for (int i = 0; i < n; i++)   // the claimed pages are read-write
+            memcpy((void *)(uintptr_t)(r->import_lo + cut[i].lo), map + reg[i].dstOffset, cut[i].hi - cut[i].lo);
+        vmaDestroyBuffer(vk_ctx()->vma, sb, sa);
+        own_cut(r, cut, n);
+        __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    }
+    // Only a page whose owned bytes came in is marked CPU-read (later GPU writes to it go back at the fence): a page
+    // that was protected with nothing owned on it (own_take's claimed case) just opens, and its next GPU write is
+    // owned again rather than copied back at every fence from then on.
+    // The fetched bytes are uploaded into the mirror once more at the page's next sync: the copy into guest memory sets
+    // the page's write-watch bit. Left so: the reset that would avoid it cannot tell that copy from a write by another
+    // thread to the page, which is read-write while claimed, and a missed write would leave the mirror stale; the cost
+    // is one page upload per fetched page, and fetches are rare.
+    int pages = 0;
+    for (uint64_t p = w0; p < w1; p += 0x1000)
+        if (mine >> ((p - w0) >> 12) & 1) {
+            if ((got >> ((p - w0) >> 12) & 1) && !__atomic_exchange_n(&r->cpu_read[(p - r->import_lo) >> 12], 1,
+                                                                       __ATOMIC_RELAXED))
+                plat_inc64(&own_switched);
+            mem_guard_clear(p);
+            pages++;
+        }
+    if (!total) plat_inc64(&own_fempty);
+    plat_mutex_unlock(&own_lock);
+    uint64_t ns = qpc() - t0;
+    int guest = kern_cpu() != NULL;
+    if (st_in_wb) plat_inc64(&own_cfetch);   // the completion thread inside staged_wb_done
+    if (kernel) plat_inc64(&own_kfetch);
+    else plat_inc64(&own_fetch[write ? 1 : 0][guest]);
+    plat_add64(&own_fpages, pages), plat_add64(&own_fbytes, (int64_t)total), plat_add64(&own_fns, (int64_t)ns);
+    for (int64_t mx = own_fmax; (int64_t)ns > mx && !__atomic_compare_exchange_n(&own_fmax, &mx, (int64_t)ns, 0,
+                                                                               __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+    int32_t i = __atomic_fetch_add(&own_nrec, 1, __ATOMIC_RELAXED);
+    if (i < OWN_LOG)
+        own_rec[i] = (OwnRec){__atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED), page, rip, ns, write, guest, kernel, pages};
+    return 1;
+}
+
+// vk_pool_fini, the pool out of the index: its owned pages open again without a fetch (the storage goes back to the
+// guest, and a pool made later at these addresses starts with plain pages), after any fetch of it has ended.
+// The first 32 get a line with what they dropped.
+static void staged_forget(PoolRec *r) {
+    static volatile int32_t logged;
+    uint64_t t0 = qpc(), bytes = 0;
+    plat_mutex_lock(&own_lock);
+    int at = st_upper(r->import_lo) - 1;   // st_pools stays sorted: staged_fetch's binary search
+    if (at < 0 || st_pools[at] != r)
+        for (at = 0; at < nst_pools && st_pools[at] != r; at++) {}
+    if (at < nst_pools) memmove(st_pools + at, st_pools + at + 1, (size_t)(nst_pools - at - 1) * sizeof *st_pools), nst_pools--;
+    int claimed, opened = mem_guard_drop(r->import_lo, r->import_hi - r->import_lo, &claimed), ranges = r->nown;
+    for (int k = 0; k < r->nown; k++) bytes += r->own[k].hi - r->own[k].lo;
+    free(r->own);
+    r->own = NULL, r->nown = r->cown = 0;
+    __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&own_lock);
+    uint64_t frame = __atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED);
+    if (plat_inc32(&logged) <= 32)
+        rt_log("mem: staged pool %#llx of %.0f MiB released at frame %llu: %d owned ranges (%.1f MiB) dropped unfetched, "
+               "%d pages opened, %d left to the threads that claimed them, %.2f ms", (unsigned long long)r->lo,
+               (r->import_hi - r->import_lo) / 1048576.0, (unsigned long long)frame, ranges, bytes / 1048576.0, opened,
+               claimed, qpc_ms(qpc() - t0));
+}
+
+// vk_mem_shutdown, the device idle, before the pools and the staging pool go: the owned pages are fetched while the
+// mirrors still hold their bytes (memory.c mem_thaw, as for a kernel path), then the pools leave st_pools, the pages
+// left owned open (mem_guard_drop) and staged_fetch's command pool and fence are destroyed. A fault on a page of
+// theirs after this finds no pool and opens the page. A pool's record must not outlive this in st_pools: vk_mem_shutdown
+// frees the records without vk_pool_fini, and a probe may start a new device in the same process.
+static void staged_own_shutdown(VkCtx *c) {
+    static struct { uint64_t lo, hi; } *rg;
+    static int crg;
+    plat_mutex_lock(&own_lock);
+    int n = nst_pools;
+    while (crg < n) grow((void **)&rg, &crg, sizeof *rg);
+    for (int i = 0; i < n; i++) rg[i].lo = st_pools[i]->import_lo, rg[i].hi = st_pools[i]->import_hi;
+    plat_mutex_unlock(&own_lock);
+    for (int i = 0; i < n; i++) mem_thaw(rg[i].lo, rg[i].hi - rg[i].lo);   // staged_fetch takes own_lock
+    plat_mutex_lock(&own_lock);
+    for (int i = 0; i < nst_pools; i++) {
+        PoolRec *r = st_pools[i];
+        int claimed;
+        mem_guard_drop(r->import_lo, r->import_hi - r->import_lo, &claimed);
+        free(r->own);
+        r->own = NULL, r->nown = r->cown = 0;
+    }
+    nst_pools = 0;
+    __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    if (fc.pool) {   // the command buffer goes with its pool
+        vkDestroyFence(c->device, fc.fence, NULL);
+        vkDestroyCommandPool(c->device, fc.pool, NULL);
+        memset(&fc, 0, sizeof fc);
+    }
+    plat_mutex_unlock(&own_lock);
+}
+
+// With the staged line: the owned pages and fetches since the last one, and the first OWN_LOG fetches.
+static void own_log(uint64_t frame, double f) {
+    uint64_t bytes = 0, cpu_read = 0;
+    int ranges = 0;
+    plat_mutex_lock(&own_lock);
+    for (int i = 0; i < nst_pools; i++) {
+        const PoolRec *r = st_pools[i];
+        ranges += r->nown;
+        for (int k = 0; k < r->nown; k++) bytes += r->own[k].hi - r->own[k].lo;
+        for (uint64_t p = 0; p <= (r->import_hi - r->import_lo) >> 12; p++) cpu_read += r->cpu_read[p];
+    }
+    plat_mutex_unlock(&own_lock);
+    int64_t fe = plat_xchg64(&own_fempty, 0), lw = plat_xchg64(&own_long, 0), sw = plat_xchg64(&own_switched, 0);
+    int64_t fbr = plat_xchg64(&own_fb_ranges, 0), fbb = plat_xchg64(&own_fb_bytes, 0);
+    int64_t cbo = plat_xchg64(&own_cb_opened, 0), cbk = plat_xchg64(&own_cb_kept, 0), cf = plat_xchg64(&own_cfetch, 0);
+    rt_log("mem: staged own frame %llu: since the last line: fetches without an owned byte %lld, fetches that waited over "
+           "1 s %lld, fetches inside staged_wb_done %lld; pages switched to the fence copy-back %lld, CPU-read pages now "
+           "%llu; copy-back onto pages owned again: opened %lld, pieces kept owned %lld; per frame: their GPU writes "
+           "copied back at the fence %.1f pieces, %.3f MiB (time in the staged frame line's write-back)",
+           (unsigned long long)frame, (long long)fe, (long long)lw, (long long)cf, (long long)sw,
+           (unsigned long long)cpu_read, (long long)cbo, (long long)cbk, fbr / f, fbb / 1048576.0 / f);
+    int64_t pr = plat_xchg64(&own_protects, 0), gr = plat_xchg64(&own_fetch[0][1], 0), gw = plat_xchg64(&own_fetch[1][1], 0);
+    int64_t rr = plat_xchg64(&own_fetch[0][0], 0), rw = plat_xchg64(&own_fetch[1][0], 0), kf = plat_xchg64(&own_kfetch, 0);
+    int64_t fp = plat_xchg64(&own_fpages, 0), fb = plat_xchg64(&own_fbytes, 0), fn = plat_xchg64(&own_fns, 0);
+    int64_t fm = plat_xchg64(&own_fmax, 0);
+    int64_t s0 = plat_xchg64(&own_seen[0], 0), s1 = plat_xchg64(&own_seen[1], 0), s2 = plat_xchg64(&own_seen[2], 0);
+    int64_t pu = plat_xchg64(&own_pushed, 0), tn = plat_xchg64(&own_take_ns, 0), pf = plat_xchg64(&own_pfail, 0);
+    int64_t tp[5];
+    for (int k = 0; k < 5; k++) tp[k] = plat_xchg64(&own_take_part[k], 0);
+    rt_log("mem: staged own frame %llu: per frame: fence-time pages seen %.1f open, %.1f owned, %.1f busy; %.1f queued, "
+           "%.1f failed to protect; own_take %.3f ms (merge and scan %.3f, thaw %.3f, commit %.3f, protect %.3f in %.1f "
+           "runs); since the last line the longest staged_wb_done %.2f ms", (unsigned long long)frame, s0 / f, s1 / f,
+           s2 / f, pu / f, pf / f, tn / 1e6 / f, tp[4] / 1e6 / f, tp[0] / 1e6 / f, tp[1] / 1e6 / f, tp[2] / 1e6 / f,
+           tp[3] / f, plat_xchg64(&st_wbdone_max, 0) / 1e6);
+    rt_log("mem: staged own frame %llu: owned now %d ranges, %.1f MiB; per frame: pages made owned (VirtualProtect calls) "
+           "%.1f; since the last line: fetches game read %lld, game write %lld, runtime read %lld, runtime write %lld, "
+           "kernel paths %lld; %lld pages, %.2f MiB, %.2f ms in all, longest %.2f ms",
+           (unsigned long long)frame, ranges, bytes / 1048576.0, pr / f, (long long)gr, (long long)gw, (long long)rr,
+           (long long)rw, (long long)kf, (long long)fp, fb / 1048576.0, fn / 1e6, fm / 1e6);
+    uintptr_t base = plat_exe_base();
+    int32_t nr = __atomic_load_n(&own_nrec, __ATOMIC_RELAXED);
+    if (nr > OWN_LOG) nr = OWN_LOG;
+    for (int32_t i = own_logged; i < nr; i++) {
+        const OwnRec *x = &own_rec[i];
+        plat_mutex_lock(&own_lock);
+        PoolRec *r = st_find(x->addr);
+        uint64_t off = r ? x->addr - r->lo : 0;
+        plat_mutex_unlock(&own_lock);
+        rt_log("mem: staged fetch %d: frame %llu, %s %#llx (pool offset %#llx%s), %s, %s exe+%#llx, %d pages, %.3f ms", i,
+               (unsigned long long)x->frame, x->kernel ? "kernel path at" : x->write ? "write" : "read",
+               (unsigned long long)x->addr, (unsigned long long)off, r ? "" : ", pool gone", x->guest ? "game thread" : "runtime thread",
+               x->kernel ? "caller" : "rip", (unsigned long long)(x->rip >= base ? x->rip - base : x->rip), x->pages,
+               x->ns / 1e6);
+    }
+    own_logged = nr;
 }
 
 // The span's pool resolved without a buffer (staged_pending) and the mirror cannot serve this use: import it after
@@ -2492,12 +3069,25 @@ static void staged_fill(PoolRec *r, const BigMirror *bm) {
 static void st_blk_update(uint64_t fence) {
     static MRange *sbuf;
     static size_t scap;
-    if (!st_blk_dirty && st_blk_fence == fence) return;
+    static uint64_t owngen;
+    uint64_t og = __atomic_load_n(&own_gen, __ATOMIC_ACQUIRE);
+    if (!st_blk_dirty && st_blk_fence == fence && owngen == og) return;
     nst_blk = 0;
     for (StJob *j = st_jobs; j; j = j->next) {
         if (!j->ended || j->fence >= fence) continue;
         for (int i = 0; i < j->n; i++) range_add(&st_blk, &nst_blk, &cst_blk, j->w[i].r, j->w[i].off, j->w[i].size);
+        for (int i = 0; i < j->no; i++) range_add(&st_blk, &nst_blk, &cst_blk, j->o[i].r, j->o[i].off, j->o[i].size);
     }
+    if (staged_fault) {   // the bytes only the mirrors hold: guest memory there is stale
+        plat_mutex_lock(&own_lock);
+        og = __atomic_load_n(&own_gen, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < nst_pools; i++)
+            for (int k = 0; k < st_pools[i]->nown; k++)
+                range_add(&st_blk, &nst_blk, &cst_blk, st_pools[i], st_pools[i]->own[k].lo,
+                          st_pools[i]->own[k].hi - st_pools[i]->own[k].lo);
+        plat_mutex_unlock(&own_lock);
+    }
+    owngen = og;
     sort_ranges(st_blk, (size_t)nst_blk, &sbuf, &scap);
     int o = 0;
     for (int i = 0; i < nst_blk; i++) {
@@ -2521,9 +3111,10 @@ static void staged_upload(VkCommandBuffer cb, uint64_t fence) {
     static int creg;
     uint64_t t0 = qpc();
     sort_ranges(stq, (size_t)nstq, &sbuf, &scap);
-    // A job leaves st_jobs only after its bytes are in guest memory (staged_wb_done), so a range blocked here has its
-    // bytes in the mirror and one not blocked has them in guest memory; the copies need not hold the lock. No job
-    // ends meanwhile: vk_mem_mirror_end runs on this thread.
+    // A job leaves st_jobs only after its bytes are in guest memory or on the pool's own list (staged_wb_done), so a
+    // range blocked here has its bytes in the mirror and one not blocked has them in guest memory; the copies need not
+    // hold the lock. No job ends meanwhile: vk_mem_mirror_end runs on this thread. A fetch that empties an own range
+    // after this only makes guest memory equal the mirror there.
     plat_mutex_lock(&st_lock);
     st_blk_update(fence);
     ncut = 0;
@@ -2557,12 +3148,14 @@ static void staged_upload(VkCommandBuffer cb, uint64_t fence) {
         VkBuffer sb;
         VmaAllocation sa;
         uint8_t *map = vk_staging(total, &sb, &sa), *p = map;
+        int probe = staged_fault;   // owned pages: copied without opening them
         for (int i = 0; i < ncut;) {
             PoolRec *r = cut[i].r;
             int k = 0;
             for (; i < ncut && cut[i].r == r; i++) {
                 if (k == creg) grow((void **)&reg, &creg, sizeof *reg);
-                memcpy(p, (const void *)(uintptr_t)(r->import_lo + cut[i].off), cut[i].size);
+                if (probe) mem_probe_copy(p, r->import_lo + cut[i].off, cut[i].size);   // the guard stays on
+                else memcpy(p, (const void *)(uintptr_t)(r->import_lo + cut[i].off), cut[i].size);
                 reg[k++] = (VkBufferCopy){(VkDeviceSize)(p - map), cut[i].off, cut[i].size};
                 p += cut[i].size;
             }
@@ -2628,11 +3221,135 @@ static int staged_wb_record(VkCommandBuffer cb) {
     return rec;
 }
 
+// staged_copy_back: the bytes of one page that a copy-back carries (offsets from import_lo, roff in the readback).
+typedef struct { uint64_t off, size, roff; } CbPiece;
+
+// own_lock held: whether every owned byte of the page at offset pg lies in the sorted, disjoint pieces pc[0..n) of
+// that page (a page owned with no byte on the list counts as covered).
+static int own_covered(const PoolRec *r, uint64_t pg, const CbPiece *pc, int n) {
+    uint64_t pe = pg + 0x1000;
+    int k = 0, m = r->nown;
+    while (k < m) {   // the first owned range ending above pg
+        int mid = (k + m) / 2;
+        if (r->own[mid].hi <= pg) k = mid + 1;
+        else m = mid;
+    }
+    for (int q = 0; k < r->nown && r->own[k].lo < pe; k++) {
+        uint64_t a = r->own[k].lo > pg ? r->own[k].lo : pg, b = r->own[k].hi < pe ? r->own[k].hi : pe;
+        while (a < b) {
+            while (q < n && pc[q].off + pc[q].size <= a) q++;
+            if (q == n || pc[q].off > a) return 0;
+            a = pc[q].off + pc[q].size;
+        }
+    }
+    return 1;
+}
+
+// staged_wb_done, TOTK_STAGED_WB=fault, pool_lock shared, r live: the job's copy-back ranges w[i0..i1) of r go into
+// guest memory. They are the GPU's writes to pages the CPU had read (r->cpu_read when the job was recorded), but such
+// a page can be owned again by now: a submission recorded before the fetch that made the page CPU-read put its writes
+// there on the own list, and its fence, after the fetch, protected the page again (own_take). Thawing such a page
+// with mem_thaw would fetch it from the mirror, a GPU round trip on the completion thread. Instead, page by page,
+// under own_lock:
+// - open: the bytes are copied in after the lock is let go (only own_take, on this thread, protects pages);
+// - owned, and every owned byte of the page is among the copy-back's bytes (own_covered): the page is claimed, the
+//   bytes go in, its owned bytes leave the list and the page opens, with no fetch;
+// - owned with other owned bytes too, or being settled by another thread: the copy-back's bytes join the own list
+//   instead. The mirror holds them, and as the newest version (this fence is the latest that wrote them; later writes
+//   come with later fences), so the page's next fetch brings them in with its other owned bytes, and the bytes of the
+//   page that neither carries stay the guest's. A page found being settled is protected again once the claim ends if
+//   it is open then (mem_guard_own), as own_take does: the claim may have been a fault on an open page.
+static void staged_copy_back(PoolRec *r, const StJob *j, int i0, int i1) {
+    static CbPiece *pc, *open;   // completion thread: the pieces by page; those for open pages
+    static int cpc, cop;
+    static StRange *keep;
+    static int ckeep;
+    static struct KeptRange *gone;
+    static int cgone;
+    static uint64_t *again;
+    static int cagain;
+    const uint64_t base = r->import_lo;
+    int npc = 0, nop = 0, nkeep = 0, ngone = 0, nagain = 0;
+    for (int x = i0; x < i1; x++)
+        for (uint64_t a = j->w[x].off, b = a + j->w[x].size; a < b;) {
+            uint64_t e = (a & ~0xfffull) + 0x1000;
+            if (e > b) e = b;
+            if (npc == cpc) grow((void **)&pc, &cpc, sizeof *pc);
+            pc[npc++] = (CbPiece){a, e - a, j->w[x].roff + (a - j->w[x].off)};
+            a = e;
+        }
+    plat_mutex_lock(&own_lock);
+    for (int p0 = 0; p0 < npc;) {
+        uint64_t pg = pc[p0].off & ~0xfffull;
+        int p1 = p0 + 1;
+        while (p1 < npc && (pc[p1].off & ~0xfffull) == pg) p1++;
+        int st = mem_guard_state(base + pg);
+        if (!st) {
+            for (int q = p0; q < p1; q++) {
+                if (nop == cop) grow((void **)&open, &cop, sizeof *open);
+                open[nop++] = pc[q];
+            }
+        } else if (st == 1 && own_covered(r, pg, pc + p0, p1 - p0) && mem_guard_tryclaim(base + pg)) {
+            for (int q = p0; q < p1; q++)   // the claimed page is read-write
+                memcpy((void *)(uintptr_t)(base + pc[q].off), j->map + pc[q].roff, pc[q].size);
+            if (ngone == cgone) grow((void **)&gone, &cgone, sizeof *gone);
+            gone[ngone++] = (struct KeptRange){pg, pg + 0x1000};
+        } else {
+            for (int q = p0; q < p1; q++) {
+                if (nkeep == ckeep) grow((void **)&keep, &ckeep, sizeof *keep);
+                keep[nkeep++] = (StRange){r, r->lo, r->storage_serial, pc[q].off, pc[q].size, 0};
+            }
+            if (st == 2) {
+                if (nagain == cagain) grow((void **)&again, &cagain, sizeof *again);
+                again[nagain++] = base + pg;
+            }
+        }
+        p0 = p1;
+    }
+    if (ngone) {
+        own_cut(r, gone, ngone);
+        for (int i = 0; i < ngone; i++) mem_guard_clear(base + gone[i].lo);   // after the cut: a fault now finds it open
+    }
+    if (nkeep) own_merge(r, keep, nkeep);
+    if (ngone || nkeep) __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&own_lock);
+    for (int i = 0; i < nagain; i++) plat_add64(&own_protects, mem_guard_own(again[i]));
+    plat_add64(&own_cb_opened, ngone), plat_add64(&own_cb_kept, nkeep);
+    for (int x = 0; x < nop;) {   // runs of pieces whose pages touch: one thaw each (guarded pages are not among them)
+        uint64_t a = (base + open[x].off) & ~0xfffull, b = (base + open[x].off + open[x].size + 0xfff) & ~0xfffull;
+        int y = x + 1;
+        for (; y < nop && ((base + open[y].off) & ~0xfffull) <= b; y++) {
+            uint64_t e2 = (base + open[y].off + open[y].size + 0xfff) & ~0xfffull;
+            if (e2 > b) b = e2;
+        }
+        mem_thaw_keep(a, b - a);   // a frozen region is read-only; nothing to settle on these pages
+        for (; x < y; x++) memcpy((void *)(uintptr_t)(base + open[x].off), j->map + open[x].roff, open[x].size);
+    }
+}
+
 // Completion thread, at the job's fence and ahead of the submission's other callbacks (vk_gpu_written_many among them):
-// the write-back bytes go into guest memory, for the pools still live (a pool finalized meanwhile has its storage
-// back in the guest's hands), then the job stops blocking the uploads.
+// for the pools still live (a pool finalized meanwhile has its storage back in the guest's hands), the owned ranges
+// join the own lists and their pages are protected, then the copy-back bytes go into guest memory, then the job stops
+// blocking the uploads. Protection first: the game may poll a word the copy-back writes (a page it reads every frame)
+// as the sign that the submission's other writes are done, and those must not be readable stale once it is set (the
+// window above).
 static void staged_wb_done(void *arg) {
     StJob *j = arg;
+    uint64_t t_done = qpc();
+    st_in_wb = 1;
+    if (j->no) {   // TOTK_STAGED_WB=fault: the writes that stay in the mirror
+        for (int i = 0; i < j->no;) {
+            PoolRec *r = j->o[i].r;
+            pool_lock_shared();   // only for the check: own_take runs without it
+            const pidx_ent *e = pidx_find(&pool_index, j->o[i].lo, 0);
+            int live = e && e->buf == (void *)r && r->storage_serial == j->o[i].serial && ms_get(r) == MS_ON;
+            plat_mutex_unlock_shared(&pool_lock);
+            int k = i;
+            for (; k < j->no && j->o[k].r == r; k++) {}
+            if (live) own_take(r, j->o + i, k - i);
+            i = k;
+        }
+    }
     if (j->n) {
         uint64_t t0 = qpc();
         vmaInvalidateAllocation(vk_ctx()->vma, j->alloc, 0, VK_WHOLE_SIZE);
@@ -2643,7 +3360,8 @@ static void staged_wb_done(void *arg) {
             int live = e && e->buf == (void *)r && r->storage_serial == j->w[i].serial;
             int k = i;
             for (; k < j->n && j->w[k].r == r; k++) {}
-            for (int x = i; live && x < k;) {   // runs of ranges whose pages touch: one thaw each
+            if (live && staged_fault && ms_get(r) == MS_ON) staged_copy_back(r, j, i, k), live = 0;
+            for (int x = i; live && x < k;) {   // TOTK_STAGED_WB=fence: runs of ranges whose pages touch, one thaw each
                 uint64_t base = r->import_lo, a = (base + j->w[x].off) & ~0xfffull;
                 uint64_t b = (base + j->w[x].off + j->w[x].size + 0xfff) & ~0xfffull;
                 int y = x + 1;
@@ -2664,11 +3382,17 @@ static void staged_wb_done(void *arg) {
     plat_mutex_lock(&st_lock);
     for (StJob **p = &st_jobs; *p; p = &(*p)->next)
         if (*p == j) { *p = j->next; break; }
-    if (j->ended && j->n) st_blk_dirty = 1;
+    if (j->ended && (j->n || j->no)) st_blk_dirty = 1;
     plat_mutex_unlock(&st_lock);
     if (j->buf) vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
     free(j->w);
+    free(j->o);
     free(j);
+    st_in_wb = 0;
+    // Every later callback, and with them the value the game waits for, waits for this one.
+    int64_t ns = (int64_t)(qpc() - t_done);
+    for (int64_t mx = st_wbdone_max; ns > mx && !__atomic_compare_exchange_n(&st_wbdone_max, &mx, ns, 0, __ATOMIC_RELAXED,
+                                                                            __ATOMIC_RELAXED);) {}
 }
 
 // vk_mem_shutdown, pool_lock held, the pools just freed: the staged ranges and the write-back jobs whose fence never
@@ -2681,6 +3405,7 @@ static void staged_shutdown(VkCtx *c) {
         st_jobs = j->next;
         if (j->buf) vmaDestroyBuffer(c->vma, j->buf, j->alloc);
         free(j->w);
+        free(j->o);
         free(j);
     }
     st_cur = NULL, nst_blk = 0, st_blk_dirty = 1;
@@ -2750,6 +3475,17 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
     plat_mutex_unlock(&pool_lock);
     r->acc_sub = msub, r->sub_hist = 1;
     r->sfeed = (uint8_t)staged;
+    if (staged && staged_fault) {   // staged_fetch finds the pool by address
+        r->cpu_read = calloc((size_t)(n >> 12) + 1, 1);
+        if (!r->cpu_read) rt_fatal("vk: out of memory");
+        plat_mutex_lock(&own_lock);
+        if (nst_pools == cst_pools) grow((void **)&st_pools, &cst_pools, sizeof *st_pools);
+        int at = st_upper(r->import_lo);   // sorted by address: staged_fetch's lookup is a binary search
+        memmove(st_pools + at + 1, st_pools + at, (size_t)(nst_pools - at) * sizeof *st_pools);
+        st_pools[at] = r;
+        nst_pools++;
+        plat_mutex_unlock(&own_lock);
+    }
     ms_set(r, MS_ON);   // after mbuf, acc_sub and sfeed: what a reader of MS_ON goes on to read
     BigMirror bm = {1, r->lo, n, 0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, qpc() - t0, q, wpages};
     if (staged) *fill = bm;   // filled by the caller, which logs it
@@ -3317,7 +4053,7 @@ static int kept_page(PoolRec *r, uint64_t off) {   // completion thread: takes m
 static void verify_cb(void *arg) {   // completion thread
     VJob *j = arg;
     static volatile int32_t logged;
-    uint64_t pages = 0, skipped = 0, bad = 0;
+    uint64_t pages = 0, skipped = 0, bad = 0, owned = 0;
     for (int i = 0; i < j->n; i++) {
         const VSample *s = &j->s[i];
         PoolRec *r = s->r;
@@ -3328,6 +4064,13 @@ static void verify_cb(void *arg) {   // completion thread
         }
         for (uint64_t o = 0; o < s->len; o += 1ull << GEN_PAGE_SHIFT) {
             uint64_t a = r->import_lo + s->off + o;
+            // A GPU-owned page (TOTK_STAGED_WB=fault): guest memory is stale there on purpose, and reading it would
+            // fetch it. Verify cannot cover those pages; TOTK_STAGED_WB=fence, whose fence copies put the GPU's bytes
+            // into guest memory, compares them.
+            if (r->sfeed && staged_fault && mem_guard_state(a)) {
+                owned++;
+                continue;
+            }
             const uint8_t *m = j->map + s->dst + o, *g = (const uint8_t *)(uintptr_t)a;
             pages++;
             if (!memcmp(m, g, 1ull << GEN_PAGE_SHIFT)) continue;
@@ -3349,6 +4092,7 @@ static void verify_cb(void *arg) {   // completion thread
     plat_add64(&v_pages, (int64_t)pages);
     plat_add64(&v_skipped, (int64_t)skipped);
     plat_add64(&v_mismatch, (int64_t)bad);
+    plat_add64(&v_owned, (int64_t)owned);
     vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
     free(j);
 }
@@ -3406,8 +4150,9 @@ int vk_mem_wb_early_min(void) {
 // Whether a held part's write-back (vk_mem_mirror_wb_held) takes the range: tagged upto or lower, and not a staged
 // mirror's (TOTK_MIRROR_STAGED, sfeed). A staged pool has no import for the write-back thread's copy to land in, so its
 // ranges stay in the lists until vk_mem_mirror_end, which splits them off for the readback buffer of the submission's
-// job (staged_wb_record), as when no held part wrote anything back. sfeed is set before MS_ON and never changes, and a
-// range is only noted for a pool in MS_ON (vk_mem_gpu_wrote), so the read needs no lock.
+// job (staged_wb_record) and, with TOTK_STAGED_WB=fault, for the pool's own list (staged_split_own), as when no held
+// part wrote anything back. sfeed is set before MS_ON and never changes, and a range is only noted for a pool in
+// MS_ON (vk_mem_gpu_wrote), so the read needs no lock.
 static int wb_early_takes(const MRange *m, uint32_t upto) { return m->tag <= upto && !m->r->sfeed; }
 
 // Moves the ranges wb_early_takes picks from a[0, *n) to the end of out (keeping the others in order); their bytes.
@@ -3607,6 +4352,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
                 else wbl[k++] = wbl[i];
         }
         if (k) rec += copy_ranges(cb, wbl, k, 0, &mrep.wb_bytes, &mrep.wb_copies, fence);
+        if (nstw && staged_fault) staged_split_own();   // most stay in the mirror; pages the CPU read go back
         if (nstw) rec += staged_wb_record(cb);
         rec += 2;
         mbarrier(cb, stage, writes,
@@ -3617,7 +4363,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (st_cur) {   // from here on the job's ranges keep the next submissions' uploads off those bytes
         plat_mutex_lock(&st_lock);
         st_cur->ended = 1;
-        if (st_cur->n) st_blk_dirty = 1;
+        if (st_cur->n || st_cur->no) st_blk_dirty = 1;
         plat_mutex_unlock(&st_lock);
         st_cur = NULL;
     }
@@ -3683,11 +4429,11 @@ static void mirror_log(uint64_t frame) {
     double f = frame > last ? (double)(frame - last) : 1.0, M = 1048576.0;
     last = frame;
     uint64_t fc = (uint64_t)plat_xchg64(&m_flush_calls, 0), fb = (uint64_t)plat_xchg64(&m_flush_bytes, 0);
-    char ver[160] = "";
+    char ver[224] = "";
     if (mirror_verify)
-        snprintf(ver, sizeof ver, "; verify: pages compared %lld, skipped %lld (written since), mismatches %lld",
-                 (long long)plat_xchg64(&v_pages, 0), (long long)plat_xchg64(&v_skipped, 0),
-                 (long long)plat_xchg64(&v_mismatch, 0));
+        snprintf(ver, sizeof ver, "; verify: pages compared %lld, skipped %lld (written since), mismatches %lld, "
+                 "GPU-owned not compared %lld", (long long)plat_xchg64(&v_pages, 0), (long long)plat_xchg64(&v_skipped, 0),
+                 (long long)plat_xchg64(&v_mismatch, 0), (long long)plat_xchg64(&v_owned, 0));
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, own GPU writes not copied in %.3f MiB, write-back %.3f MiB in %.1f ranges "
@@ -3712,6 +4458,7 @@ static void mirror_log(uint64_t frame) {
                qpc_ms(a.st_up_t) / f, a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
+        if (staged_fault) own_log(frame, f);
     }
 
 }
@@ -4174,6 +4921,7 @@ void vk_mem_shutdown(void) {
     vk_queue_lock();
     vkDeviceWaitIdle(c->device);
     vk_queue_unlock();
+    if (staged_min && staged_fault) staged_own_shutdown(c);   // the GPU-owned bytes of staged mirrors, while they exist
     if (mirror_sparse) sparse_cache_close();
     if (sparse_copy.pipeline) vkDestroyPipeline(c->device, sparse_copy.pipeline, NULL);
     if (sparse_copy.layout) vkDestroyPipelineLayout(c->device, sparse_copy.layout, NULL);

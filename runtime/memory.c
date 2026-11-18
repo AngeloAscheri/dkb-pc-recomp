@@ -132,7 +132,17 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
+static int (*volatile own_hook)(uint64_t page, int write, uint64_t rip, int kernel);
+static void prb_release(uint64_t a, uint64_t n, uintptr_t caller);
+
+// The kernel will write the range (a file read) or the host gives it back to the guest: the guarded pages there are
+// settled first (prb_release: GPU-owned ones fetched from their VRAM mirror).
 void mem_thaw(uint64_t a, uint64_t n) {
+    if (own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0));
+    mem_thaw_keep(a, n);
+}
+
+void mem_thaw_keep(uint64_t a, uint64_t n) {
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
@@ -177,6 +187,218 @@ int mem_freeze(uint64_t a) {
 }
 
 int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE); }
+
+// ---- GPU-owned pages (vk_memory.c staged mirror, TOTK_STAGED_WB=fault; Windows only)
+// A staged mirror's GPU-written bytes are only in its VRAM mirror, and their pages are PAGE_NOACCESS (mem_guard_own).
+// The first access to such a page faults into probe_fault (win32.c fault_veh), which makes the page read-write, its
+// state claimed (PRB_BUSY), and calls the hook; the hook copies the GPU's bytes in and calls mem_guard_clear. Host paths
+// that hand guest memory to the kernel or a driver, which would fail on such a page instead of faulting, settle the
+// pages first the same way: mem_thaw (file reads, imports, pool finalize), mem_touch (file writes, imports) and win32.c
+// plat_mem_read; plat_mem_readable counts the guarded pages as readable. The callers keep their own lock around the
+// state changes of a page that pair with their range lists (vk_memory.c own_lock).
+// Per page: 0 not guarded; PRB_BUSY while a thread changes the page's protection (the others wait for it to end);
+// PRB_OWN, a page whose GPU-written bytes are only in a VRAM mirror.
+#define PRB_CHUNK_SHIFT 28
+#define PRB_PER_CHUNK (1u << (PRB_CHUNK_SHIFT - 12))
+#define PRB_BUSY 0x40000000u
+#define PRB_OWN 0x20000000u
+static uint32_t *volatile prb[RT_ADDRESS_LIMIT >> PRB_CHUNK_SHIFT];
+static PlatMutex prb_lock = PLAT_MUTEX_INIT;                            // chunk allocation
+volatile uint64_t mem_probe_frame;                                     // vk_memory.c vk_mem_census
+
+static uint32_t *prb_slot(uint64_t a) {
+    if (a >= RT_ADDRESS_LIMIT) return NULL;
+    uint32_t *c = __atomic_load_n(&prb[a >> PRB_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
+    return c ? &c[(a >> 12) & (PRB_PER_CHUNK - 1)] : NULL;
+}
+
+// Claims the page's state: waits out another thread's change, then swaps in PRB_BUSY. Returns the value it replaced.
+static uint32_t prb_claim(uint32_t *s) {
+    for (unsigned i = 0;; i++) {
+        uint32_t v = __atomic_load_n(s, __ATOMIC_ACQUIRE);
+        if (v == PRB_BUSY) {
+            if (i > 1000) plat_yield();
+            else plat_pause();
+            continue;
+        }
+        if (__atomic_compare_exchange_n(s, &v, PRB_BUSY, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return v;
+    }
+}
+
+// The page's protection back to what it would be without the guard: read-only in a frozen region, else read-write.
+static void prb_unprotect(uint64_t page) { plat_mem_protect(page, PAGE, mem_frozen(page) ? PLAT_PROT_READ : PLAT_PROT_RW); }
+
+static int probe_fault(uint64_t a, int write, uint64_t rip) {
+    uint32_t *s = prb_slot(a);
+    if (!s) return 0;
+    uint64_t page = a & ~(PAGE - 1);
+    uint32_t v = prb_claim(s);
+    if (v == PRB_OWN) {   // GPU-owned: the hook fetches its bytes from the mirror and clears the state (mem_guard_clear)
+        plat_mem_protect(page, PAGE, PLAT_PROT_RW);
+        own_hook(page, write, rip, 0);
+        return 1;
+    }
+    // Not guarded, or another thread made it accessible meanwhile.
+    __atomic_store_n(s, v, __ATOMIC_RELEASE);
+    uint64_t end;
+    int st = plat_mem_state(page, page + PAGE, &end);
+    return st == PLAT_PROT_RW || (st == PLAT_PROT_READ && !write);
+}
+
+static int probe_marked(uint64_t a, uint64_t n) {
+    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
+        uint32_t *s = prb_slot(p);
+        if (!s || !__atomic_load_n(s, __ATOMIC_ACQUIRE)) return 0;
+    }
+    return 1;
+}
+
+// A host path that hands the range to the kernel or a driver: its owned pages are fetched (caller: for the fetch log).
+static void prb_release(uint64_t a, uint64_t n, uintptr_t caller) {
+    if (!n) return;
+    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
+        uint32_t *s = prb_slot(p);
+        if (!s || !__atomic_load_n(s, __ATOMIC_ACQUIRE)) continue;
+        uint32_t v = prb_claim(s);
+        if (v == PRB_OWN) {   // fetched (counted by the hook), cleared there
+            plat_mem_protect(p, PAGE, PLAT_PROT_RW);
+            own_hook(p, 0, caller, 1);
+            continue;
+        }
+        __atomic_store_n(s, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static void probe_release(uint64_t a, uint64_t n, uintptr_t caller) { prb_release(a, n, caller); }
+
+static void prb_chunk(uint64_t p) {   // the page's chunk of states exists
+    uint64_t ci = p >> PRB_CHUNK_SHIFT;
+    if (__atomic_load_n(&prb[ci], __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&prb_lock);
+    if (!prb[ci]) {
+        uint32_t *c = calloc(PRB_PER_CHUNK, sizeof *c);
+        if (!c) rt_fatal("memory: out of memory for the page guards");
+        __atomic_store_n(&prb[ci], c, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&prb_lock);
+}
+
+// A runtime read that should not settle the guarded pages it covers (vk_memory.c staged_upload's copy of the other
+// bytes of owned pages): each guarded page is opened read-only, copied and protected again, the other threads waiting
+// meanwhile.
+void mem_probe_copy(void *dst, uint64_t src, uint64_t n) {
+    uint8_t *d = dst;
+    for (uint64_t a = src; a < src + n;) {
+        uint64_t p = a & ~(PAGE - 1), e = p + PAGE < src + n ? p + PAGE : src + n;
+        uint32_t *s = prb_slot(p);
+        if (s && __atomic_load_n(s, __ATOMIC_ACQUIRE)) {
+            uint32_t v = prb_claim(s);
+            int g = v == PRB_OWN;
+            if (g) plat_mem_protect(p, PAGE, PLAT_PROT_READ);
+            memcpy(d, (const void *)(uintptr_t)a, e - a);
+            if (g) plat_mem_protect(p, PAGE, PLAT_PROT_NONE);
+            __atomic_store_n(s, v, __ATOMIC_RELEASE);
+        } else {
+            memcpy(d, (const void *)(uintptr_t)a, e - a);
+        }
+        d += e - a, a = e;
+    }
+}
+
+static void guard_hooks(void) {
+#ifdef _WIN32
+    static int done;
+    if (!done) done = 1, plat_mem_probe_hooks(probe_fault, probe_marked, probe_release);
+#endif
+}
+
+void mem_guard_hook(int (*fetch)(uint64_t page, int write, uint64_t rip, int kernel)) {
+    own_hook = fetch;
+    guard_hooks();
+}
+
+int mem_guard_state(uint64_t a) {
+    uint32_t *s = prb_slot(a);
+    uint32_t v = s ? __atomic_load_n(s, __ATOMIC_ACQUIRE) : 0;
+    return v == PRB_OWN ? 1 : v == PRB_BUSY ? 2 : 0;
+}
+
+int mem_guard_tryclaim(uint64_t p) {
+    uint32_t *s = prb_slot(p), v = PRB_OWN;
+    if (!s || !__atomic_compare_exchange_n(s, &v, PRB_BUSY, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    plat_mem_protect(p, PAGE, PLAT_PROT_RW);
+    return 1;
+}
+
+void mem_guard_clear(uint64_t p) {
+    uint32_t *s = prb_slot(p);
+    if (s) __atomic_store_n(s, 0, __ATOMIC_RELEASE);
+}
+
+int mem_guard_own(uint64_t p) {
+    prb_chunk(p);
+    uint32_t *s = prb_slot(p), v = prb_claim(s);
+    int made = 0;
+    if (!v) made = plat_mem_protect(p, PAGE, PLAT_PROT_NONE), v = made ? PRB_OWN : 0;
+    __atomic_store_n(s, v, __ATOMIC_RELEASE);
+    return made;
+}
+
+// mem_guard_own over the pages of [a, a+n), with one protection change for each run of pages that were open: the first
+// GPU writes into a new Surf Hills layer's terrain arena made about 6,000 pages owned within a few fences, and with one
+// VirtualProtect a page vk_memory.c own_take took up to about 120 ms at one of them. The run's pages stay claimed
+// during the call, so a thread that faults on one waits for it as for one page. Returns the pages made owned; *failed counts the pages left open because the
+// protection failed.
+int mem_guard_own_range(uint64_t a, uint64_t n, int *failed) {
+    int made = 0;
+    *failed = 0;
+    uint64_t r0 = 0, r1 = 0;   // the run of claimed open pages
+    for (uint64_t p = a & ~(PAGE - 1), end = a + n;; p += PAGE) {
+        uint32_t *s = NULL, v = 1;
+        if (p < end) {
+            prb_chunk(p);
+            s = prb_slot(p);
+            v = prb_claim(s);
+        }
+        if (!v && r1 == p) {
+            r1 += PAGE;
+            continue;
+        }
+        if (r1 > r0) {   // the run ends here: protect it and publish its pages' states
+            int ok = plat_mem_protect(r0, r1 - r0, PLAT_PROT_NONE);
+            for (uint64_t q = r0; q < r1; q += PAGE) __atomic_store_n(prb_slot(q), ok ? PRB_OWN : 0, __ATOMIC_RELEASE);
+            int k = (int)((r1 - r0) / PAGE);
+            if (ok) made += k;
+            else *failed += k;
+        }
+        if (p >= end) return made;
+        if (!v) r0 = p, r1 = p + PAGE;   // a new run
+        else {
+            __atomic_store_n(s, v, __ATOMIC_RELEASE);   // owned already: as it was
+            r0 = r1 = 0;
+        }
+    }
+}
+
+// Only the owned pages nobody has claimed: a thread that faulted on one has claimed it and may be waiting for the lock
+// the caller holds (vk_memory.c staged_forget holds own_lock, which staged_fetch takes), so waiting for the claim to
+// end here could block both for good. That thread finds the pool gone and opens the page itself; a page that
+// mem_probe_copy held stays owned until its next access, which finds no pool either.
+int mem_guard_drop(uint64_t a, uint64_t n, int *claimed) {
+    int opened = 0;
+    *claimed = 0;
+    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
+        uint32_t *s = prb_slot(p), v = PRB_OWN;
+        if (!s || !__atomic_compare_exchange_n(s, &v, PRB_BUSY, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (v == PRB_BUSY) ++*claimed;
+            continue;
+        }
+        prb_unprotect(p);
+        __atomic_store_n(s, 0, __ATOMIC_RELEASE);
+        opened++;
+    }
+    return opened;
+}
 
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
     *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
@@ -379,6 +601,11 @@ static int heap_lazy(void) {
 // CPU (a kernel file read, a driver importing host memory) accesses them: those accesses fail on a reserved page
 // instead of faulting into fault_veh. Committed pages are left alone. No-op without TOTK_HEAP_LAZY.
 void mem_touch(uint64_t a, uint64_t n) {
+    if (own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0));   // a kernel access
+    mem_touch_keep(a, n);
+}
+
+void mem_touch_keep(uint64_t a, uint64_t n) {
     if (!n || !heap_lazy()) return;
     uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
     uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
@@ -722,9 +949,11 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
     return R_OK;
 }
 
-// Whether a read anywhere in [a, a + n) is sure not to fault, from this file's own map of the guest: 1 inside the
+// Whether a read anywhere in [a, a + n) is sure to succeed, from this file's own map of the guest: 1 inside the
 // heap's current size (committed, or in the lazy heap reserved until the first access commits it; frozen pages are
-// read-only, still readable) or on mapped alias pages, in both cases outside a moved stack's source; 0 inside the heap
+// read-only, still readable; a staged mirror's GPU-owned PAGE_NOACCESS pages fault into probe_fault, which fetches
+// them, as plat_mem_readable's probe_marked counts them) or on mapped alias pages,
+// in both cases outside a moved stack's source; 0 inside the heap
 // block or the alias region otherwise; -1 anywhere else (modules, the stack region, the kernel region, host memory),
 // for the caller to ask the platform. No system call: on Windows plat_mem_readable's VirtualQuery reports the whole
 // run of like pages around a, so a pointer in a long read-write stretch of a committed heap (TOTK_HEAP_LAZY=0: all
