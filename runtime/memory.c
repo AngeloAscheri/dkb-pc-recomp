@@ -410,16 +410,8 @@ static int heap_lazy(void) {
 #endif
 }
 
-// Commits the reserved pages of [a, a+n) that lie in the guest heap, in 64 KiB chunks, before something other than the
-// CPU (a kernel file read, a driver importing host memory) accesses them: those accesses fail on a reserved page
-// instead of faulting into fault_veh. Committed pages are left alone. No-op without TOTK_HEAP_LAZY.
-void mem_touch(uint64_t a, uint64_t n) {
-    if (!n || !heap_lazy()) return;
-    uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
-    uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
-    if (s < lo) s = lo;
-    if (e > hi) e = hi;
-    if (s >= e) return;
+// Commits the reserved pages of [s, e) (64 KiB aligned, inside the heap) after asking the system for their state.
+static void touch_query(uint64_t s, uint64_t e) {
     plat_mutex_lock(&frz_lock);   // freeze_locked refuses regions with holes, so a commit here never lands in a frozen one
     for (uint64_t x = s, y; x < e; x = y) {
         int st = plat_mem_state(x, e, &y);
@@ -429,6 +421,83 @@ void mem_touch(uint64_t a, uint64_t n) {
         }
     }
     plat_mutex_unlock(&frz_lock);
+}
+
+// TOTK_TOUCH_MAP: 1 (default) lets mem_touch skip the chunks the platform's commit map knows to be committed
+// (plat_mem_lazy_run), 0 queries every chunk as before, verify queries the known chunks as well and logs each one found
+// reserved (then commits it). Windows only, like the lazy heap.
+#ifdef _WIN32
+static int touch_map(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("TOTK_TOUCH_MAP");
+        int m = !e || !*e ? 1 : !strcmp(e, "verify") ? 2 : strcmp(e, "0") != 0;
+        if (m != 1 && heap_lazy())
+            rt_log("mem: mem_touch %s (TOTK_TOUCH_MAP=%s)", m ? "checks the commit map against VirtualQuery" :
+                   "queries every chunk", e);
+        mode = m;
+    }
+    return mode;
+}
+#endif
+
+// mem_touch since the start: calls, chunks the commit map answered, chunks queried, and known chunks verify found
+// reserved (mem_touch_stats).
+static volatile int64_t touch_n[4];
+
+void mem_touch_stats(uint64_t out[4]) {
+    for (int i = 0; i < 4; i++) out[i] = (uint64_t)__atomic_load_n(&touch_n[i], __ATOMIC_RELAXED);
+}
+
+// Commits the reserved pages of [a, a+n) that lie in the guest heap, in 64 KiB chunks, before something other than the
+// CPU (a kernel file read, a driver importing host memory) accesses them: those accesses fail on a reserved page
+// instead of faulting into fault_veh. Committed pages are left alone. No-op without TOTK_HEAP_LAZY.
+// Chunks the platform's commit map knows (every chunk the fault handler or an earlier mem_touch committed) are skipped
+// without a system call; only the others are queried with plat_mem_state, whose VirtualQuery reports the whole run of
+// like pages after the address and so costs more the longer the committed stretch around the pool (win32.c lazy_map).
+// On the first frame of the Hilltop Layer of Surf Hills (3.2.0, RTX 5090, one run each) the touch of its ~280 first-use
+// pool imports fell from 15.3 ms to 0.5 ms, but their vkAllocateMemory took about 9 ms longer, as if the driver's page
+// pinning waited for what the queries had waited for: the imports took 36.4 ms instead of 40.0 and 40.3.
+void mem_touch(uint64_t a, uint64_t n) {
+    if (!n || !heap_lazy()) return;
+    uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
+    uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
+    if (s < lo) s = lo;
+    if (e > hi) e = hi;
+    if (s >= e) return;
+    plat_inc64(&touch_n[0]);
+#ifdef _WIN32
+    int map = touch_map();
+#else
+    int map = 0;
+#endif
+    for (uint64_t x = s, y; x < e; x = y) {
+        int known = 0;
+#ifdef _WIN32
+        y = map ? plat_mem_lazy_run(x, e, &known) : e;
+#else
+        y = e;
+#endif
+        int64_t chunks = (int64_t)((y - x) >> 16);
+        if (known) {
+            plat_add64(&touch_n[1], chunks);
+            if (map != 2) continue;
+            // verify: the map said committed; a reserved page here would have failed the caller's kernel or driver access
+            for (uint64_t u = x, v; u < y; u = v)
+                if (plat_mem_state(u, y, &v) == PLAT_MEM_RESERVED) {
+                    if (plat_inc64(&touch_n[3]) <= 16)
+                        rt_log("mem: mem_touch: the commit map holds %#llx+%#llx, which is reserved", (unsigned long long)u,
+                               (unsigned long long)(v - u));
+                    touch_query(u, v);
+                }
+            continue;
+        }
+        plat_add64(&touch_n[2], chunks);
+        touch_query(x, y);
+#ifdef _WIN32
+        if (map) plat_mem_lazy_mark(x, y);
+#endif
+    }
 }
 
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
