@@ -2490,8 +2490,28 @@ static void wb_range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off,
 // (k), which vk_mem_mirror_end merges into the pools' kept lists (kept_take).
 // lock: the owner adds to a and the write-back thread takes a held part's ranges out of it (wb_job_run) while the owner
 // records slices of a later pass; uncontended otherwise.
-typedef struct WbLocal { MRange *a; int n, cap; MRange *k; int nk, ck; struct WbLocal *next; PlatMutex lock; } WbLocal;
+// The GPU writes into staged mirrors (TOTK_MIRROR_STAGED, sfeed) go into a third list (s), without the lock: no held
+// part's write-back takes them (wb_early_takes), so only vk_mem_mirror_end reads it, when no slice is being recorded,
+// and it moves them into stw. In a with the others, they were scanned again at every held part's end
+// (vk_mem_mirror_wb_held) and moved twice at the submission's end, though nothing before the end takes them: with
+// TOTK_MIRROR_STAGED=all on the Hilltop Layer of Surf Hills (3.2.0) the lists grew to about 19,000 such ranges through
+// each submission, for 12 checks a frame.
+typedef struct WbLocal {
+    MRange *a;
+    int n, cap;
+    MRange *k;
+    int nk, ck;
+    MRange *s;
+    int ns, cs;
+    struct WbLocal *next;
+    PlatMutex lock;
+} WbLocal;
 static WbLocal *wb_locals;   // every thread's, added under mirror_lock and kept until exit
+// The submission's GPU writes into staged mirrors: the walk's as it records them (vk_mem_gpu_wrote, under mirror_lock
+// when a helper thread may add too, as wbl), the slice threads' moved in at its end (wb_locals_take); vk_mem_mirror_end
+// splits and records them (staged_split_own, staged_wb_record) and empties the list.
+static MRange *stw;
+static int nstw, cstw;
 static _Thread_local WbLocal *wb_mine;
 
 static WbLocal *wb_local(void) {
@@ -2509,6 +2529,10 @@ static WbLocal *wb_local(void) {
 
 static void wb_local_add(PoolRec *r, uint64_t off, uint64_t size) {
     WbLocal *w = wb_local();
+    if (r->sfeed) {   // a staged mirror's: vk_mem_mirror_end alone takes it (above)
+        range_add(&w->s, &w->ns, &w->cs, r, off, size);
+        return;
+    }
     plat_mutex_lock(&w->lock);
     wb_range_add(&w->a, &w->n, &w->cap, r, off, size);
     plat_mutex_unlock(&w->lock);
@@ -2524,6 +2548,8 @@ static void wb_locals_take(void) {   // replay thread, no slice being recorded
         }
         w->n = 0;
         plat_mutex_unlock(&w->lock);
+        for (int i = 0; i < w->ns; i++) range_add(&stw, &nstw, &cstw, w->s[i].r, w->s[i].off, w->s[i].size);
+        w->ns = 0;
     }
     plat_mutex_unlock(&mirror_lock);
 }
@@ -2929,8 +2955,8 @@ typedef struct StJob {
 static PlatMutex st_lock = PLAT_MUTEX_INIT;   // st_jobs; never held with mirror_lock or pool_lock
 static StJob *st_jobs;                  // every job not freed yet (vk_mem_shutdown frees those whose fence never came)
 static StJob *st_cur;                   // replay: the job of the submission being recorded
-static MRange *stq, *stw;               // replay: staged ranges the prologue took out of pend; write-backs at the end
-static int nstq, cstq, nstw, cstw;
+static MRange *stq;                     // replay: staged ranges the prologue took out of pend
+static int nstq, cstq;
 static volatile int32_t n_staged_imports, n_staged_fills, n_staged_import_failures;
 static volatile int64_t st_fill_ns, st_fill_bytes, st_wbcpu_ns, st_wbcpu_bytes;
 // What became of the staged pools, [0] since the start (the staged line), [1] since the last present (staged_frame_log):
@@ -4855,7 +4881,8 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
     if (count_quiet) wb_local_add(r, sp->offset, size);
     else {
         int locked = mirror_lock_if_shared();
-        wb_range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
+        if (r->sfeed) range_add(&stw, &nstw, &cstw, r, sp->offset, size);   // only the submission's end takes it
+        else wb_range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
         mirror_unlock(locked);
     }
     *k = (__typeof__(*k)){r, sp->offset, size, sub, wb_tag};
@@ -5261,13 +5288,13 @@ int vk_mem_wb_early_min(void) {
     return RT_KNOB_ON(mode) ? min_kib : 0;
 }
 
-// Whether a held part's write-back (vk_mem_mirror_wb_held) takes the range: tagged upto or lower, and not a staged
-// mirror's (TOTK_MIRROR_STAGED, sfeed). A staged pool has no import for the write-back thread's copy to land in, so its
-// ranges stay in the lists until vk_mem_mirror_end, which splits them off for the readback buffer of the submission's
-// job (staged_wb_record) and, with TOTK_STAGED_WB=fault, for the pool's own list (staged_split_own), as when no held
-// part wrote anything back. sfeed is set before MS_ON and never changes, and a range is only noted for a pool in
-// MS_ON (vk_mem_gpu_wrote), so the read needs no lock.
-static int wb_early_takes(const MRange *m, uint32_t upto) { return m->tag <= upto && !m->r->sfeed; }
+// Whether a held part's write-back (vk_mem_mirror_wb_held) takes the range: tagged upto or lower. A staged mirror's
+// (TOTK_MIRROR_STAGED, sfeed) is never in these lists: a staged pool has no import for the write-back thread's copy to
+// land in, so vk_mem_gpu_wrote notes its ranges in stw and the slice threads' s lists, and vk_mem_mirror_end records
+// them for the readback buffer of the submission's job (staged_wb_record) and, with TOTK_STAGED_WB=fault, for the
+// pool's own list (staged_split_own). sfeed is set before MS_ON and never changes, and a range is only noted for a pool
+// in MS_ON, so the choice of list needs no lock.
+static int wb_early_takes(const MRange *m, uint32_t upto) { return m->tag <= upto; }
 
 // Moves the ranges wb_early_takes picks from a[0, *n) to the end of out (keeping the others in order); their bytes.
 static uint64_t wb_take_tagged(MRange *a, int *n, uint32_t upto, MRange **out, int *nout, int *cout) {
@@ -5451,7 +5478,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     }
     if (__atomic_load_n(&wb_locals, __ATOMIC_ACQUIRE)) wb_locals_take(), kept_take();
     perf_ph_end(PERF_PH_WB_LISTS, ph);
-    if (nwbl) {
+    if (nwbl || nstw) {   // staged mirrors' (stw) write back through the job's readback buffer (staged_wb_record)
         VkPipelineStageFlags2 stage = VK_PIPELINE_STAGE_2_COPY_BIT;
         VkAccessFlags2 reads = VK_ACCESS_2_TRANSFER_READ_BIT, writes = VK_ACCESS_2_TRANSFER_WRITE_BIT;
         if (mirror_sparse) {
@@ -5461,15 +5488,9 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         }
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, stage, reads);
         for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub;
-        mrep.wb_ranges += (uint64_t)nwbl;
-        int k = nwbl;
-        if (staged_min) {   // staged mirrors write back through the job's readback buffer (staged_wb_record)
-            k = 0;
-            for (int i = 0; i < nwbl; i++)
-                if (wbl[i].r->sfeed) range_add(&stw, &nstw, &cstw, wbl[i].r, wbl[i].off, wbl[i].size);
-                else wbl[k++] = wbl[i];
-        }
-        if (k) rec += copy_ranges(cb, wbl, k, 0, &mrep.wb_bytes, &mrep.wb_copies, fence);
+        for (int i = 0; i < nstw; i++) stw[i].r->wb_sub = msub;
+        mrep.wb_ranges += (uint64_t)(nwbl + nstw);
+        if (nwbl) rec += copy_ranges(cb, wbl, nwbl, 0, &mrep.wb_bytes, &mrep.wb_copies, fence);
         uint64_t ps = perf_ph_begin_cpu();
         if (nstw && staged_fault) staged_split_own();   // most stay in the mirror; pages the CPU read go back
         if (fetch_test && st_cur && st_cur->no) rec += staged_ref_record(cb);   // TOTK_STAGED_FETCH_TEST
@@ -6149,7 +6170,7 @@ void vk_mem_shutdown(void) {
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
     pool_index.n = 0;
     nm = npend = nwbl = 0;   // mirrors went with their pools
-    for (WbLocal *w = wb_locals; w; w = w->next) w->n = w->nk = 0;   // pending kept ranges point at pools just freed
+    for (WbLocal *w = wb_locals; w; w = w->next) w->n = w->nk = w->ns = 0;   // pending ranges point at pools just freed
     plat_mutex_lock(&shadow_lock);
     nstouch = nspend = nsblocked = spend_dirty = 0;   // shadows too
     s_live_n = s_live_bytes = 0;
