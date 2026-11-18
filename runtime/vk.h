@@ -389,6 +389,10 @@ void vk_gpu_written_into(uint64_t addr, uint64_t size, VkBuffer buf);
 // made writable in runs before the copies, and the pending list searched once. Without it, the page stamps are taken in
 // batches of ranges under one hold of the locks (TOTK_STAMP_BATCH; 0: one vk_gpu_written_into per range).
 void vk_gpu_written_many(const VkGpuWrite *w, int n);
+// Or-ed into a range's size for vk_gpu_written_many: a storage buffer a shader wrote, which the game rarely reads on
+// the CPU. With the lazy write-back on (vk_memory.c, TOTK_WB_LAZY), such a range may be copied back at the first CPU
+// access to its pages instead of at the fence.
+#define VK_WB_LAZY (1ull << 63)
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once

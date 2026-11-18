@@ -622,12 +622,14 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
 }
 
 static uint32_t written_hash(uint64_t addr, uint64_t size) {
+    size &= ~VK_WB_LAZY;
     uint64_t h = (addr ^ size * 0xc2b2ae3d27d4eb4full) * 0x9e3779b97f4a7c15ull;
     return (uint32_t)(h >> 32);
 }
 
 // Each distinct range once per command buffer, in first-write order. A scene with thousands of written ranges and tens
 // of thousands of draws binding them spent most of the replay searching this list, so the search goes through a table.
+// VK_WB_LAZY is not part of the range's key: one non-lazy write makes the merged range non-lazy.
 // buf is the buffer the GPU writes the range through (a pool's VRAM mirror or its imported buffer, vk_memory.c
 // vk_gpu_written_into); a range written through two keeps none.
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf) {
@@ -649,7 +651,8 @@ static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf)
     uint32_t mask = r->written_slots - 1, at = written_hash(addr, size) & mask;
     for (; r->written_slot[at]; at = (at + 1) & mask) {
         Range *w = &r->written[r->written_slot[at] - 1];
-        if (w->addr == addr && w->size == size) {
+        if (w->addr == addr && (w->size & ~VK_WB_LAZY) == (size & ~VK_WB_LAZY)) {
+            w->size &= size | ~VK_WB_LAZY;
             if (w->buf != buf) w->buf = VK_NULL_HANDLE;
             return;
         }
@@ -657,7 +660,7 @@ static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf)
     if (r->nwritten == r->cwritten) r->written = grow(r->written, &r->cwritten, sizeof *r->written);
     r->written[r->nwritten++] = (Range){addr, size, buf};
     r->written_slot[at] = (uint32_t)r->nwritten;
-    vk_mem_gpu_pending(addr, size);
+    vk_mem_gpu_pending(addr, size & ~VK_WB_LAZY);   // the flag travels in the list only
 }
 
 static int reset_mapped(void *context, uint64_t addr, uint32_t size) {
@@ -690,7 +693,8 @@ static int reset_targets_overlap(const uint64_t *pointers, uint32_t count) {
 static int written_overlaps(VkExec *ex, uint64_t addr, uint64_t size) {
     const CbRes *r = cb_res(ex);
     for (int i = 0; i < r->nwritten; i++)
-        if (r->written[i].addr < addr + size && addr < r->written[i].addr + r->written[i].size) return 1;
+        if (r->written[i].addr < addr + size && addr < r->written[i].addr + (r->written[i].size & ~VK_WB_LAZY))
+            return 1;
     return 0;
 }
 
@@ -1972,7 +1976,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        how, guarded, &bi)) {
             if (written && bi.buffer != VK_NULL_HANDLE) {
-                note_written(ex, b->addr - lead, bi.range, bi.buffer);
+                note_written(ex, b->addr - lead, bi.range | VK_WB_LAZY, bi.buffer);   // a shader's storage write: vk.h
                 const uint8_t *ctl, *code;
                 uint32_t len;
                 uint64_t o;
