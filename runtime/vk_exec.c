@@ -67,7 +67,12 @@ static uint64_t par_wait_max, par_wait_long;   // the longest wait for the worke
 #define PAR_DEFER_DEPTH 4
 #define PAR_CAP_ROOM 4096   // capture words a pass end may take (vk_rec.c CAP_WORDS): the end, its query, BC copies
 static int par_defer_mode = -1;
-static struct { int s0, s1; uint64_t sig; uint32_t cap_lo, cap_hi; } PDQ[PAR_DEFER_DEPTH];
+static struct { int s0, s1; uint64_t sig; uint32_t cap_lo, cap_hi, tag; } PDQ[PAR_DEFER_DEPTH];
+// The write-back tag of the walk's GPU writes (vk_mem_wb_tag): it moves past each held pass end, and once the part is
+// submitted, what is tagged up to the pass's own goes back (par_settle_front, TOTK_WB_EARLY). A slice tags its writes
+// with its pass's. It only grows, so a range the GPU writes again after its write-back carries a higher tag and is
+// noted again (vk_memory.c vk_mem_gpu_wrote); a submission's end takes every range, whatever its tag.
+static uint32_t wb_tag_walk;
 static int pd_head, pd_n;
 static volatile uint8_t pdone[1024];   // PAR_MAX_SLICES: each slice of the batch is recorded
 // A slice is begun only once the slices of the passes before its own are recorded (par_ready): a slice changes the
@@ -117,6 +122,7 @@ static struct {
     uint8_t soq[PAR_MAX_SLICES];                 // each slice's pass: an occlusion query spans it (oq, oq_flags)
     uint8_t supd[PAR_MAX_SLICES];                // each slice's pass's snapshot
     uint8_t snote[PAR_MAX_SLICES];               // each slice's part is timed: the slice notes its work (par_record)
+    uint32_t stag[PAR_MAX_SLICES];               // each slice's write-back tag (wb_tag_walk at its pass)
     VkQueryControlFlags soqf[PAR_MAX_SLICES];
     int draws, slice_draws, slice_size;
     int expect;                                  // draws this piece of the pass took the last time (par_expect)
@@ -2098,6 +2104,7 @@ static int par_take(VkExec *ex, const op_hdr *h, const void *a) {
             PC.start[i] = PC.nops;
             PC.soq[i] = (uint8_t)PC.oq, PC.soqf[i] = PC.oq_flags, PC.supd[i] = (uint8_t)PC.upd;
             PC.snote[i] = (uint8_t)vk_sync_noting();
+            PC.stag[i] = wb_tag_walk;
             pss0[i] = (uint16_t)PC.s0;
             __atomic_store_n(&pdone[i], 0, __ATOMIC_RELAXED);
             PC.slice_draws = 0;
@@ -2160,12 +2167,14 @@ static void par_record(int i, ParPool *pp, VkExec *w, struct DrawCtx *dc) {
     par_slice = 1, par_hazard = 0;
     VkSyncNote *note = vk_sync_slice_note_begin(PC.snote[i]);   // not the part's note, which the replay keeps writing
     vk_mem_count_quiet(1), vk_usnap_quiet(1);
+    uint32_t tag = vk_mem_wb_tag(PC.stag[i]);
     int merge = vk_exec_draw_merge_on();   // TOTK_DRAW_MERGE: runs of draws that differ only in c4 go as instances
     for (int k = PC.start[i], end = PC.end[i]; k < end; k++) {
         int draws, used = merge && PC.ops[k]->op == OP_DRAW_IDX ? vk_exec_draw_merge(w, PC.ops + k, end - k, &draws) : 0;
         if (used) k += used - 1;   // the collection counted the run's draws (par_take)
         else par_op(w, PC.ops[k]->op, nvn_op_payload(PC.ops[k]));
     }
+    vk_mem_wb_tag(tag);
     par_slice = 0;
     vk_sync_slice_note_end();
     vk_mem_count_quiet(0), vk_usnap_quiet(0), vk_usnap_view(0);
@@ -2442,7 +2451,7 @@ static void par_spill(void) {
 static void par_defer(VkExec *ex) {
     __atomic_store_n(&pw_active, 0, __ATOMIC_RELEASE);   // every slice is published: idle workers sleep once none is left
     typeof(PDQ[0]) *d = &PDQ[(pd_head + pd_n++) % PAR_DEFER_DEPTH];
-    d->s0 = PC.s0, d->s1 = PC.nslices, d->sig = PC.sig;
+    d->s0 = PC.s0, d->s1 = PC.nslices, d->sig = PC.sig, d->tag = wb_tag_walk;
     rec_capture_spill(par_spill);
     pd_cur = d, pd_spilled = 0;
     d->cap_lo = rec_capture_begin_for(ex->cb);
@@ -2457,6 +2466,7 @@ static void par_defer(VkExec *ex) {
         return;
     }
     d->cap_hi = rec_capture_end();
+    vk_mem_wb_tag(++wb_tag_walk);   // the walk's writes from here on are in later parts
     ex->cb = vk_sync_split_defer();
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -2515,6 +2525,9 @@ static int par_settle_front(VkExec *ex, int wait) {
     par_notes(d.s0, d.s1, 1);
     ParTail t = {d.s1 - d.s0, cbs, d.cap_lo, d.cap_hi};
     vk_sync_split_finish(par_tail, &t);
+    // The GPU writes of this part and the ones before it go back right after it, while the walk records the next ones.
+    int min = vk_mem_wb_early_min();
+    if (min) vk_mem_mirror_wb_held(ex->fence, d.tag, (uint64_t)min << 10);
     free(cbs);
     vk_completion_add(ex->fence, par_done, done);
     pd_head = (pd_head + 1) % PAR_DEFER_DEPTH, pd_n--;
