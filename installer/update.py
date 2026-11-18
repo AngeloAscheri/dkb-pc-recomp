@@ -414,7 +414,7 @@ def remove_tree(path):
 
 WINDOWS_DEVICES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', *(f'{d}{n}' for d in ('COM', 'LPT')
                                                                     for n in (*'123456789', '¹', '²', '³'))}
-UNPACK_RATIO = 20           # unpack_limit: at most 20 times the zip's size (the tools zip unpacks to about 3 times)
+UNPACK_RATIO = 20           # unpack_limit: at most 20 times the zip's size (0.4.1's tools zip unpacks to 3.6 times)
 UNPACK_FLOOR = 1 << 30      # but always 1 GiB, so that a small zip is never refused for its ratio
 UNPACK_LIMIT = 64 << 30     # and never more than 64 GiB
 
