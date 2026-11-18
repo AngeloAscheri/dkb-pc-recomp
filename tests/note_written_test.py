@@ -1,9 +1,9 @@
 """CPU regression for the replay's written-range list.
 
 The actual note_written, its hash and grow run against a plain list that searches every entry, the behaviour the table
-replaced. Each call must give the same answer as that list: every distinct address and size once, in first-write order,
-with one vk_mem_gpu_pending for each, and the buffer the GPU wrote kept only while every write of the range named the
-same one. No Vulkan, guest memory or driver is used.
+replaced. Each call must give the same answer as that list: every distinct address and byte size once, in first-write
+order, with one vk_mem_gpu_pending for each. The lazy flag stays only while every write is lazy, and the buffer the GPU
+wrote stays only while every write of the range named the same one. No Vulkan, guest memory or driver is used.
 """
 import argparse
 import os
@@ -63,7 +63,8 @@ static int nmodel, cmodel;
 
 static void note_model(uint64_t addr, uint64_t size, VkBuffer buf) {
     for (int i = 0; i < nmodel; i++)
-        if (model[i].addr == addr && model[i].size == size) {
+        if (model[i].addr == addr && (model[i].size & ~VK_WB_LAZY) == (size & ~VK_WB_LAZY)) {
+            if (!(size & VK_WB_LAZY)) model[i].size &= ~VK_WB_LAZY;
             if (model[i].buf != buf) model[i].buf = VK_NULL_HANDLE;
             return;
         }
@@ -107,6 +108,9 @@ static uint64_t next(void) {
 }
 
 int main(void) {
+    if (written_hash(0x7000, 0x80) != written_hash(0x7000, 0x80 | VK_WB_LAZY))
+        failures++, fprintf(stderr, "FAIL the lazy flag changes the range's hash\n");
+
     note(0x1000, 0x40), note(0x1000, 0x40);
     check("a repeated range counts once");
     note(0x1000, 0x80), note(0x2000, 0x40), note(0x1000, 0x40);
@@ -126,13 +130,19 @@ int main(void) {
         failures++, fprintf(stderr, "FAIL the written buffer: a range kept a buffer another write did not name\n");
     reset();
 
-    // Around each table growth, then every entry again: an entry lost while the table was rebuilt would be added twice.
+    // Around each table growth, keep some entries lazy and clear others before rebuilding. Revisit every entry with
+    // both flags afterwards: changing a range's lazy eligibility must not lose its slot or add another pending range.
     for (uint64_t i = 0; i < 5000; i++) {
-        note(0x100000 + i * 0x100, 0x100);
+        note(0x100000 + i * 0x100, 0x100 | (i & 1 ? VK_WB_LAZY : 0));
+        if (i % 4 == 1) note_buf(0x100000 + i * 0x100, 0x100, BUF_B);
         check("sequential ranges");
     }
+    for (uint64_t i = 0; i < 5000; i++) note(0x100000 + i * 0x100, 0x100 | VK_WB_LAZY);
+    check("all sequential ranges again as lazy writes");
     for (uint64_t i = 0; i < 5000; i++) note(0x100000 + i * 0x100, 0x100);
     check("all sequential ranges again");
+    for (uint64_t i = 0; i < 5000; i++) note(0x100000 + i * 0x100, 0x100 | VK_WB_LAZY);
+    check("later lazy writes do not restore the flag");
     reset();
 
     // Ranges that repeat as a replay's do, with the same address under a few sizes.
@@ -159,14 +169,35 @@ int main(void) {
     check("many addresses under one size");
     reset();
 
-    // A shader's storage write carries VK_WB_LAZY in its size: it stays in the written list, which keeps it apart from
-    // the same range written another way, and never reaches the pending list.
-    note(0x7000, 0x80 | VK_WB_LAZY), note(0x7000, 0x80), note(0x7000, 0x80 | VK_WB_LAZY);
-    if (res.nwritten != 2 || res.written[0].size != (0x80 | VK_WB_LAZY) || res.written[1].size != 0x80)
-        failures++, fprintf(stderr, "FAIL a storage write's flag: the written list lost it or merged the two\n");
-    if (npending != 2 || pending[0].size != 0x80 || pending[1].size != 0x80)
-        failures++, fprintf(stderr, "FAIL a storage write's flag reached the pending list\n");
+    // Only storage writes: the flag stays, even if two different buffers wrote the range. It never reaches pending.
+    note(0x7000, 0x80 | VK_WB_LAZY), note(0x7000, 0x80 | VK_WB_LAZY);
+    check("only lazy writes");
+    if (res.nwritten != 1 || res.written[0].size != (0x80 | VK_WB_LAZY) || res.written[0].buf != BUF_A)
+        failures++, fprintf(stderr, "FAIL repeated lazy writes lost the flag or buffer\n");
+    note_buf(0x7000, 0x80 | VK_WB_LAZY, BUF_B);
+    check("lazy writes through different buffers");
+    if (res.nwritten != 1 || res.written[0].size != (0x80 | VK_WB_LAZY) || res.written[0].buf != VK_NULL_HANDLE)
+        failures++, fprintf(stderr, "FAIL lazy writes through different buffers kept an owner or lost the flag\n");
     reset();
+
+    // A storage write and a copy of the same range must merge in either order. With different buffers, keeping an
+    // owner would let vk_memory.c vk_gpu_written_into claim the mirror has bytes it did not write, even with lazy
+    // write-back disabled. An intervening range checks that merging preserves first-write order.
+    const VkBuffer buffers[] = {BUF_A, BUF_B, VK_NULL_HANDLE};
+    for (int first_lazy = 0; first_lazy < 2; first_lazy++) {
+        for (unsigned b = 0; b < sizeof buffers / sizeof *buffers; b++) {
+            note_buf(0x7000, 0x80 | (first_lazy ? VK_WB_LAZY : 0), BUF_A);
+            note(0x8000, 0x40);
+            note_buf(0x7000, 0x80 | (first_lazy ? 0 : VK_WB_LAZY), buffers[b]);
+            note(0x7000, 0x80 | VK_WB_LAZY);
+            check("mixed writes in either order");
+            VkBuffer owner = b == 0 ? BUF_A : VK_NULL_HANDLE;
+            if (res.nwritten != 2 || res.written[0].addr != 0x7000 || res.written[0].size != 0x80 ||
+                res.written[0].buf != owner || res.written[1].addr != 0x8000 || npending != 2)
+                failures++, fprintf(stderr, "FAIL mixed writes: first_lazy=%d, buffer=%u\n", first_lazy, b);
+            reset();
+        }
+    }
 
     printf("note_written: %u failures\n", failures);
     return failures != 0;

@@ -1417,13 +1417,15 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
 // the first made and keeps 0 after a 0), and nothing reads the pages between them while gen_lock is held. Any other
 // stamp (vk_guest_written's) takes a generation of its own and ends the shared one, so an own_chunk note never survives
 // a newer write the mirror does not hold. A page the previous range of the same pool stamped with the same generation
-// is not stamped again. TOTK_STAMP_BATCH=0 stamps one by one as before; "ab" for an in-run A/B.
+// is not stamped again. TOTK_STAMP_BATCH=0 stamps one by one as before; "ab" for an in-run A/B. Each size is read
+// without VK_WB_LAZY (vk.h): with that bit set the end of the range wraps past the top of the address space, so
+// pidx_find finds no pool and the stamp's walk covers no page at all.
 static void written_batch(const VkGpuWrite *w, int n) {
     enum { BATCH = 1024 };
     static int mode = -1;
     if (mode < 0) mode = rt_knob("STAMP_BATCH", "1");
     if (!RT_KNOB_ON(mode) || !vk_mirror_on) {
-        for (int i = 0; i < n; i++) vk_gpu_written_into(w[i].addr, w[i].size, w[i].buf);
+        for (int i = 0; i < n; i++) vk_gpu_written_into(w[i].addr, w[i].size & ~VK_WB_LAZY, w[i].buf);
         return;
     }
     for (int i = 0; i < n;) {
@@ -1434,7 +1436,7 @@ static void written_batch(const VkGpuWrite *w, int n) {
         const PoolRec *prev = NULL;
         uint64_t prev_lo = 0, prev_hi = 0;       // pages the previous mirror range stamped with g
         for (; i < end; i++) {
-            uint64_t addr = w[i].addr, size = w[i].size;
+            uint64_t addr = w[i].addr, size = w[i].size & ~VK_WB_LAZY;
             if (!size || nvn_gpu_only(addr)) continue;   // vk_guest_written stamps nothing for those
             uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
             const pidx_ent *e = w[i].buf ? pidx_find(&pool_index, addr, size) : NULL;
@@ -1631,8 +1633,8 @@ static int wb_owe(WbPage *e, uint32_t lo, uint32_t hi) {
 // write-watched page. The game's threads wait for these fences, so that time was frame time. Here the ranges are
 // sorted once, their pages are thawed and marked written in runs (plat_mem_prewrite), the copies run under one hold of
 // the locks, and one pass over the pending list removes them. With the lazy write-back, the pages of a VK_WB_LAZY
-// range that nobody touched lately are sealed in place of their copy. Without the shadow storage each range goes
-// through vk_gpu_written_into as before.
+// range that nobody touched lately are sealed in place of their copy, and a batch of fewer than 4 ranges goes
+// through vk_gpu_written_into one by one. Without the shadow storage the ranges are stamped in batches.
 typedef struct { uint64_t lo, hi; const uint8_t *src; } WbCopy;   // src: the shadow's byte for guest address lo
 
 static int wb_cmp(const void *x, const void *y) {
@@ -1763,8 +1765,17 @@ void vk_gpu_written_many(const VkGpuWrite *in, int n) {
     plat_mutex_unlock_shared(&pool_lock);
     plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;
-    for (int i = 0; i < ncp; i++)
-        if (!nvn_gpu_only(cp[i].lo)) stamp_range(cp[i].lo & ~0xfffull, (cp[i].hi + 0xfff) & ~0xfffull, g);
+    // Every range of the batch is stamped as written, less the pages this batch sealed: a sealed page keeps its old
+    // guest bytes, so it is stamped by the copy that opens them instead. w and seal are both ascending.
+    for (int i = 0, s = 0; i < m; i++) {
+        if (nvn_gpu_only(w[i][0])) continue;
+        for (uint64_t a = w[i][0] & ~0xfffull, hi = (w[i][1] + 0xfff) & ~0xfffull; a < hi;
+             a += 1ull << GEN_PAGE_SHIFT) {
+            while (s < nseal && seal[s] < a) s++;
+            if (s < nseal && seal[s] == a) continue;   // sealed: its stamp waits for the copy that opens it
+            stamp_page(a, g);
+        }
+    }
     plat_mutex_unlock(&gen_lock);
     free(seal);
     free(cp);

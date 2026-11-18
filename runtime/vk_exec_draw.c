@@ -622,12 +622,14 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
 }
 
 static uint32_t written_hash(uint64_t addr, uint64_t size) {
+    size &= ~VK_WB_LAZY;
     uint64_t h = (addr ^ size * 0xc2b2ae3d27d4eb4full) * 0x9e3779b97f4a7c15ull;
     return (uint32_t)(h >> 32);
 }
 
 // Each distinct range once per command buffer, in first-write order. A scene with thousands of written ranges and tens
 // of thousands of draws binding them spent most of the replay searching this list, so the search goes through a table.
+// VK_WB_LAZY is not part of the range's key: one non-lazy write makes the merged range non-lazy.
 // buf is the buffer the GPU writes the range through (a pool's VRAM mirror or its imported buffer, vk_memory.c
 // vk_gpu_written_into); a range written through two keeps none.
 static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf) {
@@ -649,7 +651,8 @@ static void note_written(VkExec *ex, uint64_t addr, uint64_t size, VkBuffer buf)
     uint32_t mask = r->written_slots - 1, at = written_hash(addr, size) & mask;
     for (; r->written_slot[at]; at = (at + 1) & mask) {
         Range *w = &r->written[r->written_slot[at] - 1];
-        if (w->addr == addr && w->size == size) {
+        if (w->addr == addr && (w->size & ~VK_WB_LAZY) == (size & ~VK_WB_LAZY)) {
+            w->size &= size | ~VK_WB_LAZY;
             if (w->buf != buf) w->buf = VK_NULL_HANDLE;
             return;
         }
