@@ -1518,6 +1518,20 @@ const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t 
     return e ? &e->pub : NULL;
 }
 
+// What vk_texture_by_id_locked would answer from the slot's kept resolution, without resolving, creating or checking
+// anything; NULL when the slot keeps none that still holds. For vk_exec.c vk_exec_lookahead, which looks at slots
+// ahead of the replay: an entry it created or uploaded there would come before the GPU writes the replay records
+// meanwhile.
+const VkTexImage *vk_texture_peek_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view) {
+    DescSlot *d = descriptor_slot(pool, id, 1u << 20, 0);
+    if (!d || d->kind != DESC_TEXTURE) return NULL;
+    TexSlot *s = &d->u.tex;
+    if (!s->ce || s->cgen != agen[agen_idx((uintptr_t)s->t.mem)]) return NULL;
+    if (view) *view = has_view ? s->cview : s->v;
+    if (has_view) *has_view = view ? s->chas_view : s->has_view;
+    return &s->ce->pub;
+}
+
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
 int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]) {
     lock();

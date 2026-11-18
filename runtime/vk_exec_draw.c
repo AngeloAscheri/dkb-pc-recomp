@@ -1394,10 +1394,13 @@ static void slot_mask_learn(DrawCtx *dc, uint64_t serial, int st, const GfxShade
     dc->slotm[slotm_idx(serial, st)] = (typeof(dc->slotm[0])){serial, st, gfx_shader_slot_mask(s)};
 }
 
+static int prefetching;   // vk_exec_draw_prefetch is looking up stages (the replay thread's copy only)
+
 static uint8_t type_of_handle(const VkExec *ex, uint64_t h) {   // texture lock held
     view_t v;
     int hv;
-    const VkTexImage *img = h ? vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv) : NULL;
+    const VkTexImage *img = !h ? NULL : prefetching ? vk_texture_peek_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv)
+                                                    : vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv);
     return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
 }
 
@@ -4263,6 +4266,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
         if (IS_HELPER(dc) && vk_spec_fail(VK_SPEC_PENDING)) return 0;   // whether to wait or skip is decided on the replay thread
         if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
         perf_count(PERF_CNT_ONESHOT_WAIT);
+        if (!OFF_MAIN(dc)) vk_exec_lookahead(ex);   // the draws after it queue their shaders and pipelines meanwhile
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
         dc->native_gs_vs = vs, dc->native_gs_fs = fs;
@@ -4327,6 +4331,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";
             if (!w0) w0 = kern_now_ns();
+            if (!OFF_MAIN(dc)) vk_exec_lookahead(ex);   // the draws after it queue their pipelines meanwhile
             p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
         }
         dc->PM.valid = !pending && p && info;
@@ -5194,6 +5199,65 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     if (op < OP_COUNT_) dc->DP.op_n[op]++, dc->DP.op_tk[op] += total > inside ? total - inside : 0;
     dc->DP.ops++;
 }
+
+#if !HELPER_COPY
+// vk_exec.c vk_exec_lookahead (issue 309): ex is a scratch copy of the replay state, moved on to a later op of the
+// submission by its bind and state ops alone. A bind op goes to ex; a draw has its stages looked up and its pipeline
+// entered as prepare_draw would key it, so a missing one queues its build (and a missing shader its translation)
+// without waiting. Nothing is recorded and no draw is counted. The guess leaves out what only the replay at that draw
+// knows (feedback, stand-ins, a native geometry stage: programs with one are left alone, a texture slot the replay has
+// not resolved yet, which counts as empty); a wrong guess only builds a pipeline no draw asks for. No texture entry is
+// created, resolved or checked (vk_texture_peek_by_id_locked). The copy shares draw_main's caches: its lookups enter
+// only entries keyed by everything they depend on, and descriptor_state starts the replay context's descriptor memos
+// anew at its next draw, since they were last made for another VkExec.
+void vk_exec_draw_prefetch(VkExec *ex, uint32_t op, const void *payload) {
+    DrawCtx *const dc = DC_OF(ex);
+    int prim, restart = 0;
+    switch (op) {
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_TEX: case OP_BIND_IMG:
+        op_draw_impl(ex, op, payload);
+        return;
+    case OP_DRAW: {
+        const p_draw *d = payload;
+        if (d->count <= 0) return;
+        prim = d->prim;
+        break;
+    }
+    case OP_DRAW_IDX: {
+        const p_draw_idx *d = payload;
+        if (d->count <= 0 || d->itype < 0 || d->itype > 2) return;
+        prim = d->prim, restart = restart_for(ex, d->prim, d->itype);
+        break;
+    }
+    case OP_DRAW_IDX_IND: {
+        const p_draw_idx_ind *d = payload;
+        if (d->itype != NVN_INDEX_TYPE_UNSIGNED_SHORT && d->itype != NVN_INDEX_TYPE_UNSIGNED_INT) return;
+        prim = d->prim, restart = restart_for(ex, d->prim, d->itype);
+        break;
+    }
+    default: return;
+    }
+    const uint8_t *ctl, *code;
+    uint32_t len;
+    if (!ex->prog || find_stage(dc, ex->prog, NVN_STAGE_GS, &ctl, &code, &len)) return;
+    int has_vs, has_fs, vw, fw;
+    prefetching = 1;   // texture types from the slots' kept resolutions only (type_of_handle)
+    const GfxShader *vs = shader_for(ex, NVN_STAGE_VS, &has_vs, &vw, 0);
+    const GfxShader *fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fw, 0);
+    prefetching = 0;
+    if (!vs || vw || fw || (has_fs && !fs)) return;
+    VkPipeState s = ex->pipe;
+    s.vs = vs, s.fs = fs, s.gs = NULL;
+    s.feedback = 0;
+    s.prim = (uint8_t)prim;
+    s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
+    s.y_flip = 1;
+    s.prim_restart = (uint8_t)(restart != 0);
+    const VkPipeInfo *info;
+    int pending;
+    vk_pipeline_graphics_async(&s, &info, &pending, 0);
+}
+#endif
 
 // ---- TOTK_DRAW_MERGE: a run of draws that differ only in c4, drawn as instances
 //
