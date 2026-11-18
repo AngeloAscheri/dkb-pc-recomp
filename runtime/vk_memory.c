@@ -2375,6 +2375,8 @@ typedef struct {
     // by part: the blocked ranges (rebuilds of the union and the ranges they put in it, their time), the staging
     // buffers it took and their time, the copies out of guest memory.
     uint64_t pro_t, st_blk_t, st_blk_n, st_blk_ranges, st_stg_n, st_stg_t, st_cpy_t;
+    // TOTK_TRACE=perf: staged_split_own's sort and page split (time each), the ranges it took and the pieces it made.
+    uint64_t st_sp_sort_t, st_sp_loop_t, st_sp_in, st_sp_pieces;
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -3174,7 +3176,9 @@ static void staged_split_own(void) {
     static int nfb, cfb;
     StJob *j = st_cur;
     if (!j) rt_fatal("mem: a staged write-back outside a submission's recording");
+    uint64_t t0 = qpc();
     sort_ranges(stw, (size_t)nstw, &sbuf, &scap);
+    uint64_t t1 = qpc();
     nfb = 0;
     for (int i = 0; i < nstw; i++) {
         PoolRec *r = stw[i].r;
@@ -3193,8 +3197,10 @@ static void staged_split_own(void) {
                 j->o[j->no++] = (StRange){r, r->lo, r->storage_serial, x, e - x, 0};
             }
             x = e;
+            mrep.st_sp_pieces++;
         }
     }
+    mrep.st_sp_sort_t += t1 - t0, mrep.st_sp_loop_t += qpc() - t1, mrep.st_sp_in += (uint64_t)nstw;
     nstw = 0;
     uint64_t fbb = 0;
     for (int i = 0; i < nfb; i++) range_add(&stw, &nstw, &cstw, fb[i].r, fb[i].off, fb[i].size), fbb += fb[i].size;
@@ -5467,12 +5473,15 @@ static void mirror_log(uint64_t frame) {
         rt_log("mem: staged frame %llu: per frame: upload %.3f MiB in %.1f ranges (%.3f MiB of write-backs in flight "
                "left out), CPU copy %.3f ms (blocked ranges %.3f ms in %.2f rebuilds of %.0f ranges, staging buffers %.2f "
                "in %.3f ms, copies from guest memory %.3f ms); write-back %.3f MiB in %.1f ranges, recorded in %.3f ms, "
+               "split for the own lists in %.3f ms (sort %.3f, %.0f ranges; page split %.3f, %.0f pieces), "
                "%.3f MiB copied into guest memory in %.3f ms (completion thread); so far: first fills %d (%.0f MiB, %.1f "
                "ms in all), pools imported after all %d",
                (unsigned long long)frame, a.st_up_bytes / f / M, a.st_up_ranges / f, a.st_skip_bytes / f / M,
                qpc_ms(a.st_up_t) / f, qpc_ms(a.st_blk_t) / f, a.st_blk_n / f, a.st_blk_n ? (double)a.st_blk_ranges / a.st_blk_n : 0.0,
                a.st_stg_n / f, qpc_ms(a.st_stg_t) / f, qpc_ms(a.st_cpy_t) / f,
-               a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f, wb / f / M,
+               a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f,
+               qpc_ms(a.st_sp_sort_t + a.st_sp_loop_t) / f, qpc_ms(a.st_sp_sort_t) / f, a.st_sp_in / f, qpc_ms(a.st_sp_loop_t) / f,
+               a.st_sp_pieces / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
         const volatile StCount *s = &stc[0];
