@@ -173,10 +173,10 @@ static const CfgMeta metas[] = {
     {"LOD_GUARD", "1", "0|1", RESTART}, {"FIX_C0", "1", "0|1", RESTART}, {"FIX_INDIRECT_RESET", "1", "0|1", RESTART}, {"FIX_VS_FAULT", "1", "0|1|all", RESTART}, {"FIX_LQ_FOLD", "1", "0|1|all", RESTART}, {"FIX_ZERO", "1", "0|1", RESTART}, {"FIX_SCREEN_UV", "1", "0|1", RESTART}, {"LIST_RESTART", "1", "0|1", RESTART},
     {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"PIPE_MEMO", "1", "0|1", RESTART}, {"TEX_MEMO", "1", "0|1", RESTART},
     {"DESC_KEEP", "1", "0|1|ab", RESTART}, {"LOOKAHEAD", "1", "0|1|ab", RESTART}, {"DESC_TEMPLATE", "1", "0|1", RESTART},
-    {"DESC_C0_SERIAL", "0", "0|1|ab", RESTART}, {"DESC_SAMP_GEN", "1", "0|1|ab", RESTART}, {"DESC_TD_HASH", "1", "0|1|ab", RESTART},
+    {"DESC_C0_SERIAL", "1", "0|1|ab", RESTART}, {"DESC_SAMP_GEN", "1", "0|1|ab", RESTART}, {"DESC_TD_HASH", "1", "0|1|ab", RESTART},
     {"TEX_REPEAT", "1", "0|1|ab", RESTART},
     {"CS_BARRIER", "0", "0|1|ab|game", RESTART},
-    {"DESC_STAGE_ORIGIN", "0", "0|1|ab", RESTART},
+    {"DESC_STAGE_ORIGIN", "1", "0|1|ab", RESTART},
     {"PUSH_SKIP", "1", "0|1", RESTART}, {"SPLIT_DRAWS", "64", "0..1000", RESTART},
     {"SPLIT_US", "1000", "0..20000", RESTART},
     // Vulkan

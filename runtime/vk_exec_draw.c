@@ -508,7 +508,7 @@ static int knob_on(int *mode, const char *name, const char *def) {
 // TOTK_DESC_C0_SERIAL: a graphics stage's c0 is reused while no storage buffer of the stage was bound (ssbo_serial).
 static int c0_serial_on(void) {
     static int mode = -1;
-    return knob_on(&mode, "DESC_C0_SERIAL", "0");
+    return knob_on(&mode, "DESC_C0_SERIAL", "1");
 }
 // TOTK_DESC_TD_HASH (on by default): the texture descriptor memo hashes the resource type into its index. With it and
 // TOTK_DESC_SAMP_GEN off, 29% of the slice threads' texture lookups on Canyon Layer missed the memo and took the
@@ -531,7 +531,7 @@ static int tex_check_share_on(void) {
 // TOTK_DESC_STAGE_ORIGIN: the stage memo keeps each shader's NVN 2 origin and has 2048 entries instead of 512.
 static int stage_origin_on(void) {
     static int mode = -1;
-    return knob_on(&mode, "DESC_STAGE_ORIGIN", "0");
+    return knob_on(&mode, "DESC_STAGE_ORIGIN", "1");
 }
 
 
