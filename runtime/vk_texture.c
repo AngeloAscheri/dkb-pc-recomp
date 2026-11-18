@@ -44,7 +44,7 @@ typedef struct Tex {
     tex_t t;                      // the newest texture object seen with this key
     TexVkFormat f;
     VmaAllocation alloc;          // own memory; NULL when bound into pool memory
-    VkImageCreateFlags cflags;    // the flags and usage the image was created with (astc_reformat makes it again)
+    VkImageCreateFlags cflags;    // the flags and usage the image was created with (vk_astc_bc1.c makes it again)
     VkImageUsageFlags cusage;
     uint8_t bc_settled;           // an ASTC image kept as BC3: 1 once it is to stay BC3 for good (astc_opaque.h)
     VmaAllocation bound_to;       // the pool memory it is bound into
@@ -759,37 +759,33 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }
 
-// The texture cache's side of an ASTC format change: vk_astc_bc1.c makes an entry's image again in the other format
-// (f.astc_bc 1 = BC3, 2 = BC1) and swaps the entry over to it, retiring the old image and the replay's views of it as
-// destroy_tex does them. What is left here is the new image's first transition on cb, the open upload batch, the
-// generation bump that makes the texture-descriptor memos (vk_exec_draw.c tex_info_lookup) look the texture up
-// again instead of handing out a view of the old image, and the announcement to the spec helper threads. The new
-// image holds nothing: the caller uploads every level and layer into it. 0, nothing changed, when the entry is not
-// an ASTC image kept as BC or the image could not be made again.
-static int astc_reformat(Tex *e, int to_bc1, VkCommandBuffer cb) {
-    if (!e->f.astc_bc) return 0;   // not an ASTC image kept as BC
-    if (!vk_astc_bc_remake(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, to_bc1, &e->alloc, &e->f.vk,
-                           &e->f.astc_bc)) return 0;
+// The texture cache's side of an ASTC format change, after vk_astc_bc1.c has made an entry's image again in the
+// format its rule calls for and swapped the entry over to it: the new image's first transition on cb, the open
+// upload batch, the generation bump that makes the texture-descriptor memos (vk_exec_draw.c tex_info_lookup) look
+// the texture up again instead of handing out a view of the old image, and the announcement to the spec helper
+// threads. The new image holds nothing: the caller uploads every level and layer into it.
+static void astc_reformat_done(Tex *e, VkCommandBuffer cb) {
     init_image(e, cb);
     tex_gen_bump(e->key.addr);
     vk_spec_world_changed();
-    return 1;
 }
 
 static void upload(Tex *e);
 
 // 1 when the image is BC3 and the caller may copy into it, 0 when it is a BC1 image whose remake failed: a BC1 block
-// is 8 bytes and holds no alpha, so BC3 texels do not fit it.
+// is 8 bytes and holds no alpha, so BC3 texels do not fit it. vk_astc_bc1.c makes the image again, settles the entry
+// and swaps it over; the batch, the new image's transition and the re-upload of what the entry holds are here.
 int vk_texture_astc_bc3(const VkTexImage *img) {
     if (!img) return 0;
     lock();
     Tex *e = (Tex *)img;   // pub is the first member
     int ok = 1;   // an image that is not a BC1 one to make over is already what the caller wants
-    if (e->f.astc_bc == 2) {
+    if (e->f.astc_bc == 2) {   // the one case with an image to make over
         VkCommandBuffer cb = vk_upload_begin();
-        ok = astc_reformat(e, 0, cb);
+        ok = vk_astc_bc3(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, &e->alloc, &e->f.vk, &e->f.astc_bc,
+                         &e->bc_settled);
+        if (ok) astc_reformat_done(e, cb);
         vk_upload_end();
-        if (ok) e->bc_settled = 1;   // BC3 for good; when it could not be made again it stays BC1 and is asked again
         if (ok && e->pub.mirrored && !e->pub.gpu_owned) upload(e);
     }
     unlock();
@@ -814,10 +810,10 @@ static void upload(Tex *e) {
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
     VkDeviceSize total = 0, decoded = 0;
-    // BC1 or BC3 for an ASTC image (astc_opaque.h): the blocks' kinds are counted from the deswizzled blocks in memory
-    // of our own, not read back out of the staging buffer (write-combined memory). Only a mirrored image in memory of
-    // its own, and not once it is to stay BC3.
-    int kinds = agpu && e->f.astc_bc && e->pub.mirrored && !e->bc_settled && vk_astc_bc1() && !e->bound_to && e->alloc;
+    // Whether an upload counts the kinds of the blocks it writes, and what they say about the format (each
+    // vk_astc_bc1.c): the kinds are counted from the deswizzled blocks in memory of our own, not read back out of
+    // the staging buffer (write-combined memory).
+    int kinds = vk_astc_bc_kinds(agpu, e->f.astc_bc, &e->pub, e->alloc, e->bound_to, e->bc_settled);
     AstcOpaqueScan sc = {0};
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
@@ -846,8 +842,8 @@ static void upload(Tex *e) {
                 memset(tmp ? tmp : dst, 0, raw);
             }
             if (agpu) {
-                if (kinds && tmp) {   // (the count stops at the first block that may carry alpha)
-                    if (!sc.alpha) astc_opaque_scan(&sc, tmp, raw, 1);
+                if (kinds && tmp) {
+                    vk_astc_bc_scan(&sc, tmp, raw);   // stops at the first block that may carry alpha
                     memcpy(dst, tmp, raw);
                 }
                 ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
@@ -867,9 +863,8 @@ static void upload(Tex *e) {
             free(tmp);
         }
     if (kinds) {   // a remade image is uploaded whole below, every level and layer
-        int was = e->f.astc_bc, choice = astc_bc_choice(was, &sc), remade = 0;
-        if (choice != ASTC_BC_KEEP) remade = astc_reformat(e, choice == ASTC_BC_TO_BC1, cb);
-        if (astc_bc_settled(was, choice, remade, &sc)) e->bc_settled = 1;
+        if (vk_astc_bc_choice(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, &sc, &e->alloc, &e->f.vk,
+                              &e->f.astc_bc, &e->bc_settled)) astc_reformat_done(e, cb);
     }
     uint8_t *raw_copy = acheck ? malloc(total) : NULL;
     if (raw_copy) memcpy(raw_copy, stg, total);
