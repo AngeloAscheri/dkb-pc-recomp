@@ -358,13 +358,20 @@ const void *vk_usnap_bytes(uint64_t addr, uint64_t n);   // the copy's bytes for
 void vk_usnap_cpu_reads(void);   // vk_usnap_bytes is read often: keep each copy in cached host memory too
 int vk_usnap_covers(uint64_t addr, uint64_t n);   // a copy of this submission overlaps the range
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
-void vk_usnap_drop_many(const uint64_t (*r)[2], uint32_t n);   // vk_usnap_drop of each [r[i][0], r[i][1])
+void vk_usnap_drop_many(const uint64_t (*r)[2], uint32_t n);   // vk_usnap_drop of each [r[i][0], r[i][1]), one lock
 int vk_usnap_gpu_writing(uint64_t addr, uint64_t n);   // a noted GPU write not done yet overlaps the range
 uint64_t vk_usnap_arena_bytes(void);                 // arenas created so far (all kept until shutdown)
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
+// TOTK_WB_EARLY: the least KiB of noted GPU writes worth a held part's write-back (vk_mem_mirror_wb_held; 0: off).
+int vk_mem_wb_early_min(void);
+// The write-back tag of the calling thread's GPU writes from now on (vk_exec.c: the walk's place among held pass ends);
+// returns the previous one. vk_mem_mirror_wb_held: once a held part is submitted, the writes tagged upto or lower go
+// back from a command buffer of a write-back thread's, submitted after it.
+uint32_t vk_mem_wb_tag(uint32_t tag);
+void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes);
 int vk_mem_mirror_pending(void);
 void vk_mem_mirror_prologue(VkCommandBuffer cb);
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
@@ -379,7 +386,8 @@ typedef struct { uint64_t addr, size; VkBuffer buf; } VkGpuWrite;
 // pool, the mirror's next sync does not copy the pages in again while that write is their newest.
 void vk_gpu_written_into(uint64_t addr, uint64_t size, VkBuffer buf);
 // vk_gpu_written_into for the n ranges of one submission, in one pass. With the shadow storage: one lock hold, the pages
-// made writable in runs before the copies, and the pending list searched once. Without it, one call per range.
+// made writable in runs before the copies, and the pending list searched once. Without it, the page stamps are taken in
+// batches of ranges under one hold of the locks (TOTK_STAMP_BATCH; 0: one vk_gpu_written_into per range).
 void vk_gpu_written_many(const VkGpuWrite *w, int n);
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
@@ -464,6 +472,8 @@ void vk_astc_release(void);             // vk_device.c, before the device goes: 
 // this is a destruction frontier, not a report that the value was submitted or issued.
 void vk_mem_protect_until(uint64_t timeline_value);
 void vk_mem_collect(void);                         // frees what has completed
+void vk_mem_pressure_check(void);                  // Linux memory pressure, at most once a second (vk_mem_pressure.c)
+void vk_mem_trim_after(const char *what);          // gives the heap's freed pages back after a precompile (Linux)
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
 void vk_mem_gpu_summary(char *out, size_t n);      // "; gpu: ..." for mem_commit_report: VMA, mirrors, staging, usnap
