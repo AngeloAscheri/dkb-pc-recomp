@@ -6,6 +6,9 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - #372 Leave the translator's emulated compare-exchange loop after 1024 attempts (@roverdrubber)
 - dotnet no longer adds a dead folder to the user's PATH on each install (c222918).
 - The draws of vertex stage 45e1a6f48cb7872e are skipped on NVIDIA, for the device loss at the Landfill Layer's first checkpoint on 3.2.0 (#304).
+- #393 Copy the indirect reset's disjoint records in address order (@wrothgaril)
+- #400 Log where a large pool's first GPU use spends its time, and resume write-watch queries where a full answer stopped (@wrothgaril)
+- #409 Save TOTK_SHOTS and --shot pictures of an RGB10A2 (HDR) presented image (@wrothgaril)
 - HD rumble is off by default (`rumble_hd = auto` turns it on): three third-party Switch Pro pads broke with it (#363, #383).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
