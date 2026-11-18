@@ -109,6 +109,15 @@ static int frz_whole = -1;
 
 static int heap_lazy(void);
 
+// frz_lock, with the time a thread waits for it recorded as an operation in flight (TOTK_TRACE=perf): a thaw of a
+// whole pool holds the lock while it runs, and every write fault into a frozen region and every file read waits for it.
+static void frz_lock_take(void) {
+    if (plat_mutex_trylock(&frz_lock)) return;
+    int op = plat_op_begin(PLAT_OP_FRZ_WAIT, 0, 0);
+    plat_mutex_lock(&frz_lock);
+    plat_op_end(op, 0);
+}
+
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
     return (addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size) ||
@@ -151,10 +160,15 @@ static void thaw_locked(uint64_t r, int why, int writable) {
 static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     if (!n || a >= RT_ADDRESS_LIMIT) return;
     uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
+    int op = -1;
     if (!frz_whole) {
-        for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why, 0);
+        for (uint64_t r = r0; r <= r1; r++) {
+            if (op < 0 && frz[r]) op = plat_op_begin(PLAT_OP_THAW, a, n);
+            thaw_locked(r, why, 0);
+        }
     } else {
         for (uint64_t r = r1 + 1; r-- > r0;) {
+            if (op < 0 && frz[r]) op = plat_op_begin(PLAT_OP_THAW, a, n);
             uint64_t lo = r;
             while (frz[r] == FRZ_WHOLE && lo > r0 && frz[lo - 1] == FRZ_WHOLE && r - lo + 1 < FRZ_RUN) lo--;
             if (lo < r && plat_mem_protect(lo << FRZ_SHIFT, (r - lo + 1) << FRZ_SHIFT, PLAT_PROT_RW)) {
@@ -165,10 +179,11 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
             thaw_locked(r, why, 0);
         }
     }
+    plat_op_end(op, 0);
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
-    plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+    frz_lock_take();   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
 }
@@ -199,7 +214,8 @@ int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0, how;
-    plat_mutex_lock(&frz_lock);
+    int op = plat_op_begin(PLAT_OP_FREEZE, a, FRZ_SIZE);
+    frz_lock_take();
     if (frz_whole < 0) {
         const char *e = cfg_get("TOTK_FRZ_WHOLE");
         frz_whole = !(e && !strcmp(e, "0"));
@@ -214,6 +230,7 @@ int mem_freeze(uint64_t a) {
         ok = 1;
     }
     plat_mutex_unlock(&frz_lock);
+    plat_op_end(op, 0);
     return ok;
 }
 
@@ -231,10 +248,12 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
 // The platform's write-fault hook (plat_mem_fault_hook): 1 retries the write.
 static int thaw_fault(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
-    plat_mutex_lock(&frz_lock);
+    int op = plat_op_begin(PLAT_OP_FAULT_THAW, a & ~(FRZ_SIZE - 1), FRZ_SIZE);
+    frz_lock_take();
     int was = frz[a >> FRZ_SHIFT];
     thaw_locked(a >> FRZ_SHIFT, 1, 0);
     plat_mutex_unlock(&frz_lock);
+    plat_op_end(op, 0);
     if (was) return 1;
     uint64_t end;
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) == PLAT_PROT_RW;
@@ -242,7 +261,7 @@ static int thaw_fault(uint64_t a) {
 
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_lock_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_commit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -250,7 +269,7 @@ static void commit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_lock_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -258,7 +277,7 @@ static void decommit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_lock_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_protect(a, n, prot);
     plat_mutex_unlock(&frz_lock);
@@ -426,7 +445,8 @@ void mem_touch(uint64_t a, uint64_t n) {
     if (s < lo) s = lo;
     if (e > hi) e = hi;
     if (s >= e) return;
-    plat_mutex_lock(&frz_lock);   // freeze_locked refuses regions with holes, so a commit here never lands in a frozen one
+    int op = plat_op_begin(PLAT_OP_TOUCH, s, e - s);
+    frz_lock_take();   // freeze_locked refuses regions with holes, so a commit here never lands in a frozen one
     for (uint64_t x = s, y; x < e; x = y) {
         int st = plat_mem_state(x, e, &y);
         if (st == PLAT_MEM_RESERVED && !plat_mem_commit(x, y - x)) {
@@ -435,14 +455,24 @@ void mem_touch(uint64_t a, uint64_t n) {
         }
     }
     plat_mutex_unlock(&frz_lock);
+    plat_op_end(op, 0);
 }
 
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
+    int op = plat_op_begin(PLAT_OP_HEAP_SIZE, L.heap.base, size);
     plat_mutex_lock(&lock);
     if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > L.pool) {
         plat_mutex_unlock(&lock);
+        plat_op_end(op, 0);
         return R_INVALID_STATE;
     }
+    // TOTK_TRACE=perf: each change after the first, the first 64 (a shrink decommits, and thaws the frozen regions it
+    // covers)
+    static int changes;
+    if ((rt_trace & RT_TRACE_PERF) && heap_size && size != heap_size && ++changes <= 64)
+        rt_log("mem: SetHeapSize %#llx -> %#llx (%s %llu MiB)", (unsigned long long)heap_size, (unsigned long long)size,
+               size < heap_size ? "shrinks by" : "grows by",
+               (unsigned long long)((size < heap_size ? heap_size - size : size - heap_size) >> 20));
     // TOTK_HEAP_LAZY: growing leaves the new range reserved; platform/win32.c fault_veh commits it on first touch and
     // mem_touch before a kernel or driver access. Shrinking decommits (a no-op on pages never committed).
     if (size > heap_size && !heap_lazy()) commit(L.heap.base + heap_size, size - heap_size, "heap");
@@ -456,6 +486,7 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     if (heap_lazy()) plat_mem_lazy(L.heap.base, heap_size);
 #endif
     plat_mutex_unlock(&lock);
+    plat_op_end(op, 0);
     if (addr) *addr = L.heap.base;
     return R_OK;
 }

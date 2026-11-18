@@ -215,6 +215,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
                                .memoryTypeIndex = (uint32_t)type};
     static int32_t n_slow_alloc;
     uint64_t ta = qpc();
+    int op = plat_op_begin(PLAT_OP_IMPORT, r->import_lo, n);
     res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
     if (res != VK_SUCCESS && known && p_host_props) {
         r->mem = VK_NULL_HANDLE;
@@ -229,6 +230,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size)
         }
     }
     if (res != VK_SUCCESS) r->mem = VK_NULL_HANDLE;
+    plat_op_end(op, 0);
     uint64_t alloc_ns = qpc() - ta;
     __atomic_add_fetch(&import_alloc_ns, alloc_ns, __ATOMIC_RELAXED);
     double alloc_ms = (double)alloc_ns / 1e6;
@@ -353,14 +355,18 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
-    if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->mem) {   // a host-pointer import
+        int op = plat_op_begin(PLAT_OP_IMPORT_FREE, r->import_lo, r->import_hi - r->import_lo);
+        vkFreeMemory(c->device, r->mem, NULL);
+        plat_op_end(op, 0);
+    }
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
     free(r->kept);
     free(r);
 }
 
-int vk_pool_init(pool_t *p) {
+static int pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
     // Reinitializing the same object retires its old backing before installing the new mapping. In particular,
@@ -428,6 +434,13 @@ int vk_pool_init(pool_t *p) {
     return 1;
 }
 
+int vk_pool_init(pool_t *p) {
+    int op = plat_op_begin(PLAT_OP_POOL_INIT, (uintptr_t)p->mem, p->size);
+    int ok = pool_init(p);
+    plat_op_end(op, 0);
+    return ok;
+}
+
 // What the release of a used pool waits for before the guest gets its storage back. TOTK_POOL_FINI_WAIT=idle (the
 // default) is the whole graphics queue idle, with the queue lock held, which costs a driver round trip per pool even when
 // the GPU has nothing left: a level change frees many pools one after another (a 1.6 s frame in a TOTK_PROFILE_SLOW dump,
@@ -435,7 +448,7 @@ int vk_pool_init(pool_t *p) {
 // instead and does not enter the driver when that value is already done. It covers the work the game has synchronized
 // on, which is what a release is allowed to follow; it does not cover the parts that vk_sync_split already submitted
 // for the submission still being recorded (they signal only at its end), which the idle wait did.
-static void pool_fini_wait(VkCtx *c) {
+static void pool_fini_wait_(VkCtx *c) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_get("TOTK_POOL_FINI_WAIT");
@@ -453,6 +466,12 @@ static void pool_fini_wait(VkCtx *c) {
     vk_queue_unlock();
 }
 
+static void pool_fini_wait(VkCtx *c, const PoolRec *r) {
+    int op = plat_op_begin(PLAT_OP_POOL_WAIT, r->lo, r->size);
+    pool_fini_wait_(c);
+    plat_op_end(op, 0);
+}
+
 // Releases of used pools that waited over 10 ms are logged (the first 64 of them), with the running total of all waits.
 static volatile int32_t pf_slow;
 static volatile uint64_t pf_flush_ns, pf_wait_ns;
@@ -466,7 +485,7 @@ static void pool_fini_note(uint64_t size, uint64_t flush_ns, uint64_t wait_ns) {
                (unsigned long long)(size >> 20), flush_ns / 1e6, wait_ns / 1e6, n, (pf_flush_ns + pf_wait_ns) / 1e6);
 }
 
-void vk_pool_fini(pool_t *p) {
+static void pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     pidx_ent e;
@@ -500,7 +519,7 @@ void vk_pool_fini(pool_t *p) {
         uint64_t t0 = qpc();
         vk_upload_flush(1);
         uint64_t t1 = qpc();
-        pool_fini_wait(c);
+        pool_fini_wait(c, r);
         pool_fini_note(r->size, t1 - t0, qpc() - t1);
     }
     vk_mem_collect();
@@ -508,6 +527,12 @@ void vk_pool_fini(pool_t *p) {
     // name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be queued).
     if (r->mbuf) mirror_retiring(r), vk_completion_add(vk_sync_issued() + 1, mirror_retire, r);
     else destroy_rec(c, r);
+}
+
+void vk_pool_fini(pool_t *p) {
+    int op = plat_op_begin(PLAT_OP_POOL_FINI, (uintptr_t)p->mem, p->size);
+    pool_fini(p);
+    plat_op_end(op, 0);
 }
 
 // Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c); apply them in order.
@@ -961,11 +986,85 @@ static const char *const ww_who_name[WW_WHO_N] = {"texture check", "snapshot", "
 static uint64_t ww_cpu_ns, ww_who_ns[WW_WHO_N], ww_slow_ns, ww_slow_cpu, ww_slow_addr, ww_slow_size, ww_slow_pages;
 static int ww_slow_who;
 
+// TOTK_TRACE=perf: a query that took TOTK_WW_SLOW_MS (5 by default) or more gets a line with the operations other
+// threads were inside meanwhile (platform.h plat_op_overlap), the first 64 such queries. They are grouped by thread
+// and kind: count, the time of theirs inside the query's interval, the longest, the longest run a VirtualQuery
+// reported, and the range they covered; those still running are listed one by one with their nesting. gen_lock is held
+// (the line costs tens of microseconds, after a query that waited milliseconds).
+#define WW_OPS 4096
+typedef struct {
+    uint32_t tid;
+    int role, kind, n;
+    uint64_t in_ns, max_ns, max_run, lo, hi;
+} WwOpGroup;
+static PlatOp ww_ops[WW_OPS];
+static WwOpGroup ww_groups[64];
+
+static void ww_slow_report(uint64_t addr, uint64_t size, int who, uint64_t t0, uint64_t t1, uint64_t cpu, uint64_t pages) {
+    static uint64_t min_ns;
+    static int lines;
+    if (!min_ns) {
+        const char *e = cfg_get("TOTK_WW_SLOW_MS");
+        min_ns = (uint64_t)(e && atof(e) > 0 ? atof(e) * 1e6 : 5e6);
+    }
+    if (t1 - t0 < min_ns || lines >= 64) return;
+    lines++;
+    int lost, n = plat_op_overlap(t0, t1, plat_thread_id(), ww_ops, WW_OPS, &lost), ng = 0;
+    char run_line[1400];
+    size_t ro = 0;
+    run_line[0] = 0;
+    for (int i = 0; i < n; i++) {
+        const PlatOp *o = &ww_ops[i];
+        if (!o->done) {   // still running: one by one, nested ones after the outer ones of the same thread
+            if (ro < sizeof run_line - 160)
+                ro += (size_t)snprintf(run_line + ro, sizeof run_line - ro, "%s[%u %s] %s%s at %#llx+%#llx for %.2f ms",
+                                       ro ? "; " : "", o->tid, plat_op_role_name(o->role), o->depth ? "> " : "",
+                                       plat_op_name(o->kind), (unsigned long long)o->addr, (unsigned long long)o->size,
+                                       (o->t1 - o->t0) / 1e6);
+            continue;
+        }
+        int g = 0;
+        while (g < ng && !(ww_groups[g].tid == o->tid && ww_groups[g].kind == o->kind)) g++;
+        if (g == ng) {
+            if (ng == (int)(sizeof ww_groups / sizeof *ww_groups)) continue;
+            ww_groups[ng++] = (WwOpGroup){o->tid, o->role, o->kind, 0, 0, 0, 0, UINT64_MAX, 0};
+        }
+        WwOpGroup *G = &ww_groups[g];
+        uint64_t a = o->t0 > t0 ? o->t0 : t0, b = o->t1 < t1 ? o->t1 : t1, d = o->t1 - o->t0;
+        G->n++, G->in_ns += b - a;
+        if (d > G->max_ns) G->max_ns = d;
+        if (o->run > G->max_run) G->max_run = o->run;
+        if (o->addr < G->lo) G->lo = o->addr;
+        if (o->addr + o->size > G->hi) G->hi = o->addr + o->size;
+    }
+    for (int i = 1; i < ng; i++)   // the most time inside the query first
+        for (int j = i; j > 0 && ww_groups[j].in_ns > ww_groups[j - 1].in_ns; j--) {
+            WwOpGroup x = ww_groups[j];
+            ww_groups[j] = ww_groups[j - 1], ww_groups[j - 1] = x;
+        }
+    char line[2400];
+    size_t o = 0;
+    line[0] = 0;
+    for (int g = 0; g < ng && g < 16 && o < sizeof line - 200; g++) {
+        const WwOpGroup *G = &ww_groups[g];
+        char run[32] = "";
+        if (G->max_run) snprintf(run, sizeof run, ", run %.0f MiB", G->max_run / 1048576.0);
+        o += (size_t)snprintf(line + o, sizeof line - o, "%s[%u %s] %s %d (%.2f ms inside, longest %.2f ms%s, %#llx-%#llx)",
+                              o ? "; " : "", G->tid, plat_op_role_name(G->role), plat_op_name(G->kind), G->n,
+                              G->in_ns / 1e6, G->max_ns / 1e6, run, (unsigned long long)G->lo,
+                              (unsigned long long)G->hi);
+    }
+    rt_log("mem: slow write-watch query: %.3f ms (%.3f on the CPU) over %.1f MiB at %#llx, %llu pages, by %s; ended "
+           "operations of other threads inside it (%d groups%s): %s; still running: %s", (t1 - t0) / 1e6, cpu / 1e6,
+           size / 1048576.0, (unsigned long long)addr, (unsigned long long)pages, ww_who_name[who], ng,
+           lost ? ", the ring was overwritten since its start" : "", ng ? line : "none", ro ? run_line : "none");
+}
+
 static uint64_t ww_query(uint64_t addr, uint64_t size, int who) {
     int perf = (rt_trace & RT_TRACE_PERF) != 0;
     uint64_t c0 = perf ? plat_self_cpu_ns() : 0, t0 = qpc();
     uint64_t n = mem_written_pages(addr, size, gen_pages, sizeof gen_pages / sizeof *gen_pages);
-    uint64_t dt = qpc() - t0;
+    uint64_t t1 = qpc(), dt = t1 - t0;
     ww_ticks += dt, ww_calls++, ww_bytes += size;
     if (n && n != UINT64_MAX) ww_dirty_calls++, ww_dirty_ticks += dt, ww_pages += n;
     if (perf) {
@@ -974,6 +1073,7 @@ static uint64_t ww_query(uint64_t addr, uint64_t size, int who) {
         if (dt > ww_slow_ns)
             ww_slow_ns = dt, ww_slow_cpu = cpu, ww_slow_addr = addr, ww_slow_size = size,
             ww_slow_pages = n == UINT64_MAX ? 0 : n, ww_slow_who = who;
+        ww_slow_report(addr, size, who, t0, t1, cpu, n == UINT64_MAX ? 0 : n);
     }
     return n;
 }

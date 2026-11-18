@@ -564,11 +564,19 @@ int plat_mem_reserve_in(uint64_t lo, uint64_t hi, uint64_t n, uint64_t align, in
 void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
 
 int plat_mem_commit(uint64_t addr, size_t n) {
-    return VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    int op = plat_op_begin(PLAT_OP_COMMIT, addr, n);
+    int ok = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    plat_op_end(op, 0);
+    return ok;
 }
 
 // Decommitted pages come back zeroed when committed again.
-int plat_mem_decommit(uint64_t addr, uint64_t n) { return VirtualFree((void *)(uintptr_t)addr, n, MEM_DECOMMIT) != 0; }
+int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    int op = plat_op_begin(PLAT_OP_DECOMMIT, addr, n);
+    int ok = VirtualFree((void *)(uintptr_t)addr, n, MEM_DECOMMIT) != 0;
+    plat_op_end(op, 0);
+    return ok;
+}
 
 // plat_vm_stats: every VirtualQuery and VirtualProtect of the host goes through vm_query or plat_mem_protect, which
 // time it (QueryPerformanceCounter, tens of ns against a call of a microsecond or more) and count it by kind.
@@ -589,11 +597,14 @@ static void vm_count(int kind, int64_t t0, uint64_t run) {
     vm_max(&vm_max_run[kind], (int64_t)run);
 }
 
+// The PLAT_VM_* kinds are the PLAT_OP_VQ_* ones (platform.h), so a query is also an operation in flight.
 static SIZE_T vm_query(uint64_t addr, MEMORY_BASIC_INFORMATION *mbi, int kind) {
+    int op = plat_op_begin(kind, addr, 0x1000);
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     SIZE_T r = VirtualQuery((void *)(uintptr_t)addr, mbi, sizeof *mbi);
     vm_count(kind, t0.QuadPart, r ? mbi->RegionSize : 0);
+    plat_op_end(op, r ? mbi->RegionSize : 0);
     return r;
 }
 
@@ -626,10 +637,12 @@ uint64_t plat_self_cpu_ns(void) {
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
     DWORD old;
     DWORD p = prot == PLAT_PROT_RW ? PAGE_READWRITE : prot == PLAT_PROT_READ ? PAGE_READONLY : PAGE_NOACCESS;
+    int op = plat_op_begin(PLAT_OP_PROTECT, addr, n);
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     int ok = VirtualProtect((void *)(uintptr_t)addr, n, p, &old) != 0;
     vm_count(PLAT_VM_PROTECT, t0.QuadPart, 0);
+    plat_op_end(op, 0);
     return ok;
 }
 
@@ -656,10 +669,11 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     ULONG_PTR got = (ULONG_PTR)max;
     DWORD gran;
     _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
-    if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, (void *)(uintptr_t)addr, (SIZE_T)n, (PVOID *)pages, &got,
-                      &gran))
-        return UINT64_MAX;
-    return got;
+    int op = plat_op_begin(PLAT_OP_WRITE_WATCH, addr, n);
+    UINT r = GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, (void *)(uintptr_t)addr, (SIZE_T)n, (PVOID *)pages, &got,
+                           &gran);
+    plat_op_end(op, 0);
+    return r ? UINT64_MAX : got;
 }
 
 static int (*fault_hook)(uint64_t addr);
@@ -705,8 +719,10 @@ static int lazy_commit(uint64_t addr, uint64_t lo, uint64_t hi) {
         int ok = 0;
         for (int t = 0; t < 5 && !ok; t++) {
             if (t) Sleep(20);
+            int op = plat_op_begin(PLAT_OP_COMMIT, x, y - x);
             ok = VirtualAlloc((void *)(uintptr_t)x, y - x, MEM_COMMIT, PAGE_READWRITE) != NULL;
             if (!ok) err = GetLastError();
+            plat_op_end(op, 0);
         }
         if (!ok) {
             __atomic_store_n(&lazy_fail_addr, x, __ATOMIC_RELAXED);
