@@ -1071,6 +1071,15 @@ void vk_mem_census(uint64_t frame) {
     window_start = frame;
 }
 
+// TOTK_VRAM_LIMIT=<MiB> (test knob, unset = off): caps the device-local budget every VRAM consumer reads here (texture
+// pressure, headroom, the perf line), to see how the runtime behaves on a card with less video memory. The driver still
+// lets allocations go past it, so it shows the runtime's reaction, not the driver paging a real small card does.
+static void vram_limit(uint64_t *budget) {
+    static int64_t lim = -1;
+    if (lim < 0) { const char *s = cfg_get("TOTK_VRAM_LIMIT"); lim = s ? (int64_t)strtoull(s, NULL, 10) << 20 : 0; }
+    if (lim && *budget > (uint64_t)lim) *budget = (uint64_t)lim;
+}
+
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     VkCtx *c = vk_ctx();
     *used = *budget = 0, *exact = 0;
@@ -1086,6 +1095,7 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
             if (p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 *used += b.heapUsage[h], *budget += b.heapBudget[h];
         *exact = 1;
+        vram_limit(budget);
         return *budget != 0;
     }
     VmaBudget vb[VK_MAX_MEMORY_HEAPS];
@@ -1093,6 +1103,7 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
         if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
+    vram_limit(budget);
     return *budget != 0;
 }
 
