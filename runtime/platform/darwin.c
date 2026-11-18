@@ -1541,6 +1541,13 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (resident) *proc_mb = (float)(resident >> 20);
 }
 
+int plat_mem_avail(uint64_t *avail, uint64_t *swap_free, uint64_t *total, int *has_swap) {
+    (void)avail, (void)swap_free, (void)total, (void)has_swap;
+    return 0;   // the memory-pressure policy (vk_mem_pressure.c) is Linux only
+}
+
+int plat_mem_trim(void) { return 0; }
+
 // No walk of the address space on this host: mem_commit_report then sums nothing.
 void plat_mem_walk(void (*fn)(uint64_t, uint64_t, int, void *), void *arg) { (void)fn, (void)arg; }
 // Not implemented on this host (the commit report is Windows only): reports 0.

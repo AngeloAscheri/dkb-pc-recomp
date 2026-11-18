@@ -471,6 +471,8 @@ void vk_astc_release(void);             // vk_device.c, before the device goes: 
 // this is a destruction frontier, not a report that the value was submitted or issued.
 void vk_mem_protect_until(uint64_t timeline_value);
 void vk_mem_collect(void);                         // frees what has completed
+void vk_mem_pressure_check(void);                  // Linux memory pressure, at most once a second (vk_mem_pressure.c)
+void vk_mem_trim_after(const char *what);          // gives the heap's freed pages back after a precompile (Linux)
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
 void vk_mem_gpu_summary(char *out, size_t n);      // "; gpu: ..." for mem_commit_report: VMA, mirrors, staging, usnap
