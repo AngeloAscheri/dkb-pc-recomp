@@ -217,6 +217,7 @@ static int alias_copy(Tex *a, const Tex *b) { (void)a; (void)b; check(0, "no liv
 static void init_image(Tex *image, VkCommandBuffer cb) { (void)image; (void)cb; }
 VkCommandBuffer vk_upload_begin(void) { return (VkCommandBuffer)(uintptr_t)0xC200; }
 void vk_upload_end(void) {}
+void vk_mem_pressure_check(void) {}   // vk_mem_collect calls it after each collection (vk_mem_pressure.c, #374)
 int vk_mem_changed(uint64_t a, uint64_t n, uint32_t before, uint32_t *now) {
     (void)a; (void)n; (void)before; (void)now; check(0, "not a mirrored image"); return 0;
 }
