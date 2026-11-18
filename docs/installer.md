@@ -271,11 +271,14 @@ older, downgrade, offline, API fallback, mismatching digests), the download (goo
 too long, cancelled), the unpack (good, members leaving the folder, wrong version, damaged zip), the switch of versions
 (confirmed, failed, slow start), the launcher's replacement and the window's settings, all with an injected opener and
 no network. `python -m installer.gui --selftest --shots DIR` draws the home and update screens in both languages.
-`tests/launcher_e2e.py` (Windows, MSYS2 clang, about a minute) runs against a fake release server on 127.0.0.1. It
-does the first install of a release A with a `-DDKB_LAUNCHER_TEST` launcher for real, with a stub in place of
-Python, then the update to a release B through `installer.update` in the window's order and the new window's start
-code. Both include the failure paths: a tampered zip, a cancel, two launchers at once, a window that never confirms,
-a kill between the two pointer files, and going back. GitHub's TLS and redirects are the part it does not cover.
+`tests/launcher_e2e.py` (`launcher-e2e` in `tools/test.py`, tier 1: Windows, MSYS2 clang, under a minute) runs
+against a fake release server on 127.0.0.1. It does the first install of a release A with a `-DDKB_LAUNCHER_TEST`
+launcher for real, with a stub in place of Python and a junk `winhttp.dll` and `bcrypt.dll` beside the launcher,
+then the update to a release B in A's window: an `installer.gui.App` on a hidden Tk root whose check, Update and Go
+back run as a click runs them, its requests going through `update.http_open`, and B's start code
+(`gui.start_launcher`) in B's own folder. Both include the failure paths: a tampered zip, a cancel, two launchers at
+once, a window that never confirms, a kill between the two pointer files, and going back. GitHub's TLS and redirects
+are the part it does not cover.
 
 ## Inherited TotK installer
 

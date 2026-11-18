@@ -1,18 +1,23 @@
 """End-to-end test of the Bananza launcher against a fake release server on 127.0.0.1 (Windows, MSYS2 clang).
 
-    .venv\\Scripts\\python tests\\launcher_e2e.py [--keep]
-
+    .venv\\Scripts\\python tests\\launcher_e2e.py [--cc CLANG] [--keep]
 
 The C launcher (a -DDKB_LAUNCHER_TEST build, no windows) does the first install of release A for real: manifest,
-download, SHA-256, tar.exe, current.txt, start of A's python\\pythonw.exe (a stub that logs its command line). The
-update to B then goes through installer.update in the order the window calls it (check, download, stage,
-start_version), with B's window replaced by tests/launcher_e2e_window.py, which runs installer.gui.start_launcher (confirm_start and the
-launcher exe's replacement). The opener maps GitHub's https links onto the local server; TLS and GitHub's redirects
-are not covered. Scenarios: a tampered zip and a cancel at the first install, the first install and a second start,
-two first installs at once, then from installed A: a tampered update, a window that never confirms, a kill between
-previous.txt and current.txt, the update to B with the launcher's replacement, a second start, and going back to A.
-Everything happens in a temporary folder (kept with --keep); exit code 0 when every check passes.
+download, SHA-256, tar.exe, current.txt, start of A's python\\pythonw.exe (a stub that logs its command line), with a
+junk winhttp.dll and bcrypt.dll beside it that Windows must not load. The update to B then runs the window's own code:
+an installer.gui.App on a withdrawn Tk root, set up as launcher.c starts A's window, whose release check, Update
+button (App.start_update, update_worker, hand_over) and Go back run as a click runs them, on Tk's main loop. Its
+requests go through installer.update.http_open with GitHub's https links mapped onto the local server (update.OPENER);
+TLS and GitHub's redirects are not covered. B's python\\pythonw.exe is the same stub, which then forwards to
+tests/launcher_e2e_window.py, which runs installer.gui.start_launcher (confirm_start and the launcher exe's
+replacement) as B's window does before it opens. Scenarios: a tampered zip and a cancel at the first install, the
+first install and a second start, two first installs at once, then from installed A: a tampered update, a window that
+never confirms, a kill between previous.txt and current.txt, the update to B with the launcher's replacement, a second
+start, and going back to A. Everything happens in a temporary folder (kept with --keep); exit code 0 when every check
+passes, 77 (skipped) off Windows or without clang.
 """
+import argparse
+import dataclasses
 import hashlib
 import http.server
 import json
@@ -26,13 +31,13 @@ import time
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 from installer import update  # noqa: E402
 
-CLANG = r'C:\msys64\ucrt64\bin\clang.exe'
 WORK = Path(tempfile.mkdtemp(prefix='dkb-launcher-e2e-'))
 RESULTS = []
 
@@ -48,15 +53,17 @@ def sha(path):
 
 # ---- builds -----------------------------------------------------------------------------------------------------
 
-def build_launcher():
+def build_launcher(cc):
     sys.path.insert(0, str(REPO / 'tools'))
     import make_release
     inc = WORK / 'inc'
     make_release.launcher_header(inc / 'launcher_text.h', 'dkb')
     exe = WORK / 'launcher-test.exe'
     src = [str(s) for s in make_release.launcher_sources('dkb')]
-    subprocess.run([CLANG, '-O2', '-mwindows', '-municode', '-fuse-ld=lld', '-Wl,--dependent-load-flag=0x800',
-                    '-DDKB_LAUNCHER_TEST', '-I', str(inc), *src, '-o', str(exe)], check=True)
+    subprocess.run([cc, '-O2', '-mwindows', '-municode', '-fuse-ld=lld',
+                    f'-Wl,--dependent-load-flag={make_release.DEPENDENT_LOAD_FLAG}', '-DDKB_LAUNCHER_TEST', '-I', str(inc),
+                    *src, '-o', str(exe)], check=True)
+    make_release.check_launcher(exe)
     return exe.read_bytes()
 
 
@@ -83,7 +90,7 @@ class Release:
 
 class Server:
     def __init__(self):
-        self.files, self.requests, self.delay = {}, [], 0.0
+        self.files, self.requests, self.agents, self.delay = {}, [], set(), 0.0
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -92,6 +99,7 @@ class Server:
 
             def do_GET(self):
                 server.requests.append(self.path)
+                server.agents.add(self.headers.get('User-Agent'))
                 data = server.files.get(self.path)
                 if data is None:
                     self.send_response(404)
@@ -133,12 +141,15 @@ class Server:
                             'digest': 'sha256:' + sha(release.zip)},
                            {'name': 'DKB-Launcher.exe', 'size': len(release.launcher_bytes)}]}).encode()}
 
-    def opener(self, url, accept=None, timeout=update.TIMEOUT):
-        """installer.update's opener with GitHub's https links mapped onto this server"""
+    def open(self, request, timeout=None):
+        """update.OPENER's open(): GitHub's https links of http_open's request mapped onto this server, with its
+        headers (the generic User-Agent) passed on"""
+        url = request.full_url
         for prefix, local in ((update.API, '/api/latest'), (update.LATEST_MANIFEST, '/latest/dkb-release.txt'),
                               (update.DOWNLOAD, '/download/')):
             if url.startswith(prefix):
-                return urllib.request.urlopen(self.url(local + url[len(prefix):]), timeout=timeout)
+                mapped = urllib.request.Request(self.url(local + url[len(prefix):]), headers=dict(request.header_items()))
+                return urllib.request.urlopen(mapped, timeout=timeout)
         raise OSError(f'not mapped: {url}')
 
 
@@ -189,29 +200,104 @@ class Player:
         d = self.base / 'downloads'
         return sorted(p.name for p in d.iterdir()) if d.exists() else []
 
-    def update_to(self, current, window_env=None, spawn=None):
-        """installer.gui App.update_worker's calls, in its order"""
-        offer = update.check(current, self.server.opener)
-        assert update.may_install(offer), offer
-        zip_path = update.download(offer.manifest.tools, offer.tag, self.base / 'downloads', opener=self.server.opener,
-                                   sleep=lambda s: None)
-        folder = update.stage(zip_path, self.base, offer.manifest)
-        zip_path.unlink(missing_ok=True)
 
-        def window(cmd, cwd):   # the new version's window: window.py runs gui.start_launcher with these arguments
-            return subprocess.Popen([sys.executable, str(HERE / 'launcher_e2e_window.py'), *cmd[1:]], cwd=cwd,
-                                    env={**os.environ, 'E2E_REPO': str(REPO), **(window_env or {})})
-        return offer, folder, update.start_version(self.base, offer.tag, self.exe, ('--lang', 'en'),
-                                                   spawn=spawn or window, timeout=60)
+# ---- the window -------------------------------------------------------------------------------------------------
+
+class Window:
+    """The window launcher.c starts for the version `running` (its folder, --launcher, --base): an installer.gui.App on
+    a withdrawn Tk root, whose requests reach the local server through update.http_open. A version's python\\pythonw.exe
+    that it starts forwards to tests/launcher_e2e_window.py (forward=False: the stub only logs and exits, a window that
+    never confirms its start)."""
+
+    def __init__(self, player, running, forward=True, **window_env):
+        import tkinter as tk
+        from installer import gui, layout as layouts
+        from installer.guilogic import Launcher
+        self.gui, self.tk = gui, tk
+        forwarding = {'E2E_FORWARD_PYTHON': sys.executable, 'E2E_FORWARD_SCRIPT': str(HERE / 'launcher_e2e_window.py')}
+        self.env = {'E2E_REPO': str(REPO), 'STUB_LOG': str(player.stub_log), **(forwarding if forward else {}),
+                    **window_env}
+        self.patches = [patch.object(update, 'OPENER', player.server), patch.dict(os.environ, self.env)]
+        for p in self.patches:
+            p.start()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        layout = dataclasses.replace(layouts.find(None), root=player.base / 'versions' / running.tag,
+                                     release=running.version)
+        self.app = gui.App(self.root, 'en', layout, game='bananza', check_updates=False,
+                           launcher=Launcher(base=player.base, exe=player.exe))
+        self.closed = False
+
+    def loop(self, done, timeout=120):
+        """Tk's main loop, as the window runs it (a worker's later() needs it), until done() or the window closed"""
+        end = time.monotonic() + timeout
+        pending = []
+
+        def poll():
+            if done() or time.monotonic() > end:
+                self.root.quit()
+            else:
+                pending[:] = [self.root.after(50, poll)]
+        pending.append(self.root.after(50, poll))
+        self.root.mainloop()
+        try:
+            self.root.winfo_exists()
+        except self.tk.TclError:
+            self.closed = True
+        try:   # a poll still queued when the window closed would run against a destroyed root
+            self.root.after_cancel(pending[0])
+        except (self.tk.TclError, IndexError):
+            pass
+
+    def check(self):
+        self.app.check_now()
+        self.loop(lambda: self.app.check_button.instate(['!disabled']))
+        return self.app.offer
+
+    def click(self, action):
+        """Update or Go back, then the main loop until the worker is done (and the window closed when it handed over)"""
+        with patch.object(self.gui.messagebox, 'askyesno', return_value=True):   # Go back's question
+            action()
+        self.loop(lambda: not self.app.update_running and self.app.update_failure is not None)
+        return None if self.closed else self.app.update_failure
+
+    def close(self):
+        if not self.closed:
+            try:
+                self.root.destroy()
+            except self.tk.TclError:
+                pass
+        for p in reversed(self.patches):
+            p.stop()
+
+
+def update_in_window(player, running, **window_kw):
+    """The home screen's check and Update button: (the offer, the failure the update screen shows or None, whether
+    the window closed)"""
+    w = Window(player, running, **window_kw)
+    try:
+        offer = w.check()
+        failure = w.click(w.app.start_update) if offer and w.app.update_offered else ('not offered', {})
+        return offer, failure, w.closed
+    finally:
+        w.close()
 
 
 def main():
-    if not Path(CLANG).is_file():
-        print(f'skipped: no {CLANG}')
-        return 0
-    subprocess.run([CLANG, '-O1', '-mwindows', '-municode', str(HERE / 'launcher_e2e_stub.c'), '-o', str(WORK / 'stub.exe')],
-                   check=True)
-    launcher = build_launcher()
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--cc', default=r'C:\msys64\ucrt64\bin\clang.exe')
+    ap.add_argument('--keep', action='store_true')
+    args = ap.parse_args()
+    if os.name != 'nt':
+        print('skipped: the launcher is a Windows program')
+        return 77
+    if not Path(args.cc).is_file():
+        print(f'skipped: no {args.cc}')
+        return 77
+    os.environ['PATH'] = str(Path(args.cc).parent) + os.pathsep + os.environ.get('PATH', '')
+    subprocess.run([args.cc, '-O1', '-mwindows', '-municode', str(HERE / 'launcher_e2e_stub.c'), '-o',
+                    str(WORK / 'stub.exe')], check=True)
+    launcher = build_launcher(args.cc)
     a = Release(WORK / 'release-a', '0.5.0', 'aaaaaaa', launcher + b'\0release A')   # an overlay: another exe hash
     b = Release(WORK / 'release-b', '0.6.0', 'bbbbbbb', launcher + b'\0release B')
     server = Server()
@@ -232,14 +318,17 @@ def main():
           p.versions() == [] and p.downloads() == [] and p.started() == [] and p.messages() == [p.messages()[0]],
           (p.versions(), p.downloads(), p.started(), p.messages()))
 
-    # -- first install of A
+    # -- first install of A, from a Downloads folder that also holds a winhttp.dll and a bcrypt.dll
     p = Player('player', a.launcher_bytes, server)
+    for dll in ('winhttp.dll', 'bcrypt.dll'):   # not images: had Windows loaded either, the launcher would not start
+        (p.dir / dll).write_bytes(b'not a DLL')
     before = len(server.requests)
     p.run()
     started = p.started(1)
     check('first install: versions\\v0.5.0 unpacked, current.txt names it, downloads empty',
           p.versions() == ['current.txt', 'v0.5.0'] and p.pointer('current') == 'v0.5.0' and p.downloads() == [],
           (p.versions(), p.downloads()))
+    check('first install: the winhttp.dll and bcrypt.dll beside the launcher were not loaded', len(started) == 1, started)
     check('first install: only the confirmation was shown', len(p.messages()) == 1 and 'downloads them' in p.messages()[0],
           p.messages())
     check('first install: A started from its folder with --launcher and --base',
@@ -266,7 +355,7 @@ def main():
           len(zips) == 1 and len(q.started(2)) == 2 and q.versions() == ['current.txt', 'v0.5.0'],
           (server.requests[before:], q.started(), q.versions(), q.messages()))
 
-    # -- the update to B, failure paths first
+    # -- the update to B in A's window, failure paths first
     shutil.copytree(p.base, WORK / 'a-installed')   # every update scenario starts from this installed A
     exe_a = p.exe.read_bytes()
 
@@ -276,33 +365,34 @@ def main():
         p.exe.write_bytes(exe_a)
 
     server.publish(b, tamper=True)
-    try:
-        p.update_to(a.version)
-        check('update: a tampered zip is refused', False)
-    except update.UpdateError as e:
-        check('update: a tampered zip is refused (update.checksum)', e.id == 'update.checksum', e.id)
+    offer, failure, closed = update_in_window(p, a)
+    check('update: B is offered in A\'s window', offer is not None and offer.tag == 'v0.6.0', offer)
+    check('update: a tampered zip is refused (update.checksum) and the window stays',
+          failure and failure[0] == 'update.checksum' and not closed, (failure, closed))
     check('update: after the tampered zip, A is current, nothing staged, downloads empty',
           p.pointer('current') == 'v0.5.0' and p.versions() == ['current.txt', 'v0.5.0'] and p.downloads() == [],
           (p.versions(), p.downloads()))
 
     server.publish(b)
     reset()
-
-    def no_confirm(cmd, cwd):   # B's window exits without confirming: its python is the stub, which only logs
-        return subprocess.Popen([str(Path(cwd) / 'python' / 'pythonw.exe'), *cmd[1:]], cwd=cwd, env=p.env())
-    offer, folder, result = p.update_to(a.version, spawn=no_confirm)
-    p.started(1)
-    check('update: a window that never confirms gives "failed" and A stays current',
-          result == 'failed' and p.pointer('current') == 'v0.5.0' and p.pointer('previous') is None, result)
+    n = len(p.started())
+    offer, failure, closed = update_in_window(p, a, forward=False)   # B's window exits without confirming
+    p.started(n + 1)
+    check('update: a window that never confirms is reported, A stays current and the window stays',
+          failure and failure[0] == 'ui.update_start_failed' and failure[1].get('current') == 'v0.5.0' and not closed and
+          p.pointer('current') == 'v0.5.0' and p.pointer('previous') is None, (failure, closed))
     n = len(p.started())
     p.run()
     check('update: after the failed start the launcher starts A', len(p.started(n + 1)) == n + 1 and
           p.started()[-1].split('\t')[0].endswith('v0.5.0'), p.started()[-1:])
 
     reset()
-    offer, folder, result = p.update_to(a.version, window_env={'E2E_KILL_BEFORE': 'current'})
-    check('update: killed between previous.txt and current.txt: "failed", A still current',
-          result == 'failed' and p.pointer('current') == 'v0.5.0', (result, p.pointer('current'), p.pointer('previous')))
+    n = len(p.started())
+    offer, failure, closed = update_in_window(p, a, E2E_KILL_BEFORE='current')
+    p.started(n + 1)
+    check('update: killed between previous.txt and current.txt: reported, A still current',
+          failure and failure[0] == 'ui.update_start_failed' and p.pointer('current') == 'v0.5.0',
+          (failure, p.pointer('current'), p.pointer('previous')))
     n = len(p.started())
     p.run()
     check('update: after that kill the launcher starts A', len(p.started(n + 1)) == n + 1 and
@@ -310,10 +400,13 @@ def main():
 
     # -- the update to B
     reset()
-    before = len(server.requests)
-    offer, folder, result = p.update_to(a.version)
-    check('update: B checked, downloaded, verified, unpacked; its window confirmed ("started")',
-          result == 'started' and folder == p.base / 'versions' / 'v0.6.0' and update.complete(folder, b.version), result)
+    before, n = len(server.requests), len(p.started())
+    offer, failure, closed = update_in_window(p, a)
+    done = p.started(n + 1)   # the stub logs once B's start code has run
+    check('update: B checked, downloaded, verified, unpacked; its window confirmed and A\'s window closed',
+          failure is None and closed and update.complete(p.base / 'versions' / 'v0.6.0', b.version), (failure, closed))
+    check('update: B\'s window was started with --after-update from its own folder',
+          len(done) == n + 1 and done[-1].split('\t')[0].endswith('v0.6.0') and '--after-update' in done[-1], done[-1:])
     check('update: current.txt is B, previous.txt is A, both folders kept, downloads empty',
           p.pointer('current') == 'v0.6.0' and p.pointer('previous') == 'v0.5.0' and
           p.versions() == ['current.txt', 'previous.txt', 'v0.5.0', 'v0.6.0'] and p.downloads() == [],
@@ -322,29 +415,36 @@ def main():
           sha(p.exe) == hashlib.sha256(b.launcher_bytes).hexdigest() and sorted(x.name for x in p.dir.iterdir()
                                                                                 if x.name.startswith('DKB-Launcher')) == ['DKB-Launcher.exe'],
           sorted(x.name for x in p.dir.iterdir()))
-    check('update: requests were the API, the manifest and the zip', len(server.requests) - before == 3,
-          server.requests[before:])
+    check('update: requests were the API, the manifest and the zip, with the generic User-Agent',
+          len(server.requests) - before == 3 and update.USER_AGENT in server.agents, server.requests[before:])
+    log = (p.base / 'logs' / 'launcher.log').read_text(encoding='utf-8')
+    check('update: launcher.log has the check, the download, the unpack and the confirmed start',
+          all(s in log for s in ('check: latest v0.6.0', 'downloaded and checked', 'unpacked into',
+                                 'v0.6.0: its window started', 'v0.6.0 (0.6.0+bbbbbbb) started and is now current')), log)
     before, n = len(server.requests), len(p.started())
     p.run()   # now B's launcher binary
     check('second start after the update: B starts, no request', len(server.requests) == before and
           len(p.started(n + 1)) == n + 1 and p.started()[-1].split('\t')[0].endswith('v0.6.0'), p.started()[-1:])
-    offer = update.check(b.version, server.opener)
-    check('the check from B: B is the latest, nothing to install', offer.direction == 0 and not update.may_install(offer))
-
-    # -- Go back to A (the home screen's button: start_version of previous.txt's tag, as App.go_back does)
-    def window(cmd, cwd):
-        return subprocess.Popen([sys.executable, str(HERE / 'launcher_e2e_window.py'), *cmd[1:]], cwd=cwd,
-                                env={**os.environ, 'E2E_REPO': str(REPO)})
-    from installer import guilogic
-    tag = guilogic.previous_version(p.base, 'v0.6.0')
-    before = len(server.requests)
-    result = update.start_version(p.base, tag, p.exe, ('--lang', 'en'), spawn=window, timeout=60)
-    check('go back: A confirms, current.txt A, previous.txt B, both kept, A\'s launcher back, no request',
-          tag == 'v0.5.0' and result == 'started' and p.pointer('current') == 'v0.5.0' and
+    w = Window(p, b)
+    try:
+        offer = w.check()
+        check('the check in B\'s window: B is the latest, no Update button',
+              offer.direction == 0 and not w.app.update_offered, offer)
+        # -- Go back to A (the home screen's button)
+        before, n = len(server.requests), len(p.started())
+        back = w.app.previous_tag()
+        failure = w.click(w.app.go_back)
+        closed = w.closed
+    finally:
+        w.close()
+    p.started(n + 1)
+    check('go back: A confirms, current.txt A, previous.txt B, both kept, A\'s launcher back, no download',
+          back == 'v0.5.0' and failure is None and closed and p.pointer('current') == 'v0.5.0' and
           p.pointer('previous') == 'v0.6.0' and p.versions() == ['current.txt', 'previous.txt', 'v0.5.0', 'v0.6.0'] and
-          sha(p.exe) == hashlib.sha256(a.launcher_bytes).hexdigest() and len(server.requests) == before,
-          (tag, result, p.versions()))
-    offer = update.check(a.version, server.opener)
+          sha(p.exe) == hashlib.sha256(a.launcher_bytes).hexdigest() and
+          not [r for r in server.requests[before:] if r.endswith('.zip')], (back, failure, closed, p.versions()))
+    with patch.object(update, 'OPENER', server):
+        offer = update.check(a.version)
     folder = update.stage(Path('unused.zip'), p.base, offer.manifest)   # B's folder is complete: reused, not unpacked
     check('go back: B is offered again and its folder is reused without a download',
           update.may_install(offer) and folder == p.base / 'versions' / 'v0.6.0')
