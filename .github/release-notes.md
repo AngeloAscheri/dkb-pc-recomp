@@ -1,7 +1,6 @@
 ## Draft: next release (since 0.4.2)
 
-Draft, not released. The 0.4.2 notes follow below, unchanged.
-
+- #419 Keep the Bananza installer tests independent of the host's free space and symlink rights (@wrothgaril)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 
 New files in the package table of that release:
@@ -10,8 +9,6 @@ New files in the package table of that release:
 |---|---|---|
 | `DKB-Launcher.exe` | Windows 10/11 x64 | New, the simplest way: one small file. Put it in a folder of its own and start it; it downloads the tools zip below, checks its SHA-256, builds the game from your dump and offers each later release with one click (docs/installer.md, "Launcher and updates"). |
 | `dkb-release.txt` | the launcher | The version, the file names, sizes and SHA-256 the launcher checks itself and the tools zip against. |
-
----
 
 DKB Recomp 0.4.2: a static recompilation of *Donkey Kong Bananza* (Switch 2) to a native Windows exe with a Vulkan renderer. It is still experimental (0.x). A small release: fixes and community pull requests from the day after 0.4.1, with most of the work on frame drops in heavy scenes, on first runs and on PCs with fewer CPU threads.
 
