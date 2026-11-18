@@ -155,7 +155,7 @@ void vk_sync_note(int kind, uint64_t a, uint64_t b, uint64_t work) {
     if (!n) return;
     if (kind >= 2 && n == &note && n->nmarks) {   // TOTK_PASS_GPU: a dispatch's mark takes its compute stage's name
         uint64_t *k = &n->marks[n->nmarks - 1].key;
-        if (*k == (2 | (uint64_t)OP_DISPATCH << 2) || *k == (2 | (uint64_t)OP_DISPATCH_IND << 2)) *k = a << 10 | 252 << 2 | 2;
+        if (*k == (2 | 251 << 2)) *k = a << 10 | 252 << 2 | 2;   // vk_exec.c walk marks a dispatch with 251
     }
     n->last_a = a, n->last_b = b;
     if (kind == 0) n->draws++;
@@ -288,7 +288,7 @@ static void mk_report(void) {
         }
         if (!(key & 1)) {
             rt_log("perf:   outside passes, from op %s %.2f ms, %.1f a frame",
-                   key >> 2 == 255 ? "(mirror prologue)" : key >> 2 == 254 ? "(depth twin copy)" : key >> 2 == 253 ? "(start of a part)" : nvn_op_name((int)(key >> 2)), list[j][1] / 1e6 / f, mk_sum[list[j][0]].n / f);
+                   key >> 2 == 255 ? "(mirror prologue)" : key >> 2 == 254 ? "(depth twin copy)" : key >> 2 == 253 ? "(start of a part)" : key >> 2 == 251 ? "(dispatch)" : nvn_op_name((int)(key >> 2)), list[j][1] / 1e6 / f, mk_sum[list[j][0]].n / f);
             continue;
         }
         rt_log("perf:   %4llux%-4llu %llu colour fmt %llu depth fmt %llu samples %llu: %.2f ms, %.1f passes a frame",

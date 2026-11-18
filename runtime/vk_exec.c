@@ -2895,7 +2895,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         if (ex == &X && !ex->in_pass)   // TOTK_PASS_GPU: the GPU work of ops outside passes, by op
             switch (h->op) {
             case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_DISPATCH: case OP_DISPATCH_IND: case OP_COPY_B2B: case OP_COPY_B2T:
-            case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_CLEAR_BUF: vk_sync_mark(ex->cb, 2 | (uint64_t)h->op << 2);
+            case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_CLEAR_BUF:
+                vk_sync_mark(ex->cb, 2 | (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND ? 251 : (uint64_t)h->op) << 2);
             default: break;
             }
         switch (h->op) {
