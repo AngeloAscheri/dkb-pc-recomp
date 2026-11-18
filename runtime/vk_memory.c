@@ -3293,12 +3293,28 @@ static void st_sort_drain(void) {   // staged_shutdown: no job is being sorted w
 // in the order the ranges came (a piece inside or right after the last one joins it), sorted by the sort thread
 // (above). The bytes each list gets are those the sorted split gave, and the sort joins what overlaps or touches, so
 // the lists are the same.
+// st_lock: the owned-range lists of jobs whose fence has come (staged_wb_done), kept for the next jobs' lists. In the
+// order the writes came few ranges join, so a job's list held thousands of ranges of 48 bytes on the Hilltop Layer of
+// Surf Hills (3.2.0) with TOTK_MIRROR_STAGED=all; grown from nothing at every submission, it was reallocated a dozen
+// times and its new pages faulted in: the split took 0.16 ms a frame there, 0.04 ms with the lists kept.
+#define ST_OBUF 4
+static StRange *st_obuf[ST_OBUF];
+static int st_obuf_cap[ST_OBUF];
+
 static void staged_split_own(void) {
     static MRange *fb;
     static int nfb, cfb;
     StJob *j = st_cur;
     if (!j) rt_fatal("mem: a staged write-back outside a submission's recording");
     uint64_t t1 = qpc();
+    if (!j->o) {   // the largest list kept, if any
+        plat_mutex_lock(&st_lock);
+        int best = -1;
+        for (int k = 0; k < ST_OBUF; k++)
+            if (st_obuf[k] && (best < 0 || st_obuf_cap[k] > st_obuf_cap[best])) best = k;
+        if (best >= 0) j->o = st_obuf[best], j->co = st_obuf_cap[best], st_obuf[best] = NULL;
+        plat_mutex_unlock(&st_lock);
+    }
     nfb = 0;
     for (int i = 0; i < nstw; i++) {
         PoolRec *r = stw[i].r;
@@ -4477,6 +4493,8 @@ static void staged_wb_done(void *arg) {
     plat_mutex_lock(&st_lock);
     for (StJob **p = &st_jobs; *p; p = &(*p)->next)
         if (*p == j) { *p = j->next; break; }
+    for (int k = 0; j->o && k < ST_OBUF; k++)   // the list for a later job (staged_split_own)
+        if (!st_obuf[k]) st_obuf[k] = j->o, st_obuf_cap[k] = j->co, j->o = NULL;
     plat_mutex_unlock(&st_lock);
     if (j->buf) vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
     if (j->tbuf) vmaDestroyBuffer(vk_ctx()->vma, j->tbuf, j->talloc);
@@ -4505,6 +4523,7 @@ static void staged_shutdown(VkCtx *c) {
         free(j->o);
         free(j);
     }
+    for (int k = 0; k < ST_OBUF; k++) free(st_obuf[k]), st_obuf[k] = NULL;
     st_cur = NULL;
     plat_mutex_unlock(&st_lock);
 }
