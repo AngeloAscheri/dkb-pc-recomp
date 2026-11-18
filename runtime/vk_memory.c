@@ -5541,14 +5541,17 @@ static void mirror_log(uint64_t frame) {
     mem_freeze_stats(&fz, &ff, &ft, &fo);
     uint64_t fr[MEM_FRZ_NO_N];
     mem_freeze_refusals(fr);
+    uint64_t cl[4];   // memory.c mem_commit_later: staged pools' untouched pages committed in the background
+    mem_commit_later_stats(cl);
     if (rt_trace & RT_TRACE_PERF)
         rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
                "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
                "or mapping change %llu, refused %llu (a guarded page %llu, held after a thaw %llu, never frozen %llu, page "
-               "states %llu)",
+               "states %llu), background commits of staged pools %llu over %.1f MiB in %.1f ms (%llu dropped)",
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
                fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr,
-               (unsigned long long)fr[0], (unsigned long long)fr[1], (unsigned long long)fr[2], (unsigned long long)fr[3]);
+               (unsigned long long)fr[0], (unsigned long long)fr[1], (unsigned long long)fr[2], (unsigned long long)fr[3],
+               (unsigned long long)cl[0], cl[1] / 1048576.0, cl[2] / 1e6, (unsigned long long)cl[3]);
     if (rt_trace & RT_TRACE_PERF) {
         // #317: the queries' wall time against their CPU time, the slowest one, and what else asked the kernel about
         // guest memory meanwhile (VirtualQuery and VirtualProtect by kind, the pointer guards' cache misses).
