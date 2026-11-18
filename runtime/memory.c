@@ -132,13 +132,14 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
+static int prb_mode;
 static int (*volatile own_hook)(uint64_t page, int write, uint64_t rip, int kernel);
-static void prb_release(uint64_t a, uint64_t n, uintptr_t caller);
+static void prb_release(uint64_t a, uint64_t n, uintptr_t caller, int counted);
 
 // The kernel will write the range (a file read) or the host gives it back to the guest: the guarded pages there are
-// settled first (prb_release: GPU-owned ones fetched from their VRAM mirror).
+// settled first (prb_release: the read probe's opened, GPU-owned ones fetched from their VRAM mirror).
 void mem_thaw(uint64_t a, uint64_t n) {
-    if (own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0));
+    if (prb_mode > 0 || own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0), 1);
     mem_thaw_keep(a, n);
 }
 
@@ -188,23 +189,39 @@ int mem_freeze(uint64_t a) {
 
 int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE); }
 
-// ---- GPU-owned pages (vk_memory.c staged mirror, TOTK_STAGED_WB=fault; Windows only)
-// A staged mirror's GPU-written bytes are only in its VRAM mirror, and their pages are PAGE_NOACCESS (mem_guard_own).
-// The first access to such a page faults into probe_fault (win32.c fault_veh), which makes the page read-write, its
-// state claimed (PRB_BUSY), and calls the hook; the hook copies the GPU's bytes in and calls mem_guard_clear. Host paths
-// that hand guest memory to the kernel or a driver, which would fail on such a page instead of faulting, settle the
-// pages first the same way: mem_thaw (file reads, imports, pool finalize), mem_touch (file writes, imports) and win32.c
-// plat_mem_read; plat_mem_readable counts the guarded pages as readable. The callers keep their own lock around the
-// state changes of a page that pair with their range lists (vk_memory.c own_lock).
-// Per page: 0 not guarded; PRB_BUSY while a thread changes the page's protection (the others wait for it to end);
-// PRB_OWN, a page whose GPU-written bytes are only in a VRAM mirror.
+// ---- read probe (TOTK_STAGED_READ_PROBE=1, off by default; Windows only)
+// Whether anything on the CPU reads the bytes the GPU writes into a staged pool (vk_memory.c staged mirror): once the
+// completion thread has copied a submission's write-back bytes into guest memory (staged_wb_done), their pages become
+// PAGE_NOACCESS (mem_probe_protect). The first access to such a page faults into probe_fault (win32.c fault_veh), which
+// makes the page accessible again, counts the access (read or write, game or runtime thread, on the written bytes or on
+// other bytes of the page) and lets it run again. Host paths that hand guest memory to the kernel or a driver, which
+// would fail on such a page instead of faulting, release the pages first: mem_thaw (file reads, imports, pool
+// finalize), mem_touch (file writes, imports) and win32.c plat_mem_read; plat_mem_readable counts the probe's pages
+// as readable. Diagnostic only: protection changes cost time on every page of every write-back.
+// Per page: 0 not protected; PRB_BUSY while a thread changes the page's protection (the others wait for it to end);
+// PRB_ON | lo << 12 | (hi - 1), the bytes [lo, hi) of the page the write-backs wrote since it was protected; PRB_OWN,
+// a page whose GPU-written bytes are only in a VRAM mirror (vk_memory.c staged mirror, TOTK_STAGED_WB=fault, below).
 #define PRB_CHUNK_SHIFT 28
 #define PRB_PER_CHUNK (1u << (PRB_CHUNK_SHIFT - 12))
+#define PRB_ON 0x80000000u
 #define PRB_BUSY 0x40000000u
 #define PRB_OWN 0x20000000u
+#define PRB_LOG 32
 static uint32_t *volatile prb[RT_ADDRESS_LIMIT >> PRB_CHUNK_SHIFT];
+static uint8_t *volatile prb_seen[RT_ADDRESS_LIMIT >> PRB_CHUNK_SHIFT];   // pages that ever faulted
 static PlatMutex prb_lock = PLAT_MUTEX_INIT;                            // chunk allocation
 volatile uint64_t mem_probe_frame;                                     // vk_memory.c vk_mem_census
+// Counters: [0] since the last line, [1] in all. f[write][guest], in[write][guest]: faults, and those on written bytes.
+typedef struct { int64_t protected_pages, f[2][2], in[2][2], distinct, rel_calls, rel_pages, readable, own_reads, failed; } PrbAcc;
+static PrbAcc prb_acc[2];
+typedef struct { uint64_t frame, addr, rip; uint32_t v; int write, guest, kind; } PrbRec;   // kind 0 fault, 1 release
+static PrbRec prb_rec[2][PRB_LOG];
+static volatile int32_t prb_nrec[2], prb_logged[2];
+
+static void prb_add(int64_t *field, int64_t v) {
+    __atomic_add_fetch(field, v, __ATOMIC_RELAXED);
+    __atomic_add_fetch((int64_t *)((char *)field + sizeof(PrbAcc)), v, __ATOMIC_RELAXED);   // the same field of [1]
+}
 
 static uint32_t *prb_slot(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT) return NULL;
@@ -225,7 +242,13 @@ static uint32_t prb_claim(uint32_t *s) {
     }
 }
 
-// The page's protection back to what it would be without the guard: read-only in a frozen region, else read-write.
+static void prb_record(int kind, uint64_t addr, uint32_t v, int write, int guest, uint64_t rip) {
+    int32_t k = __atomic_fetch_add(&prb_nrec[kind], 1, __ATOMIC_RELAXED);
+    if (k < PRB_LOG)
+        prb_rec[kind][k] = (PrbRec){__atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED), addr, rip, v, write, guest, kind};
+}
+
+// The page's protection back to what it would be without the probe: read-only in a frozen region, else read-write.
 static void prb_unprotect(uint64_t page) { plat_mem_protect(page, PAGE, mem_frozen(page) ? PLAT_PROT_READ : PLAT_PROT_RW); }
 
 static int probe_fault(uint64_t a, int write, uint64_t rip) {
@@ -238,11 +261,23 @@ static int probe_fault(uint64_t a, int write, uint64_t rip) {
         own_hook(page, write, rip, 0);
         return 1;
     }
-    // Not guarded, or another thread made it accessible meanwhile.
-    __atomic_store_n(s, v, __ATOMIC_RELEASE);
-    uint64_t end;
-    int st = plat_mem_state(page, page + PAGE, &end);
-    return st == PLAT_PROT_RW || (st == PLAT_PROT_READ && !write);
+    if (!(v & PRB_ON)) {   // not the probe's, or another thread made it accessible meanwhile
+        __atomic_store_n(s, v, __ATOMIC_RELEASE);
+        uint64_t end;
+        int st = plat_mem_state(page, page + PAGE, &end);
+        return st == PLAT_PROT_RW || (st == PLAT_PROT_READ && !write);
+    }
+    prb_unprotect(page);
+    __atomic_store_n(s, 0, __ATOMIC_RELEASE);
+    int guest = kern_cpu() != NULL;
+    uint32_t off = (uint32_t)(a & (PAGE - 1)), lo = v >> 12 & 0xfff, hi = (v & 0xfff) + 1;
+    prb_add(&prb_acc[0].f[write][guest], 1);
+    if (off >= lo && off < hi) prb_add(&prb_acc[0].in[write][guest], 1);
+    uint8_t *seen = __atomic_load_n(&prb_seen[a >> PRB_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
+    if (seen && !__atomic_exchange_n(&seen[(a >> 12) & (PRB_PER_CHUNK - 1)], 1, __ATOMIC_RELAXED))
+        prb_add(&prb_acc[0].distinct, 1);
+    prb_record(0, a, v, write, guest, rip);
+    return 1;
 }
 
 static int probe_marked(uint64_t a, uint64_t n) {
@@ -250,12 +285,15 @@ static int probe_marked(uint64_t a, uint64_t n) {
         uint32_t *s = prb_slot(p);
         if (!s || !__atomic_load_n(s, __ATOMIC_ACQUIRE)) return 0;
     }
+    prb_add(&prb_acc[0].readable, 1);
     return 1;
 }
 
-// A host path that hands the range to the kernel or a driver: its owned pages are fetched (caller: for the fetch log).
-static void prb_release(uint64_t a, uint64_t n, uintptr_t caller) {
+// counted: a host path that hands the range to the kernel or a driver (logged with its caller); 0: the probe's own
+// write-back about to write the pages (staged_wb_done), which is not an access to count.
+static void prb_release(uint64_t a, uint64_t n, uintptr_t caller, int counted) {
     if (!n) return;
+    int pages = 0;
     for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
         uint32_t *s = prb_slot(p);
         if (!s || !__atomic_load_n(s, __ATOMIC_ACQUIRE)) continue;
@@ -265,27 +303,80 @@ static void prb_release(uint64_t a, uint64_t n, uintptr_t caller) {
             own_hook(p, 0, caller, 1);
             continue;
         }
+        if (v & PRB_ON) prb_unprotect(p), pages++;
         __atomic_store_n(s, 0, __ATOMIC_RELEASE);
+        if (counted && (v & PRB_ON) && pages == 1) prb_record(1, p, v, 0, kern_cpu() != NULL, caller);
     }
+    if (counted && pages) prb_add(&prb_acc[0].rel_calls, 1), prb_add(&prb_acc[0].rel_pages, pages);
 }
 
-static void probe_release(uint64_t a, uint64_t n, uintptr_t caller) { prb_release(a, n, caller); }
+static void probe_release(uint64_t a, uint64_t n, uintptr_t caller) { prb_release(a, n, caller, 1); }
+
+static void probe_atexit(void) { mem_probe_log(__atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED), 1); }
+
+int mem_probe_on(void) {
+    if (!prb_mode) {
+        int on = 0;
+#ifdef _WIN32
+        const char *e = cfg_get("TOTK_STAGED_READ_PROBE");
+        on = e && *e && strcmp(e, "0");
+        if (on) {
+            plat_mem_probe_hooks(probe_fault, probe_marked, probe_release);
+            atexit(probe_atexit);   // the totals: vk_mem_shutdown does not run when the game exits on its own
+            rt_log("mem: read probe: pages of staged write-backs are made PAGE_NOACCESS after the fence, and each first "
+                   "access is counted (TOTK_STAGED_READ_PROBE)");
+        }
+#endif
+        prb_mode = on ? 1 : -1;
+    }
+    return prb_mode;
+}
+
+void mem_probe_release(uint64_t a, uint64_t n) {
+    if (prb_mode > 0) prb_release(a, n, 0, 0);
+}
 
 static void prb_chunk(uint64_t p) {   // the page's chunk of states exists
     uint64_t ci = p >> PRB_CHUNK_SHIFT;
     if (__atomic_load_n(&prb[ci], __ATOMIC_ACQUIRE)) return;
     plat_mutex_lock(&prb_lock);
     if (!prb[ci]) {
+        uint8_t *seen = calloc(PRB_PER_CHUNK, 1);
         uint32_t *c = calloc(PRB_PER_CHUNK, sizeof *c);
-        if (!c) rt_fatal("memory: out of memory for the page guards");
+        if (!c || !seen) rt_fatal("memory: out of memory for the page guards");
+        __atomic_store_n(&prb_seen[ci], seen, __ATOMIC_RELEASE);
         __atomic_store_n(&prb[ci], c, __ATOMIC_RELEASE);
     }
     plat_mutex_unlock(&prb_lock);
 }
 
-// A runtime read that should not settle the guarded pages it covers (vk_memory.c staged_upload's copy of the other
-// bytes of owned pages): each guarded page is opened read-only, copied and protected again, the other threads waiting
-// meanwhile.
+void mem_probe_protect(uint64_t a, uint64_t n) {
+    if (prb_mode <= 0 || !n || a + n > RT_ADDRESS_LIMIT) return;
+    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
+        prb_chunk(p);
+        uint32_t lo = (uint32_t)((a > p ? a : p) - p), hi = (uint32_t)((a + n < p + PAGE ? a + n : p + PAGE) - p);
+        uint32_t *s = prb_slot(p), v = prb_claim(s);
+        if (v & PRB_ON) {
+            uint32_t ol = v >> 12 & 0xfff, oh = (v & 0xfff) + 1;
+            if (ol < lo) lo = ol;
+            if (oh > hi) hi = oh;
+        }
+        // Protected every time, also a page marked already: a thread that made it accessible may have raced the mark.
+        if (!plat_mem_protect(p, PAGE, PLAT_PROT_NONE)) prb_add(&prb_acc[0].failed, 1);
+        static int checked;   // once: the page really is inaccessible now (a probe that never faults proves nothing else)
+        if (!checked) {
+            uint64_t end;
+            checked = 1;
+            rt_log("mem: read probe: the first protected page %#llx has state %d (%d: no access)", (unsigned long long)p,
+                   plat_mem_state(p, p + PAGE, &end), PLAT_PROT_NONE);
+        }
+        if (!(v & PRB_ON)) prb_add(&prb_acc[0].protected_pages, 1);
+        __atomic_store_n(s, PRB_ON | lo << 12 | (hi - 1), __ATOMIC_RELEASE);
+    }
+}
+
+// A runtime read that should not lift the probe (vk_memory.c staged_upload's copy of re-sent pages): each protected
+// page is opened, copied and protected again, the other threads waiting meanwhile. Counted apart from the faults.
 void mem_probe_copy(void *dst, uint64_t src, uint64_t n) {
     uint8_t *d = dst;
     for (uint64_t a = src; a < src + n;) {
@@ -293,8 +384,8 @@ void mem_probe_copy(void *dst, uint64_t src, uint64_t n) {
         uint32_t *s = prb_slot(p);
         if (s && __atomic_load_n(s, __ATOMIC_ACQUIRE)) {
             uint32_t v = prb_claim(s);
-            int g = v == PRB_OWN;
-            if (g) plat_mem_protect(p, PAGE, PLAT_PROT_READ);
+            int g = (v & PRB_ON) || v == PRB_OWN;
+            if (g) plat_mem_protect(p, PAGE, PLAT_PROT_READ), prb_add(&prb_acc[0].own_reads, 1);
             memcpy(d, (const void *)(uintptr_t)a, e - a);
             if (g) plat_mem_protect(p, PAGE, PLAT_PROT_NONE);
             __atomic_store_n(s, v, __ATOMIC_RELEASE);
@@ -305,6 +396,11 @@ void mem_probe_copy(void *dst, uint64_t src, uint64_t n) {
     }
 }
 
+// ---- GPU-owned pages (vk_memory.c staged mirror, TOTK_STAGED_WB=fault)
+// The same page states and fault path as the read probe: an owned page is PAGE_NOACCESS, and its first access (or a
+// kernel-path release) calls the hook with the page made read-write and its state PRB_BUSY; the hook copies the
+// GPU's bytes in and calls mem_guard_clear. The callers keep their own lock around the state changes of a page that
+// pair with their range lists (vk_memory.c own_lock).
 static void guard_hooks(void) {
 #ifdef _WIN32
     static int done;
@@ -374,7 +470,7 @@ int mem_guard_own_range(uint64_t a, uint64_t n, int *failed) {
         if (p >= end) return made;
         if (!v) r0 = p, r1 = p + PAGE;   // a new run
         else {
-            __atomic_store_n(s, v, __ATOMIC_RELEASE);   // owned already: as it was
+            __atomic_store_n(s, v, __ATOMIC_RELEASE);   // owned already, or the probe's: as it was
             r0 = r1 = 0;
         }
     }
@@ -398,6 +494,41 @@ int mem_guard_drop(uint64_t a, uint64_t n, int *claimed) {
         opened++;
     }
     return opened;
+}
+
+// One line of counts since the last (final: the totals instead), then the first PRB_LOG faults and kernel-path
+// releases not logged yet, with the host rip (exe offset: look it up in the build's map, a lifted function's name is
+// its guest address) or the caller of the release.
+void mem_probe_log(uint64_t frame, int final) {
+    if (prb_mode <= 0) return;
+    PrbAcc a;
+    PrbAcc *src = &prb_acc[final ? 1 : 0];
+    int64_t *d = (int64_t *)&a, *s = (int64_t *)src;
+    for (size_t i = 0; i < sizeof a / sizeof(int64_t); i++) d[i] = final ? __atomic_load_n(&s[i], __ATOMIC_RELAXED) : plat_xchg64(&s[i], 0);
+    rt_log("mem: read probe %s %llu: pages protected %lld; faults: game threads read %lld (%lld on written bytes), "
+           "write %lld (%lld), runtime threads read %lld (%lld), write %lld (%lld); distinct pages that faulted %lld; "
+           "kernel-path releases %lld calls (%lld pages); readable checks answered %lld; runtime copies kept protected %lld; "
+           "protection failures %lld",
+           final ? "totals at exit, frame" : "frame", (unsigned long long)frame, (long long)a.protected_pages,
+           (long long)a.f[0][1], (long long)a.in[0][1], (long long)a.f[1][1], (long long)a.in[1][1],
+           (long long)a.f[0][0], (long long)a.in[0][0], (long long)a.f[1][0], (long long)a.in[1][0],
+           (long long)a.distinct, (long long)a.rel_calls, (long long)a.rel_pages, (long long)a.readable,
+           (long long)a.own_reads, (long long)a.failed);
+    uintptr_t base = plat_exe_base();
+    for (int kind = 0; kind < 2; kind++) {
+        int32_t n = __atomic_load_n(&prb_nrec[kind], __ATOMIC_RELAXED);
+        if (n > PRB_LOG) n = PRB_LOG;
+        for (int32_t i = prb_logged[kind]; i < n; i++) {
+            const PrbRec *r = &prb_rec[kind][i];
+            uint32_t lo = r->v >> 12 & 0xfff, hi = (r->v & 0xfff) + 1, off = (uint32_t)(r->addr & (PAGE - 1));
+            rt_log("mem: read probe %s %d: frame %llu, %s %#llx (page bytes %#x..%#x written, %s), %s thread, %s exe+%#llx",
+                   kind ? "kernel-path release" : "fault", i, (unsigned long long)r->frame,
+                   kind ? "page" : r->write ? "write" : "read", (unsigned long long)r->addr, lo, hi,
+                   kind ? "-" : off >= lo && off < hi ? "on them" : "beside them", r->guest ? "game" : "runtime",
+                   kind ? "caller" : "rip", (unsigned long long)(r->rip >= base ? r->rip - base : r->rip));
+        }
+        prb_logged[kind] = n;
+    }
 }
 
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
@@ -601,7 +732,7 @@ static int heap_lazy(void) {
 // CPU (a kernel file read, a driver importing host memory) accesses them: those accesses fail on a reserved page
 // instead of faulting into fault_veh. Committed pages are left alone. No-op without TOTK_HEAP_LAZY.
 void mem_touch(uint64_t a, uint64_t n) {
-    if (own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0));   // a kernel access
+    if (prb_mode > 0 || own_hook) prb_release(a, n, (uintptr_t)__builtin_return_address(0), 1);   // a kernel access
     mem_touch_keep(a, n);
 }
 
@@ -951,8 +1082,8 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
 
 // Whether a read anywhere in [a, a + n) is sure to succeed, from this file's own map of the guest: 1 inside the
 // heap's current size (committed, or in the lazy heap reserved until the first access commits it; frozen pages are
-// read-only, still readable; a staged mirror's GPU-owned PAGE_NOACCESS pages fault into probe_fault, which fetches
-// them, as plat_mem_readable's probe_marked counts them) or on mapped alias pages,
+// read-only, still readable; a staged mirror's GPU-owned or the read probe's PAGE_NOACCESS pages fault into
+// probe_fault, which fetches or opens them, as plat_mem_readable's probe_marked counts them) or on mapped alias pages,
 // in both cases outside a moved stack's source; 0 inside the heap
 // block or the alias region otherwise; -1 anywhere else (modules, the stack region, the kernel region, host memory),
 // for the caller to ask the platform. No system call: on Windows plat_mem_readable's VirtualQuery reports the whole

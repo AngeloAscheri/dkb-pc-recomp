@@ -86,6 +86,10 @@ typedef struct PoolRec {
     int nown, cown;
     int own_ix;                        // own_lock: 1 + its place in st_own while own holds a range, else 0
     uint8_t *cpu_read;                 // per page: the CPU fetched it, so GPU writes to it go back at the fence
+    // TOTK_STAGED_FETCH_TEST, per page: the submission of the last recorded write, that of the reference bytes, and
+    // the reference (ft_check).
+    uint32_t *t_rec, *t_ref;
+    uint8_t **t_page;
 } PoolRec;
 
 // A pool's mirror state. The replay thread stores it with release order after the mirror's buffer exists, and every
@@ -106,6 +110,8 @@ static uint64_t staged_min;              // TOTK_MIRROR_STAGED in bytes (mirror_
 static int staged_fault = 1;             // TOTK_STAGED_WB (mirror_mode): 1 fault (GPU-owned pages), 0 fence (copy-back)
 static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel);
 static void staged_forget(PoolRec *r);   // vk_pool_fini: a staged pool's owned pages open without a fetch
+static int fetch_test;                   // TOTK_STAGED_FETCH_TEST (fetch exerciser below)
+static void ft_frame(uint64_t frame);
 static void staged_frame_log(uint64_t frame);   // vk_mem_census: what the staged pools did in the frame
 // A staged pool that has not been imported: lazy stays 1 until staged_import imports it after all, and lazy_import
 // stores 0 with release order only once r->buf is complete, so a reader that sees 0 here may read r->buf.
@@ -423,6 +429,11 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     free(r->kept);
     free(r->own);
     free(r->cpu_read);
+    if (r->t_page)
+        for (uint64_t i = 0; i <= (r->import_hi - r->import_lo) >> 12; i++) free(r->t_page[i]);
+    free(r->t_page);
+    free(r->t_rec);
+    free(r->t_ref);
     free(r);
 }
 
@@ -920,6 +931,7 @@ void vk_mem_census(uint64_t frame) {
     static int report_every = -1;   // TOTK_MEM_REPORT, read on the first present
     if (report_every < 0) report_every = cfg_int("TOTK_MEM_REPORT");
     __atomic_store_n(&mem_probe_frame, frame, __ATOMIC_RELAXED);
+    if (fetch_test) ft_frame(frame);   // TOTK_STAGED_FETCH_TEST
     lazy_frame_log(frame);
     staged_frame_log(frame);
     if (report_every > 0 && frame % (uint64_t)report_every == 0) {
@@ -1991,9 +2003,16 @@ static void mirror_mode(int discrete, uint32_t vendor) {
                    ms, staged_fault ? "fault" : "fence");
 #ifdef _WIN32
             if (staged_fault) mem_guard_hook(staged_fetch);
+            else mem_probe_on();   // TOTK_STAGED_READ_PROBE: staged_wb_done protects the pages it wrote (memory.c read probe)
 #else
             if (staged_fault) rt_log("mem: TOTK_STAGED_WB=fault needs page faults this platform does not route: fence"), staged_fault = 0;
 #endif
+            const char *ftv = cfg_get("TOTK_STAGED_FETCH_TEST");
+            fetch_test = staged_fault && ftv && *ftv ? atoi(ftv) : 0;
+            if (fetch_test < 0) fetch_test = 0;
+            if (fetch_test)
+                rt_log("mem: staged fetch test: %d GPU-owned pages a frame are touched and their fetches checked against "
+                       "a reference copy (TOTK_STAGED_FETCH_TEST)", fetch_test);
         }
     }
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
@@ -2416,6 +2435,10 @@ typedef struct StJob {
     int n, cap;
     StRange *o;                         // TOTK_STAGED_WB=fault: the GPU writes that stay in the mirror (own_take)
     int no, co;
+    uint32_t sub;                       // msub of the submission
+    VkBuffer tbuf;                      // TOTK_STAGED_FETCH_TEST: the reference copy of the o ranges (staged_ref_record)
+    VmaAllocation talloc;
+    const uint8_t *tmap;
     uint64_t bytes;
     VkBuffer buf;
     VmaAllocation alloc;
@@ -2570,14 +2593,19 @@ static volatile int64_t own_cb_opened, own_cb_kept, own_cfetch;
 static volatile int64_t own_take_part[5];
 static volatile int64_t st_wbdone_max;   // since the last staged line: the longest staged_wb_done (ns), a fence's delay
 static _Thread_local int st_in_wb;   // staged_wb_done runs on this thread now: staged_fetch counts a fetch it causes
+static volatile int64_t ft_touch[4], ft_cmp_bytes, ft_cmp_pieces, ft_bad, ft_skip;
+static PlatMutex ft_lock = PLAT_MUTEX_INIT;   // TOTK_STAGED_FETCH_TEST: a touch from its pick to its access (staged_forget)
+static void ft_ref_take(PoolRec *r, const StRange *add, int n, const uint8_t *tmap, uint32_t sub);
+static void ft_check(PoolRec *r, const struct KeptRange *cut, const VkBufferCopy *reg, int n, const uint8_t *map,
+                     const uint32_t *rec0, uint64_t w0off);
 static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; } fc;   // own_lock: staged_fetch's copy
 typedef struct { uint64_t frame, addr, rip, ns; int write, guest, kernel, pages; } OwnRec;
 static OwnRec own_rec[OWN_LOG];
 static volatile int32_t own_nrec, own_logged;
 
 // With TOTK_MIRROR_STAGED=all there are hundreds to thousands of staged mirrors, and few of them own any byte: the
-// lookups below are binary searches of st_pools, and the loops that want the owned bytes (st_blk_update, own_log) walk
-// st_own, not every staged pool.
+// lookups below are binary searches of st_pools, and the loops that want the owned bytes (st_blk_update, the fetch
+// exerciser, own_log) walk st_own, not every staged pool.
 // own_lock held: the index of the first staged pool whose import_lo is above a.
 static int st_upper(uint64_t a) {
     int lo = 0, hi = nst_pools;
@@ -2701,7 +2729,7 @@ static void own_settle_failed(PoolRec *r, const uint64_t *pg, int n);
 // pool_lock exclusively, and every resolve then waits behind it (the reloads of the Hilltop route showed waits of
 // 122-172 ms). The record stays alive without it: a staged mirror's record is freed by mirror_retire, on this thread;
 // a pool released meanwhile has left st_pools (staged_forget, under own_lock), and then nothing is taken.
-static void own_take(PoolRec *r, const StRange *add, int n) {
+static void own_take(PoolRec *r, const StRange *add, int n, const uint8_t *tmap, uint32_t sub) {
     static uint64_t *pg, *fl;   // completion thread: pages to protect, pages whose protection failed
     static int npg, cpg, cfl;
     int nfl = 0;
@@ -2712,6 +2740,7 @@ static void own_take(PoolRec *r, const StRange *add, int n) {
         plat_mutex_unlock(&own_lock);
         return;
     }
+    if (tmap && r->t_page) ft_ref_take(r, add, n, tmap, sub);   // TOTK_STAGED_FETCH_TEST
     own_merge(r, add, n);
     for (int i = 0; i < n; i++)
         for (uint64_t p = (r->import_lo + add[i].off) & ~0xfffull; p < r->import_lo + add[i].off + add[i].size; p += 0x1000) {
@@ -2915,9 +2944,14 @@ static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel) {
         }
     }
     if (total) {
+        uint32_t rec0[OWN_BLOCK >> 12];   // TOTK_STAGED_FETCH_TEST: the pages' last recorded writes before the copy
+        if (r->t_rec)
+            for (uint64_t p = w0; p < w1; p += 0x1000)
+                rec0[(p - w0) >> 12] = __atomic_load_n(&r->t_rec[(p - r->import_lo) >> 12], __ATOMIC_RELAXED);
         VkBuffer sb;
         VmaAllocation sa;
         const uint8_t *map = own_gpu_read(r, reg, n, total, &sb, &sa, page);
+        if (r->t_rec) ft_check(r, cut, reg, n, map, rec0, w0 - r->import_lo);
         for (int i = 0; i < n; i++)   // the claimed pages are read-write
             memcpy((void *)(uintptr_t)(r->import_lo + cut[i].lo), map + reg[i].dstOffset, cut[i].hi - cut[i].lo);
         vmaDestroyBuffer(vk_ctx()->vma, sb, sa);
@@ -2930,7 +2964,7 @@ static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel) {
     // The fetched bytes are uploaded into the mirror once more at the page's next sync: the copy into guest memory sets
     // the page's write-watch bit. Left so: the reset that would avoid it cannot tell that copy from a write by another
     // thread to the page, which is read-write while claimed, and a missed write would leave the mirror stale; the cost
-    // is one page upload per fetched page, and fetches are rare.
+    // is one page upload per fetched page, and fetches are rare (none on the Hilltop route without the exerciser).
     int pages = 0;
     for (uint64_t p = w0; p < w1; p += 0x1000)
         if (mine >> ((p - w0) >> 12) & 1) {
@@ -2961,6 +2995,7 @@ static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel) {
 // The first 32 get a line with what they dropped.
 static void staged_forget(PoolRec *r) {
     static volatile int32_t logged;
+    if (fetch_test) plat_mutex_lock(&ft_lock);   // no touch of the exerciser is between its pick and its access
     uint64_t t0 = qpc(), bytes = 0;
     plat_mutex_lock(&own_lock);
     int at = st_upper(r->import_lo) - 1;   // st_pools stays sorted: staged_fetch's binary search
@@ -2974,6 +3009,7 @@ static void staged_forget(PoolRec *r) {
     own_listed(r);
     __atomic_add_fetch(&own_gen, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&own_lock);
+    if (fetch_test) plat_mutex_unlock(&ft_lock);
     uint64_t frame = __atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED), n = r->import_hi - r->import_lo;
     plat_add64(&own_drop_bytes, (int64_t)bytes);
     if (bytes) ST_ADD(drop_n, 1), ST_ADD(drop_bytes, bytes);
@@ -2993,6 +3029,7 @@ static void staged_forget(PoolRec *r) {
 static void staged_own_shutdown(VkCtx *c) {
     static struct { uint64_t lo, hi; } *rg;
     static int crg;
+    if (fetch_test) plat_mutex_lock(&ft_lock);
     plat_mutex_lock(&own_lock);
     int n = nst_pools;
     while (crg < n) grow((void **)&rg, &crg, sizeof *rg);
@@ -3015,6 +3052,7 @@ static void staged_own_shutdown(VkCtx *c) {
         memset(&fc, 0, sizeof fc);
     }
     plat_mutex_unlock(&own_lock);
+    if (fetch_test) plat_mutex_unlock(&ft_lock);
 }
 
 // With the staged line: the owned pages and fetches since the last one, and the first OWN_LOG fetches.
@@ -3077,6 +3115,197 @@ static void own_log(uint64_t frame, double f) {
                x->ns / 1e6);
     }
     own_logged = nr;
+}
+
+// ---- fetch exerciser (TOTK_STAGED_FETCH_TEST=<pages per frame>, off by default; a test of TOTK_STAGED_WB=fault)
+// On Hilltop nothing reads a staged pool's GPU-owned pages, so staged_fetch never runs on its own. This mode touches
+// that many randomly chosen owned pages a frame through the real fault path: half from a thread of its own (a runtime
+// thread) and half from the present path (vk_mem_census, on the thread that presented, which is the game's own thread
+// when the replay is synchronous, the default; a game thread inside the runtime, not lifted code), alternating a read
+// and a write (a locked OR of 0 into one byte: a write access that leaves the byte as it was, whatever another thread
+// writes there meanwhile). Every 8th frame its thread also hands the owned page's 64 KiB block to a kernel path,
+// mem_thaw and mem_touch in turn, which fetch the owned pages there first. ft_lock holds a touch from its pick to its
+// access, so that the pool cannot be released in between (staged_forget takes it).
+// Every fetch it causes is checked: vk_mem_mirror_end also copies the submission's owned ranges into a readback buffer
+// (staged_ref_record), own_take keeps those bytes per page as a reference, apart from guest memory, with the
+// submission that wrote them, and staged_fetch compares the bytes it fetched with the reference on every page that no
+// write recorded since that submission can have changed (the page's last recorded write, r->t_rec, stamped by
+// vk_mem_gpu_wrote and vk_mem_gpu_kept, is the reference's submission, before and after the copy). Every 600 frames
+// the pages' CPU-read marks are cleared, so fetched pages go back to being owned and the switch to the fence copy-back
+// repeats.
+static uint64_t ft_rng = 0x9e3779b97f4a7c15ull;   // own_lock
+
+static uint64_t ft_next(void) {
+    ft_rng ^= ft_rng << 13, ft_rng ^= ft_rng >> 7, ft_rng ^= ft_rng << 17;
+    return ft_rng;
+}
+
+// ft_lock held: a byte of a randomly chosen owned page (0: none), and the pool's bounds.
+static uint64_t ft_pick(uint64_t *lo, uint64_t *hi) {
+    uint64_t a = 0;
+    plat_mutex_lock(&own_lock);
+    for (int tries = 0; tries < 8 && !a && nst_own; tries++) {   // st_own: the pools that own a byte
+        PoolRec *r = st_own[ft_next() % (uint64_t)nst_own];
+        if (!r->nown) continue;
+        const struct KeptRange *k = &r->own[ft_next() % (uint64_t)r->nown];
+        uint64_t x = r->import_lo + k->lo + ft_next() % (k->hi - k->lo);
+        if (mem_guard_state(x) == 1) a = x, *lo = r->import_lo, *hi = r->import_hi;
+    }
+    plat_mutex_unlock(&own_lock);
+    return a;
+}
+
+static void ft_access(uint64_t a, int write) {
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)a;
+    if (!write) (void)*p;
+#if defined(__x86_64__)
+    // Not an atomic fetch-or of 0: compilers turn that into a fenced load, which would fault as a read.
+    else __asm__ volatile("lock orb $0, %0" : "+m"(*p) : : "memory");
+#else
+    else __atomic_fetch_add(p, 0, __ATOMIC_SEQ_CST);
+#endif
+}
+
+// kind 0 runtime thread, 1 present path, each on one thread; reads and writes in turn, also across calls (at one
+// touch a call, the parity of the loop index alone would only ever read).
+static void ft_touch_pages(int n, int kind) {
+    static unsigned turn[2];
+    for (int i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        plat_mutex_lock(&ft_lock);
+        uint64_t a = ft_pick(&lo, &hi);
+        if (a) ft_access(a, turn[kind]++ & 1), plat_inc64(&ft_touch[kind]);
+        plat_mutex_unlock(&ft_lock);
+        if (!a) return;
+    }
+}
+
+static void ft_main(void *arg) {
+    (void)arg;
+    uint64_t seen = 0, kernel = 0;
+    for (;;) {
+        uint64_t f = __atomic_load_n(&mem_probe_frame, __ATOMIC_RELAXED);
+        if (f == seen) {
+            plat_sleep_ms(1);
+            continue;
+        }
+        seen = f;
+        ft_touch_pages((fetch_test + 1) / 2, 0);
+        if (f % 8 == 0) {   // a kernel path: mem_thaw and mem_touch settle the owned pages of their range first
+            uint64_t lo, hi;
+            plat_mutex_lock(&ft_lock);
+            uint64_t a = ft_pick(&lo, &hi);
+            if (a) {
+                uint64_t b0 = a & ~(OWN_BLOCK - 1), b1 = b0 + OWN_BLOCK;
+                if (b0 < lo) b0 = lo;
+                if (b1 > hi) b1 = hi;
+                if (kernel++ & 1) mem_touch(b0, b1 - b0), plat_inc64(&ft_touch[3]);
+                else mem_thaw(b0, b1 - b0), plat_inc64(&ft_touch[2]);
+            }
+            plat_mutex_unlock(&ft_lock);
+        }
+    }
+}
+
+// vk_mem_census, every present.
+static void ft_frame(uint64_t frame) {
+    static int started;
+    if (!fetch_test || !__atomic_load_n(&nst_pools, __ATOMIC_RELAXED)) return;
+    if (!started) started = plat_thread_spawn(ft_main, NULL, "staged fetch test", 0);
+    ft_touch_pages(fetch_test / 2, 1);
+    if (frame % 600 == 0) {   // the fetched pages become owned again at their next GPU write
+        plat_mutex_lock(&own_lock);
+        for (int i = 0; i < nst_pools; i++)
+            memset(st_pools[i]->cpu_read, 0, (size_t)((st_pools[i]->import_hi - st_pools[i]->import_lo) >> 12) + 1);
+        plat_mutex_unlock(&own_lock);
+    }
+}
+
+// Record time (vk_mem_gpu_wrote, vk_mem_gpu_kept): the pages of a write into a staged mirror carry the submission.
+static void ft_stamp(PoolRec *r, uint64_t off, uint64_t size) {
+    if (!r->t_rec || !size) return;
+    uint32_t s = __atomic_load_n(&msub, __ATOMIC_RELAXED);
+    for (uint64_t p = off >> 12; p <= (off + size - 1) >> 12; p++) __atomic_store_n(&r->t_rec[p], s, __ATOMIC_RELAXED);
+}
+
+// vk_mem_mirror_end, after staged_split_own: the job's owned ranges also go mirror -> a readback buffer of the job (the
+// reference); their roff is where. The caller's barriers order and expose the copies as for staged_wb_record.
+static int staged_ref_record(VkCommandBuffer cb) {
+    static VkBufferCopy *reg;
+    static int creg;
+    StJob *j = st_cur;
+    uint64_t total = 0;
+    for (int i = 0; i < j->no; i++) j->o[i].roff = total, total += j->o[i].size;
+    if (!total) return 0;
+    j->tmap = vk_staging(total, &j->tbuf, &j->talloc);
+    int rec = 0;
+    for (int i = 0; i < j->no;) {
+        PoolRec *r = j->o[i].r;
+        int k = 0;
+        for (; i < j->no && j->o[i].r == r; i++) {
+            if (k == creg) grow((void **)&reg, &creg, sizeof *reg);
+            reg[k++] = (VkBufferCopy){j->o[i].off, j->o[i].roff, j->o[i].size};
+        }
+        vkCmdCopyBuffer(cb, r->mbuf, j->tbuf, (uint32_t)k, reg);
+        rec++;
+    }
+    return rec;
+}
+
+// own_take, own_lock held: the reference bytes of the job's ranges add[0..n) of pool r, from the job's readback.
+static void ft_ref_take(PoolRec *r, const StRange *add, int n, const uint8_t *tmap, uint32_t sub) {
+    for (int i = 0; i < n; i++)
+        for (uint64_t x = add[i].off; x < add[i].off + add[i].size;) {
+            uint64_t pg = x >> 12, e = (pg + 1) << 12;
+            if (e > add[i].off + add[i].size) e = add[i].off + add[i].size;
+            if (!r->t_page[pg] && !(r->t_page[pg] = calloc(1, 0x1000))) rt_fatal("vk: out of memory");
+            memcpy(r->t_page[pg] + (x & 0xfff), tmap + add[i].roff + (x - add[i].off), e - x);
+            r->t_ref[pg] = sub;
+            x = e;
+        }
+}
+
+// staged_fetch, own_lock held, after the copy: the fetched pieces against the reference, on the pages whose last
+// recorded write is the reference's and was so before the copy too (rec0).
+static void ft_check(PoolRec *r, const struct KeptRange *cut, const VkBufferCopy *reg, int n, const uint8_t *map,
+                     const uint32_t *rec0, uint64_t w0off) {
+    static int32_t logged;
+    for (int i = 0; i < n; i++)
+        for (uint64_t x = cut[i].lo; x < cut[i].hi;) {
+            uint64_t pg = x >> 12, e = (pg + 1) << 12;
+            if (e > cut[i].hi) e = cut[i].hi;
+            uint32_t now = __atomic_load_n(&r->t_rec[pg], __ATOMIC_RELAXED), was = rec0[(x - w0off) >> 12];
+            if (now != was || now != r->t_ref[pg] || !r->t_page[pg]) {
+                plat_add64(&ft_skip, (int64_t)(e - x));
+            } else {
+                const uint8_t *got = map + reg[i].dstOffset + (x - cut[i].lo), *want = r->t_page[pg] + (x & 0xfff);
+                plat_add64(&ft_cmp_bytes, (int64_t)(e - x));
+                plat_inc64(&ft_cmp_pieces);
+                if (memcmp(got, want, e - x)) {
+                    plat_inc64(&ft_bad);
+                    if (plat_inc32(&logged) <= 16) {
+                        uint64_t k = 0;
+                        while (k < e - x && got[k] == want[k]) k++;
+                        rt_log("mem: staged fetch test mismatch: pool %#llx offset %#llx (%llu bytes, first at +%llu: fetched "
+                               "%02x, reference %02x of submission %u)", (unsigned long long)r->lo,
+                               (unsigned long long)(r->import_lo + x - r->lo), (unsigned long long)(e - x),
+                               (unsigned long long)k, got[k], want[k], r->t_ref[pg]);
+                    }
+                }
+            }
+            x = e;
+        }
+}
+
+static void ft_log(uint64_t frame) {
+    if (!fetch_test) return;
+    rt_log("mem: staged fetch test frame %llu: since the last line: touches runtime thread %lld, present path %lld, kernel "
+           "path mem_thaw %lld, mem_touch %lld; fetched bytes compared %lld in %lld pieces, mismatches %lld, not "
+           "comparable %lld bytes", (unsigned long long)frame,
+           (long long)plat_xchg64(&ft_touch[0], 0), (long long)plat_xchg64(&ft_touch[1], 0),
+           (long long)plat_xchg64(&ft_touch[2], 0), (long long)plat_xchg64(&ft_touch[3], 0),
+           (long long)plat_xchg64(&ft_cmp_bytes, 0), (long long)plat_xchg64(&ft_cmp_pieces, 0),
+           (long long)plat_xchg64(&ft_bad, 0), (long long)plat_xchg64(&ft_skip, 0));
 }
 
 // The span's pool resolved without a buffer (staged_pending) and the mirror cannot serve this use: import it after
@@ -3339,7 +3568,7 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
         VmaAllocation sa = NULL;
         uint8_t *map = NULL;
         uint64_t used = 0, room = 0, left = total;
-        int probe = staged_fault;   // owned pages: copied without opening them
+        int probe = staged_fault || mem_probe_on() > 0;   // owned or probed pages: copied without opening them
         for (int i = 0, zi = 0; i < ncut;) {
             PoolRec *r = cut[i].r;
             while (zi < nzl && (uintptr_t)zl[zi] < (uintptr_t)r) zi++;
@@ -3541,6 +3770,7 @@ static void staged_wb_done(void *arg) {
     uint64_t t_done = qpc();
     st_in_wb = 1;
     if (j->no) {   // TOTK_STAGED_WB=fault: the writes that stay in the mirror
+        if (j->tbuf) vmaInvalidateAllocation(vk_ctx()->vma, j->talloc, 0, VK_WHOLE_SIZE);   // TOTK_STAGED_FETCH_TEST
         for (int i = 0; i < j->no;) {
             PoolRec *r = j->o[i].r;
             pool_lock_shared();   // only for the check: own_take runs without it
@@ -3549,7 +3779,7 @@ static void staged_wb_done(void *arg) {
             plat_mutex_unlock_shared(&pool_lock);
             int k = i;
             for (; k < j->no && j->o[k].r == r; k++) {}
-            if (live) own_take(r, j->o + i, k - i);
+            if (live) own_take(r, j->o + i, k - i, j->tmap, j->sub);
             i = k;
         }
     }
@@ -3572,9 +3802,12 @@ static void staged_wb_done(void *arg) {
                     uint64_t e2 = (base + j->w[y].off + j->w[y].size + 0xfff) & ~0xfffull;
                     if (e2 > b) b = e2;
                 }
+                mem_probe_release(a, b - a);   // the read probe's pages from an earlier write-back, uncounted
                 mem_thaw(a, b - a);   // a frozen region is read-only
-                for (; x < y; x++)
-                    memcpy((void *)(uintptr_t)(base + j->w[x].off), j->map + j->w[x].roff, j->w[x].size);
+                for (int z = x; z < y; z++)
+                    memcpy((void *)(uintptr_t)(base + j->w[z].off), j->map + j->w[z].roff, j->w[z].size);
+                // TOTK_STAGED_READ_PROBE: from here on the first CPU access to these pages is counted (memory.c).
+                for (; x < y; x++) mem_probe_protect(base + j->w[x].off, j->w[x].size);
             }
             i = k;
         }
@@ -3588,6 +3821,7 @@ static void staged_wb_done(void *arg) {
     if (j->ended && (j->n || j->no)) st_blk_dirty = 1;
     plat_mutex_unlock(&st_lock);
     if (j->buf) vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
+    if (j->tbuf) vmaDestroyBuffer(vk_ctx()->vma, j->tbuf, j->talloc);
     free(j->w);
     free(j->o);
     free(j);
@@ -3607,6 +3841,7 @@ static void staged_shutdown(VkCtx *c) {
         StJob *j = st_jobs;
         st_jobs = j->next;
         if (j->buf) vmaDestroyBuffer(c->vma, j->buf, j->alloc);
+        if (j->tbuf) vmaDestroyBuffer(c->vma, j->tbuf, j->talloc);
         free(j->w);
         free(j->o);
         free(j);
@@ -3689,6 +3924,12 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
     if (staged && staged_fault) {   // staged_fetch finds the pool by address
         r->cpu_read = calloc((size_t)(n >> 12) + 1, 1);
         if (!r->cpu_read) rt_fatal("vk: out of memory");
+        if (fetch_test) {
+            r->t_rec = calloc((size_t)(n >> 12) + 1, sizeof *r->t_rec);
+            r->t_ref = calloc((size_t)(n >> 12) + 1, sizeof *r->t_ref);
+            r->t_page = calloc((size_t)(n >> 12) + 1, sizeof *r->t_page);
+            if (!r->t_rec || !r->t_ref || !r->t_page) rt_fatal("vk: out of memory");
+        }
         plat_mutex_lock(&own_lock);
         if (nst_pools == cst_pools) grow((void **)&st_pools, &cst_pools, sizeof *st_pools);
         int at = st_upper(r->import_lo);   // sorted by address: staged_fetch's lookup is a binary search
@@ -3962,6 +4203,7 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
     vk_spec_event();   // a bind the GPU writes through: never the helper thread's
     PoolRec *r = sp->pool;
     if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return;
+    if (fetch_test) ft_stamp(r, sp->offset, size);   // TOTK_STAGED_FETCH_TEST
     static _Thread_local struct { const PoolRec *r; uint64_t off, size; uint32_t sub, tag; } seen[128];
     __typeof__(seen[0]) *k = &seen[((uintptr_t)r >> 6 ^ sp->offset >> 4) & 127];
     uint32_t sub = __atomic_load_n(&msub, __ATOMIC_RELAXED);
@@ -3990,6 +4232,7 @@ int vk_mem_gpu_kept(const VkMemSpan *sp, uint64_t size) {
     vk_spec_event();
     PoolRec *r = sp->pool;
     if (!r || ms_get(r) != MS_ON || sp->buffer != r->mbuf || !size) return 0;
+    if (fetch_test) ft_stamp(r, sp->offset, size);   // TOTK_STAGED_FETCH_TEST: a kept write changes the mirror too
     const uint64_t page = 1ull << GEN_PAGE_SHIFT, a = r->import_lo + sp->offset, b = a + size;
     uint64_t pa = (a + page - 1) & ~(page - 1), pb = b & ~(page - 1);
     if (pa >= pb) return vk_mem_gpu_wrote(sp, size), 0;   // no whole page
@@ -4150,6 +4393,7 @@ void vk_mem_mirror_begin(void) {
     }
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
+    if (st_cur) st_cur->sub = msub;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
@@ -4569,6 +4813,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         }
         if (k) rec += copy_ranges(cb, wbl, k, 0, &mrep.wb_bytes, &mrep.wb_copies, fence);
         if (nstw && staged_fault) staged_split_own();   // most stay in the mirror; pages the CPU read go back
+        if (fetch_test && st_cur && st_cur->no) rec += staged_ref_record(cb);   // TOTK_STAGED_FETCH_TEST
         if (nstw) rec += staged_wb_record(cb);
         rec += 2;
         mbarrier(cb, stage, writes,
@@ -4690,7 +4935,8 @@ static void mirror_log(uint64_t frame) {
                s->small_ns / 1e6, (long long)s->big_n, n_staged_imports, imp, (long long)s->rel_n, s->rel_ns / 1e6,
                (long long)s->rel_never, (long long)s->rel_cpu, (long long)s->rel_mirror, (long long)s->rel_imported,
                own_drop_bytes / M);
-        if (staged_fault) own_log(frame, f);
+        mem_probe_log(frame, 0);
+        if (staged_fault) own_log(frame, f), ft_log(frame);
     }
 
 }

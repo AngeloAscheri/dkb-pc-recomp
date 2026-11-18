@@ -184,8 +184,14 @@ int mem_guest_readable(uint64_t a, uint64_t n);            // 1 a read of [a, a+
                                                            // own map, no system call
 void mem_touch(uint64_t a, uint64_t n);                    // commits the lazy guest heap (TOTK_HEAP_LAZY) over [a, a+n)
                                                            // before a kernel or driver access; no-op otherwise
-// Guarded pages (memory.c, Windows only): mem_probe_copy copies guest memory without settling the guarded pages there.
+// Read probe (memory.c, TOTK_STAGED_READ_PROBE, Windows only): mem_probe_on reads the switch once; mem_probe_protect
+// makes the pages of a range PAGE_NOACCESS until their first access, which is counted; mem_probe_release lifts it
+// uncounted; mem_probe_copy copies guest memory without lifting it; mem_probe_log logs the counts (final: the totals).
+int mem_probe_on(void);
+void mem_probe_protect(uint64_t a, uint64_t n);
+void mem_probe_release(uint64_t a, uint64_t n);
 void mem_probe_copy(void *dst, uint64_t src, uint64_t n);
+void mem_probe_log(uint64_t frame, int final);
 extern volatile uint64_t mem_probe_frame;                  // the present being made (vk_mem_census)
 // GPU-owned pages (memory.c, vk_memory.c staged mirror with TOTK_STAGED_WB=fault, Windows only): mem_guard_own makes a
 // page PAGE_NOACCESS (1 when it changed the protection); its first access, or a kernel-path release (mem_thaw,

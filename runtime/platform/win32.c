@@ -743,8 +743,8 @@ static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t a = (uint64_t)er->ExceptionInformation[1];
-    // memory.c's guarded PAGE_NOACCESS pages (probe_fault), before anything else: the lazy-heap path below lets a read
-    // on a committed page that is not readable go to the crash handler.
+    // memory.c's guarded PAGE_NOACCESS pages (probe_fault: GPU-owned pages and the read probe's), before anything else:
+    // the lazy-heap path below lets a read on a committed page that is not readable go to the crash handler.
     int (*pf)(uint64_t, int, uint64_t) = __atomic_load_n(&probe_fault, __ATOMIC_ACQUIRE);
     if (pf && er->ExceptionInformation[0] <= 1 && pf(a, (int)er->ExceptionInformation[0], (uint64_t)ep->ContextRecord->Rip))
         return EXCEPTION_CONTINUE_EXECUTION;
