@@ -106,6 +106,11 @@ static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by m
 // holes is, a query per read-only run, from the bottom up. Read at the first freeze (frz_lock), before which nothing
 // is thawed.
 static int frz_whole = -1;
+// Regions that hold sealed pages (vk_memory.c, the lazy write-back) are never frozen: a freeze would make a sealed page
+// readable. Set under frz_lock by mem_freeze_exclude and never cleared. thaw_hook is the back end's: it unseals the
+// pages of a range before a kernel write into it (a file read), which fails on a sealed page as on a read-only one.
+static volatile uint8_t frz_never[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+static void (*thaw_hook)(uint64_t a, uint64_t n);
 
 static int heap_lazy(void);
 
@@ -182,7 +187,32 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     plat_op_end(op, 0);
 }
 
+static int never_frozen(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return 0;
+    uint64_t r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= r1; r++)
+        if (__atomic_load_n(&frz_never[r], __ATOMIC_ACQUIRE)) return 1;
+    return 0;
+}
+
+void mem_freeze_exclude(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return;
+    uint64_t last = a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1;
+    uint64_t r0 = a >> FRZ_SHIFT, r1 = last >> FRZ_SHIFT, r = r0;
+    while (r <= r1 && __atomic_load_n(&frz_never[r], __ATOMIC_ACQUIRE)) r++;
+    if (r > r1) return;   // the usual case: excluded since an earlier frame
+    frz_lock_take();
+    for (r = r0; r <= r1; r++) {
+        thaw_locked(r, 3, 0);
+        __atomic_store_n(&frz_never[r], 1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&frz_lock);
+}
+
+void mem_thaw_hook(void (*fn)(uint64_t a, uint64_t n)) { thaw_hook = fn; }
+
 void mem_thaw(uint64_t a, uint64_t n) {
+    if (thaw_hook && never_frozen(a, n)) thaw_hook(a, n);   // before frz_lock: the hook takes its own lock only
     frz_lock_take();   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
@@ -222,6 +252,7 @@ int mem_freeze(uint64_t a) {
         if (!frz_whole) rt_log("mem: frozen regions are thawed with a query per read-only run (TOTK_FRZ_WHOLE=0)");
     }
     if (frz[r]) ok = 1;
+    else if (frz_never[r]) ok = 0;
     else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if ((how = freeze_locked(r))) {
         __atomic_store_n(&frz[r], (uint8_t)how, __ATOMIC_RELEASE);
@@ -269,6 +300,7 @@ static void commit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
+    if (thaw_hook && never_frozen(a, n)) thaw_hook(a, n);   // sealed pages become ordinary ones before they go
     frz_lock_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);

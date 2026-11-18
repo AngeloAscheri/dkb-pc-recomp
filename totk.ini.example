@@ -65,6 +65,9 @@
 # imported into Vulkan), mirror (pools used as buffers get a copy in video memory) or verify (mirror plus a check of
 # every copy; slow).
 # memory = auto
+# Linux: copy a shader's storage write back to the game's memory only when the game's code touches it (0 or 1;
+# default 0).
+# wb_lazy = 0
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
 # Drop or release cached textures when VRAM usage rises above this percentage (0 to 100; 0 = off). Default: 90.

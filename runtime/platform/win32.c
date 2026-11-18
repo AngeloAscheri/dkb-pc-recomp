@@ -661,6 +661,9 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
 }
 
 void plat_mem_prewrite(uint64_t addr, uint64_t n) { (void)addr, (void)n; }   // a watched write costs nothing extra here
+// Not on this platform: the lazy write-back stays off.
+int plat_mem_seal(uint64_t addr, uint64_t n, int on) { (void)addr, (void)n, (void)on; return 0; }
+int plat_mem_access_hook(int (*fn)(uint64_t addr)) { (void)fn; return 0; }
 
 // Adapted from LAS Recomp runtime/platform/windows.c:40-63 @ da35b83 (MIT, Copyright (c) 2026 Peiikai): GetWriteWatch
 // with the reset flag.
