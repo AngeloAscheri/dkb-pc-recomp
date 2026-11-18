@@ -426,6 +426,18 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.base / 'versions').iterdir() if p.is_dir()), ['v0.4.1', 'v0.5.0'])
         self.assertFalse(update.confirm_start(self.base, 'v0.5.0'))   # the next start of the same version changes nothing
 
+    def test_switch_clears_cut_off_downloads(self):
+        downloads = self.base / 'downloads'
+        downloads.mkdir()
+        (downloads / ('a' * 64 + '.zip.part')).write_bytes(b'half of an older release')   # its window was closed
+        (downloads / ('b' * 64 + '.zip')).write_bytes(b'checked, never unpacked')
+        busy = downloads / ('c' * 64 + '.zip.part')
+        with open(busy, 'wb'):   # another window still writing: Windows refuses the delete, which is no error
+            self.assertTrue(update.confirm_start(self.base, 'v0.5.0'))
+        left = sorted(p.name for p in downloads.iterdir())
+        self.assertEqual(left, [busy.name] if os.name == 'nt' else [])
+        self.assertTrue((self.base / 'versions' / 'v0.4.1').is_dir())
+
     def spawn(self, on_poll, seen):
         def spawn(cmd, cwd):
             seen.append((cmd, cwd))

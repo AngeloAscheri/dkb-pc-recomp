@@ -502,16 +502,20 @@ def confirm_start(base, tag):
 
 
 def prune(base):
-    """Remove every version folder but current and previous, and leftovers of a stopped unpack. Never fails."""
+    """Remove every version folder but current and previous, leftovers of a stopped unpack, and every file left in
+    downloads/ (a download cut off by a closed window or a stop: an update deletes its zip once unpacked, so by the
+    time a new version confirms its start nothing there is still wanted). A file in use stays. Never fails."""
     versions = Path(base) / 'versions'
     keep = {read_pointer(base, 'current'), read_pointer(base, 'previous')} - {None}
-    try:
-        entries = list(versions.iterdir())
-    except OSError:
-        return
-    for p in entries:
-        if p.is_dir() and p.name not in keep:
-            remove_tree(p)
+    for folder, wanted in ((versions, lambda p: p.is_dir() and p.name not in keep),
+                           (Path(base) / 'downloads', lambda p: p.is_file() and not p.is_symlink())):
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if wanted(p):
+                remove_tree(p)
 
 
 def start_version(base, tag, launcher, extra=(), spawn=subprocess.Popen, timeout=60, sleep=time.sleep):
