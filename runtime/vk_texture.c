@@ -781,6 +781,7 @@ int vk_texture_astc_bc3(const VkTexImage *img) {
     Tex *e = (Tex *)img;   // pub is the first member
     int ok = 1;   // an image that is not a BC1 one to make over is already what the caller wants
     if (e->f.astc_bc == 2) {   // the one case with an image to make over
+        hold_barrier();   // the old image is retired and the entry swapped below, while held slices may still read it
         VkCommandBuffer cb = vk_upload_begin();
         ok = vk_astc_bc3(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, &e->alloc, &e->f.vk, &e->f.astc_bc,
                          &e->bc_settled);
