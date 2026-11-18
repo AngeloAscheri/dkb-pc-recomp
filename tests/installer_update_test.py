@@ -484,28 +484,56 @@ class LauncherTest(unittest.TestCase):
     def tearDown(self):
         self.work.cleanup()
 
-    def test_replaced_by_rename(self):
-        self.assertTrue(update.replace_launcher(self.launcher, self.new))
+    def names(self):
+        return sorted(p.name for p in self.dir.iterdir())
+
+    def failing_replace(self, *fail):
+        """os.replace that raises PermissionError on the calls numbered in fail (1 is the first)."""
+        real, calls = os.replace, []
+
+        def replace(a, b):
+            calls.append((Path(a).name, Path(b).name))
+            if len(calls) in fail:
+                raise PermissionError('denied')
+            return real(a, b)
+        return patch.object(update.os, 'replace', side_effect=replace), calls
+
+    def test_replaced_in_one_rename_when_not_running(self):
+        """launcher.c has exited when the window replaces it: the copy takes its name at once, with no moment in which
+        no DKB-Launcher.exe exists."""
+        patcher, calls = self.failing_replace()
+        with patcher:
+            self.assertTrue(update.replace_launcher(self.launcher, self.new))
+        self.assertEqual(calls, [('DKB-Launcher.exe.new', 'DKB-Launcher.exe')])
+        self.assertEqual(self.launcher.read_bytes(), b'MZ new')
+        self.assertEqual(self.names(), ['DKB-Launcher.exe', 'new-DKB-Setup.exe'])
+        self.assertFalse(update.replace_launcher(self.launcher, self.new))   # already the same
+
+    def test_running_launcher_is_renamed_away(self):
+        patcher, calls = self.failing_replace(1)   # a running exe cannot be replaced, only renamed
+        with patcher:
+            self.assertTrue(update.replace_launcher(self.launcher, self.new))
+        self.assertEqual(calls[1:], [('DKB-Launcher.exe', 'DKB-Launcher.exe.old'),
+                                     ('DKB-Launcher.exe.new', 'DKB-Launcher.exe')])
         self.assertEqual(self.launcher.read_bytes(), b'MZ new')
         self.assertEqual((self.dir / 'DKB-Launcher.exe.old').read_bytes(), b'MZ old')
         self.assertFalse((self.dir / 'DKB-Launcher.exe.new').exists())
-        self.assertFalse(update.replace_launcher(self.launcher, self.new))   # already the same
         update.clean_old_launcher(self.launcher)
         self.assertFalse((self.dir / 'DKB-Launcher.exe.old').exists())
 
     def test_failed_rename_puts_the_old_launcher_back(self):
-        real = os.replace
-        calls = []
-
-        def replace(a, b):
-            calls.append((a, b))
-            if len(calls) == 2:
-                raise PermissionError('denied')
-            return real(a, b)
-        with patch.object(update.os, 'replace', side_effect=replace), self.assertRaises(PermissionError):
+        patcher, _ = self.failing_replace(1, 3)
+        with patcher, self.assertRaises(PermissionError):
             update.replace_launcher(self.launcher, self.new)
         self.assertEqual(self.launcher.read_bytes(), b'MZ old')
-        self.assertFalse((self.dir / 'DKB-Launcher.exe.new').exists())
+        self.assertEqual(self.names(), ['DKB-Launcher.exe', 'new-DKB-Setup.exe'])
+
+    def test_launcher_that_cannot_be_renamed_leaves_no_copy(self):
+        patcher, _ = self.failing_replace(1, 2)   # a folder where renaming is refused
+        with patcher, self.assertRaises(PermissionError):
+            update.replace_launcher(self.launcher, self.new)
+        self.assertEqual(self.launcher.read_bytes(), b'MZ old')
+        self.assertEqual(self.names(), ['DKB-Launcher.exe', 'new-DKB-Setup.exe'])
 
     def test_only_an_exe_is_replaced(self):
         other = self.dir / 'notes.txt'

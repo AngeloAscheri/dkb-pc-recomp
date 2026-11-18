@@ -538,8 +538,10 @@ def start_version(base, tag, launcher, extra=(), spawn=subprocess.Popen, timeout
 
 def replace_launcher(launcher, new):
     """Put new (the launcher of the release that runs, checked with its zip) in place of the launcher exe the player
-    started, when they differ. A running exe cannot be overwritten on Windows but can be renamed: it becomes
-    <name>.old (deleted at a later start) and a copy of new, checked again, takes its name. True when replaced."""
+    started, when they differ. A copy of new, checked again, replaces it in one rename: launcher.c has exited by the
+    time this window runs, so the exe is normally not running and the launcher name is never missing. A running exe
+    (a second start of the launcher) cannot be overwritten on Windows but can be renamed: then it becomes <name>.old
+    (deleted at a later start) and the copy takes its name. No .new copy is left behind. True when replaced."""
     launcher, new = Path(launcher), Path(new)
     if not launcher.is_file() or not new.is_file() or launcher.suffix.lower() != '.exe':
         return False
@@ -548,23 +550,31 @@ def replace_launcher(launcher, new):
         return False
     staged = launcher.with_name(launcher.name + '.new')
     old = launcher.with_name(launcher.name + '.old')
-    shutil.copyfile(new, staged)
-    if sha256(staged) != want:
-        staged.unlink(missing_ok=True)
-        raise UpdateError('update.checksum', name=new.name)
     try:
-        old.unlink(missing_ok=True)
-    except OSError:   # an .old still running (the update before this one): its name stays taken
-        staged.unlink(missing_ok=True)
-        return False
-    os.replace(launcher, old)
-    try:
-        os.replace(staged, launcher)
-    except OSError:
-        os.replace(old, launcher)
-        staged.unlink(missing_ok=True)
-        raise
-    return True
+        shutil.copyfile(new, staged)
+        if sha256(staged) != want:
+            raise UpdateError('update.checksum', name=new.name)
+        try:
+            os.replace(staged, launcher)
+            return True
+        except OSError:   # the exe runs (or something holds it): renamed away instead
+            pass
+        try:
+            old.unlink(missing_ok=True)
+        except OSError:   # an .old still running (the update before this one): its name stays taken
+            return False
+        os.replace(launcher, old)
+        try:
+            os.replace(staged, launcher)
+        except OSError:
+            os.replace(old, launcher)
+            raise
+        return True
+    finally:
+        try:
+            staged.unlink(missing_ok=True)   # gone already once it took the launcher's name
+        except OSError:
+            pass
 
 
 def clean_old_launcher(launcher):
