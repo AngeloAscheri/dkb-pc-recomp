@@ -323,7 +323,9 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 // under vk_sync_submit's lock) calls:
 // - VK_MEM_USE at a vertex, index, uniform, storage or indirect binding of a span vk_mem_resolve returned: the pool's
 //   mirror is created on first use and sp.buffer becomes it (same offsets); a pool that stays imported keeps its buffer.
-// - VK_MEM_PICK where a copy, fill or update reads or writes a span: the mirror if the pool has one, never a new one.
+// - VK_MEM_PICK where a copy, fill or update reads or writes a span: the mirror if the pool has one, never a new one,
+//   except for a staged pool (TOTK_MIRROR_STAGED), whose spans resolve with a null buffer: both give it its mirror, or
+//   import it when it cannot have one. Code that uses sp.buffer calls one of them first.
 // - vk_mem_gpu_wrote after recording a GPU write of [sp.offset, sp.offset + size) into sp.buffer: a mirror's bytes go
 //   back to guest memory at the end of the submission. No-op for imported buffers.
 // - vk_mem_mirror_begin at the start of a submission's recording, vk_mem_mirror_end (records the write-backs; returns
@@ -372,7 +374,7 @@ int vk_mem_wb_early_min(void);
 uint32_t vk_mem_wb_tag(uint32_t tag);
 void vk_mem_mirror_wb_held(uint64_t fence, uint32_t upto, uint64_t min_bytes);
 int vk_mem_mirror_pending(void);
-void vk_mem_mirror_prologue(VkCommandBuffer cb);
+void vk_mem_mirror_prologue(VkCommandBuffer cb, uint64_t fence);   // fence: the value of the part's submission
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).

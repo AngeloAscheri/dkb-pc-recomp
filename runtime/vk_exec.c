@@ -1170,8 +1170,10 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     if (!x_here || ex != &X || !ex->cb || !out || !addr || !size || size > (8ull << 20) ||
         addr > UINT64_MAX - size || (addr & 3) || (size & 3)) return 0;
     VkMemSpan source;
-    if (!vk_mem_resolve(addr, size, &source) || !source.buffer || source.avail < size || (source.offset & 3)) return 0;
-    VK_MEM_PICK(source);   // choose an existing mirror; a read does not create a new one
+    if (!vk_mem_resolve(addr, size, &source) || source.avail < size || (source.offset & 3)) return 0;
+    // Choose an existing mirror; a read does not create a new one, except for a staged pool (vk_memory.c staged
+    // mirror), whose span has no buffer before VK_MEM_PICK gives it the mirror.
+    VK_MEM_PICK(source);
     if (!source.buffer) return 0;
     VkCtx *c = vk_ctx();
     VkBuffer buffer = VK_NULL_HANDLE;
