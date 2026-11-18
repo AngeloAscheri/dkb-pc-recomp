@@ -223,6 +223,13 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // report as written at the next plat_mem_written, as they would after the writes. A no-op where a watched write
 // costs nothing extra.
 void plat_mem_prewrite(uint64_t addr, uint64_t n);
+// Sealed pages (vk_memory.c, the lazy write-back): on 1 makes the pages of [addr, addr+n) inaccessible, 0 read-write
+// again, without changing what plat_mem_state answers for them; 1 on success. The first access to a sealed page, a
+// read or a write, from any thread, goes to the function given to plat_mem_access_hook before every other fault
+// handling; it returns 1 when it made the page accessible and the access is to be retried. plat_mem_access_hook
+// returns 0 where pages cannot be sealed (then plat_mem_seal fails too).
+int plat_mem_seal(uint64_t addr, uint64_t n, int on);
+int plat_mem_access_hook(int (*fn)(uint64_t addr));
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));

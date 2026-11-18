@@ -176,6 +176,10 @@ int mem_freeze(uint64_t a);                                // makes the 2 MiB re
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze
+// Thaws the regions over [a, a+n) for good: mem_freeze refuses them.
+void mem_freeze_exclude(uint64_t a, uint64_t n);
+// Called by mem_thaw, before its lock, for a range with such regions.
+void mem_thaw_hook(void (*fn)(uint64_t a, uint64_t n));
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
 int mem_guest_readable(uint64_t a, uint64_t n);            // 1 a read of [a, a+n) cannot fault (heap, mapped alias
