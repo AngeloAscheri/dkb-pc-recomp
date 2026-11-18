@@ -235,6 +235,10 @@ int mem_guard_state(uint64_t a);
 int mem_guard_drop(uint64_t a, uint64_t n, int *claimed);
 void mem_thaw_keep(uint64_t a, uint64_t n);
 void mem_touch_keep(uint64_t a, uint64_t n);               // mem_touch without settling guarded pages
+void mem_commit_later(uint64_t a, uint64_t n);             // mem_touch_keep over [a, a+n) on a thread of its own, about
+                                                           // 2 s later (a staged pool, never imported); no-op without
+                                                           // TOTK_HEAP_LAZY
+void mem_commit_later_stats(uint64_t out[4]);              // since the last call: ranges, bytes, ns, ranges dropped
 void mem_commit_report(const char *when);                  // logs where the process's commit goes (TOTK_MEM_REPORT)
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
                                                            // regions frozen now; freezes and thaws since the last call

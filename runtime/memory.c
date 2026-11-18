@@ -1013,6 +1013,84 @@ void mem_touch_keep(uint64_t a, uint64_t n) {
     }
 }
 
+// ---- lazy-heap commits in the background (mem_commit_later)
+// A staged pool (vk_memory.c, TOTK_MIRROR_STAGED) is never imported, so the pages of it the CPU never touched stay
+// reserved, where an imported pool's import commits them all (mem_touch). freeze_locked never freezes a 2 MiB region
+// with a lazy-heap hole (fault_veh may commit it at any moment), so the regions over such a pool are write-watch queried
+// every frame: with TOTK_MIRROR_STAGED=all on the Hilltop Layer of Surf Hills (3.2.0) about 300 MiB were frozen instead
+// of about 730, and the queries covered 630 MiB a frame instead of 220. This thread commits those holes, as the import
+// would have, CL_DELAY_MS after the pool's first use and CL_SLICE bytes at a time, so the frame that first uses the
+// pools (the point of the staged mirror is that its first use costs no import) and the replay's queries meanwhile wait
+// at most for one slice's frz_lock (touch_query). A commit leaves the page's bytes zero, as the fault handler's would,
+// and is not a write for the write watch. The commit charge comes back to what the imports had; the pages stay out of
+// the working set until something touches them. The queue keeps the ranges in the order they came, so every due range
+// is at its head; one that finds the queue full is left for the fault handler, as without this.
+#define CL_DELAY_MS 2000u
+#define CL_SLICE (2ull << 20)
+#define CL_MAX 4096   // a layer's first frame makes a few hundred staged mirrors, a reload up to about 1,400
+static struct {
+    PlatMutex lock;
+    PlatCond cv;
+    PlatThread *t;
+    int failed;
+    struct { uint64_t a, n; uint64_t due; } q[CL_MAX];
+    int head, n;
+    uint64_t dropped;
+} CL = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT};
+// Since the last mem_commit_later_stats: ranges taken, bytes looked at, time spent (ns); ranges dropped (queue full).
+static volatile int64_t cl_ranges, cl_bytes, cl_ns, cl_dropped;
+
+static void cl_thread(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&CL.lock);
+    for (;;) {
+        while (!CL.n) plat_cond_wait(&CL.cv, &CL.lock);
+        uint64_t now = plat_now_ms(), due = CL.q[CL.head].due;
+        if (now < due) {   // the head is the earliest: wait for it (or for nothing new: the queue only grows behind it)
+            plat_cond_wait_ms(&CL.cv, &CL.lock, (uint32_t)(due - now));
+            continue;
+        }
+        uint64_t a = CL.q[CL.head].a, n = CL.q[CL.head].n;
+        CL.head = (CL.head + 1) % CL_MAX, CL.n--;
+        plat_mutex_unlock(&CL.lock);
+        uint64_t t0 = plat_now_ns();
+        for (uint64_t x = a; x < a + n; x += CL_SLICE) mem_touch_keep(x, a + n - x < CL_SLICE ? a + n - x : CL_SLICE);
+        plat_inc64(&cl_ranges);
+        plat_add64(&cl_bytes, (int64_t)n);
+        plat_add64(&cl_ns, (int64_t)(plat_now_ns() - t0));
+        plat_mutex_lock(&CL.lock);
+    }
+}
+
+void mem_commit_later(uint64_t a, uint64_t n) {
+    if (!n || !heap_lazy()) return;
+    plat_mutex_lock(&CL.lock);
+    if (!CL.t && !CL.failed && !(CL.t = plat_thread_new(cl_thread, NULL, "mem commit later"))) {
+        CL.failed = 1;
+        rt_log("mem: the background commit thread could not be started; staged pools' untouched pages stay reserved");
+    }
+    if (CL.failed || CL.n == CL_MAX) {
+        if (!CL.failed) plat_inc64(&cl_dropped);
+        plat_mutex_unlock(&CL.lock);
+        return;
+    }
+    __typeof__(CL.q[0]) *tail = CL.n ? &CL.q[(CL.head + CL.n - 1) % CL_MAX] : NULL;
+    if (tail && tail->a + tail->n == a) {   // pools made one after another often follow each other in the heap
+        tail->n += n;   // committed with the range before it, a little earlier than its own due time
+        plat_mutex_unlock(&CL.lock);
+        return;
+    }
+    CL.q[(CL.head + CL.n) % CL_MAX].a = a, CL.q[(CL.head + CL.n) % CL_MAX].n = n;
+    CL.q[(CL.head + CL.n) % CL_MAX].due = plat_now_ms() + CL_DELAY_MS;
+    if (!CL.n++) plat_cond_signal(&CL.cv);
+    plat_mutex_unlock(&CL.lock);
+}
+
+void mem_commit_later_stats(uint64_t out[4]) {
+    out[0] = (uint64_t)plat_xchg64(&cl_ranges, 0), out[1] = (uint64_t)plat_xchg64(&cl_bytes, 0);
+    out[2] = (uint64_t)plat_xchg64(&cl_ns, 0), out[3] = (uint64_t)plat_xchg64(&cl_dropped, 0);
+}
+
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     int op = plat_op_begin(PLAT_OP_HEAP_SIZE, L.heap.base, size);
     plat_mutex_lock(&lock);

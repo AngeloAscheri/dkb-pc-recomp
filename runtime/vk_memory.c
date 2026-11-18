@@ -4603,6 +4603,9 @@ static void mirror_create(PoolRec *r, BigMirror *fill) {
     // goes the staged way (sfeed). Before MS_ON, like the other fields; under mirror_lock when shared, like pend.
     if (staged && n <= STG_SMALL) r->szero = 1, range_add(&pend, &npend, &cpend, r, 0, n);
     ms_set(r, MS_ON);   // after mbuf, acc_sub and sfeed: what a reader of MS_ON goes on to read
+    // Never imported, its untouched lazy-heap pages stay reserved and keep its 2 MiB regions from freezing: committed by
+    // a thread of memory.c's a while after this frame, as the import would have (memory.c mem_commit_later).
+    if (staged) mem_commit_later(r->import_lo, r->import_hi - r->import_lo);
     BigMirror bm = {1, r->lo, n, 0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, qpc() - t0, q, wpages};
     if (staged && n > STG_SMALL) *fill = bm;   // filled by the caller (staged_fill), which logs it
     else if (!staged) {
