@@ -510,11 +510,16 @@ typedef struct {
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin).
                                    // Read and set through vk_tex_fb_learned and vk_tex_fb_learn
 } VkTexImage;
-// vk_astc_bc1.c: the image of an ASTC texture kept as BC3 made again as BC1 (to_bc1) or back, with img's extent,
-// levels, layers, flags and usage, in new memory. 1 with *out, *out_alloc and *out_format set; the caller retires the
-// old image.
-int vk_astc_bc_remake(const VkTexImage *img, VkImageCreateFlags flags, VkImageUsageFlags usage, int srgb, int to_bc1,
-                      VkImage *out, VmaAllocation *out_alloc, VkFormat *out_format);
+// vk_astc_bc1.c: an ASTC texture's image (TexVkFormat.astc_bc 1 = BC3, 2 = BC1) made again in the other format
+// (to_bc1: BC1) and the entry swapped over to it: the same extent, levels, layers, create flags and usage with the
+// new format, in new memory. The old image and the replay's views of it go once the GPU is done with them. The new
+// image and its format go to img->image and img->format, and to *out_alloc, *out_format and *out_bc for the parts of
+// the entry that live outside VkTexImage; it holds nothing and is in VK_IMAGE_LAYOUT_UNDEFINED, so the caller
+// transitions it, uploads every level and layer into it and bumps the generation the descriptor memos look it up
+// by. 0 and nothing changed when the image cannot be made again: not a 2D single-sample image, one bound into pool
+// memory, one with no memory of its own, or no memory for the new image.
+int vk_astc_bc_remake(VkTexImage *img, VkImageCreateFlags flags, VkImageUsageFlags usage, int srgb, int to_bc1,
+                      VmaAllocation *out_alloc, VkFormat *out_format, uint8_t *out_bc);
 // fb_learned is set by the replay thread (vk_exec_draw.c feedback_prepare) while the helper threads (vk_spec.h) read
 // it for the draws they translate and the passes they begin, so it is loaded and stored atomically. A helper part that
 // read it before the store is dropped: the store is followed by vk_spec_world_changed.
@@ -526,8 +531,10 @@ static inline void vk_tex_fb_learn(VkTexImage *img) { __atomic_store_n(&img->fb_
 void vk_texture_hold_barrier(void);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 // An ASTC image kept as BC1 made BC3 again and uploaded whole, before texels that may carry alpha are written into it
-// (vk_exec_xfer.c's copies into a decoded ASTC image, WriteTexels). Any other image is left as it is.
-void vk_texture_astc_bc3(const VkTexImage *img);
+// (vk_exec_xfer.c's copies into a decoded ASTC image, WriteTexels). Any other image is left as it is. 1 when the image
+// is BC3 and the copy may go on; 0 when it is a BC1 image whose remake failed, or there is no image at all, since a
+// BC1 block is 8 bytes and holds no alpha for the copy's texels.
+int vk_texture_astc_bc3(const VkTexImage *img);
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view);
 // The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the

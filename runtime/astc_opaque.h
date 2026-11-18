@@ -9,9 +9,12 @@
 // A block is opaque when:
 // - it is a void-extent block (one colour) in LDR whose alpha's high byte is 0xFF (the decoder scales the 16-bit alpha
 //   to 8);
-// - or its colour endpoint mode carries no alpha: 0-3, 6-9, 11, 14 and 15. The modes with alpha are 4 and 5
-//   (luminance + alpha), 10 (RGB scale + two alphas), 12 and 13 (RGBA). The mode is in bits 13-16 for one partition,
-//   and in bits 25-28 for partitions that share one (bits 23-24 zero).
+// - or its colour endpoint mode carries no alpha: 0-3, 6-9 and 11. The modes with alpha are 4 and 5
+//   (luminance + alpha), 10 (RGB scale + two alphas) and 12, 13, 14 and 15 (two layers, each with its own
+//   endpoints). The mode is in bits 13-16 for one partition, and in bits 25-28 for partitions that share one
+//   (bits 23-24 zero). 14 and 15 are counted with the alpha modes although the compute decoder writes magenta
+//   for them (its endpoint unpacker handles 0, 1, 4, 5, 6, 8, 9, 10, 12 and 13 and magentas the rest, alpha 255
+//   included): the rule then rests on the block header alone, not on what the decoder happens to write.
 // Partitions of different modes would need the weights' size to read their modes whole: they count as maybe-alpha, as
 // do an HDR void extent and an alpha mode (which could still decode to 255 everywhere: a decode would tell; here BC3
 // stays). A block of zeros is counted apart: storage before the game wrote the texture, or padding between levels,
@@ -24,8 +27,9 @@ enum { ASTC_KIND_ALPHA = 0, ASTC_KIND_OPAQUE = 1, ASTC_KIND_EMPTY = 2 };
 
 typedef struct { uint64_t opaque, alpha, empty; } AstcOpaqueScan;
 
+// The endpoint modes whose blocks carry alpha: the modes with an explicit alpha and the two-layer modes.
 static inline int astc_cem_has_alpha(uint32_t cem) {
-    return cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13;
+    return cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13 || cem == 14 || cem == 15;
 }
 
 // The kind of one 16-byte block.

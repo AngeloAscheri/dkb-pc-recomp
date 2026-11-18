@@ -759,21 +759,17 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }
 
-// An ASTC image kept as BC3 (f.astc_bc 1) made again as BC1 (to_bc1) or the other way (vk_astc_bc1.c
-// vk_astc_bc_remake): the old image and the replay's views of it go once the GPU is done with them, as in destroy_tex,
-// and the generation bump makes the texture-descriptor memos (vk_exec_draw.c tex_info_lookup) look the texture up again
-// instead of handing out a view of the old image. The new image holds nothing: the caller uploads every level and
-// layer into it. cb is the open upload batch, which takes the image's first transition. 0, nothing changed, when the
-// image cannot be made again (pool memory, no memory).
+// The texture cache's side of an ASTC format change: vk_astc_bc1.c makes an entry's image again in the other format
+// (f.astc_bc 1 = BC3, 2 = BC1) and swaps the entry over to it, retiring the old image and the replay's views of it as
+// destroy_tex does them. What is left here is the new image's first transition on cb, the open upload batch, the
+// generation bump that makes the texture-descriptor memos (vk_exec_draw.c tex_info_lookup) look the texture up
+// again instead of handing out a view of the old image, and the announcement to the spec helper threads. The new
+// image holds nothing: the caller uploads every level and layer into it. 0, nothing changed, when the entry is not
+// an ASTC image kept as BC or the image could not be made again.
 static int astc_reformat(Tex *e, int to_bc1, VkCommandBuffer cb) {
-    if (!e->f.astc_bc || e->bound_to || !e->alloc) return 0;
-    VkImage img;
-    VmaAllocation alloc;
-    VkFormat f;
-    if (!vk_astc_bc_remake(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, to_bc1, &img, &alloc, &f)) return 0;
-    vk_exec_image_gone(e->pub.image);
-    vk_defer_image(e->pub.image, e->alloc);
-    e->pub.image = img, e->alloc = alloc, e->pub.format = f, e->f.vk = f, e->f.astc_bc = to_bc1 ? 2 : 1;
+    if (!e->f.astc_bc) return 0;   // not an ASTC image kept as BC
+    if (!vk_astc_bc_remake(&e->pub, e->cflags, e->cusage, e->f.astc_srgb != 0, to_bc1, &e->alloc, &e->f.vk,
+                           &e->f.astc_bc)) return 0;
     init_image(e, cb);
     tex_gen_bump(e->key.addr);
     vk_spec_world_changed();
@@ -782,18 +778,22 @@ static int astc_reformat(Tex *e, int to_bc1, VkCommandBuffer cb) {
 
 static void upload(Tex *e);
 
-void vk_texture_astc_bc3(const VkTexImage *img) {
-    if (!img) return;
+// 1 when the image is BC3 and the caller may copy into it, 0 when it is a BC1 image whose remake failed: a BC1 block
+// is 8 bytes and holds no alpha, so BC3 texels do not fit it.
+int vk_texture_astc_bc3(const VkTexImage *img) {
+    if (!img) return 0;
     lock();
     Tex *e = (Tex *)img;   // pub is the first member
+    int ok = 1;   // an image that is not a BC1 one to make over is already what the caller wants
     if (e->f.astc_bc == 2) {
         VkCommandBuffer cb = vk_upload_begin();
-        int ok = astc_reformat(e, 0, cb);
+        ok = astc_reformat(e, 0, cb);
         vk_upload_end();
         if (ok) e->bc_settled = 1;   // BC3 for good; when it could not be made again it stays BC1 and is asked again
         if (ok && e->pub.mirrored && !e->pub.gpu_owned) upload(e);
     }
     unlock();
+    return ok;
 }
 
 // Copies the whole storage into the image (every level and layer the image has).
@@ -1618,7 +1618,8 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
     VkImageAspectFlags aspect;
-    if (write && e->f.astc_bc == 2) vk_texture_astc_bc3(&e->pub);   // texels that may carry alpha: not into a BC1 image
+    // texels that may carry alpha: not into a BC1 image; when it cannot be made BC3 the write is skipped instead
+    if (write && e->f.astc_bc == 2 && !vk_texture_astc_bc3(&e->pub)) return 0;
     if (e->f.astc_bw && !write) {
         log_limited(&n_astc, "ReadTexels of ASTC texture %#llx: the image holds decoded RGBA8; zeros returned",
                     (unsigned long long)e->pub.addr);

@@ -39,17 +39,19 @@ static void void_extent(uint8_t b[16], int hdr, uint8_t alpha_high) {
 
 int main(void) {
     uint8_t b[16];
-    // single partition: modes 4, 5, 10, 12, 13 carry alpha, every other mode is opaque
+    // single partition: modes 4, 5, 10, 12, 13, 14 and 15 carry alpha, every other mode is opaque
     for (uint32_t cem = 0; cem < 16; cem++) {
         normal(b, 1, cem);
-        int want = (cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13) ? ASTC_KIND_ALPHA : ASTC_KIND_OPAQUE;
+        int want = (cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13 || cem == 14 || cem == 15)
+                       ? ASTC_KIND_ALPHA : ASTC_KIND_OPAQUE;
         CHECK(astc_block_kind(b) == want, "one partition, mode %u: %d, want %d", cem, astc_block_kind(b), want);
     }
     // partitions sharing a mode follow that mode
     for (int parts = 2; parts <= 4; parts++)
         for (uint32_t cem = 0; cem < 16; cem++) {
             normal(b, parts, cem);
-            int want = cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13 ? ASTC_KIND_ALPHA : ASTC_KIND_OPAQUE;
+            int want = cem == 4 || cem == 5 || cem == 10 || cem == 12 || cem == 13 || cem == 14 || cem == 15
+                           ? ASTC_KIND_ALPHA : ASTC_KIND_OPAQUE;
             CHECK(astc_block_kind(b) == want, "%d partitions, shared mode %u: %d, want %d", parts, cem,
                   astc_block_kind(b), want);
         }
