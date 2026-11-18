@@ -514,6 +514,73 @@ class LauncherTest(unittest.TestCase):
         self.assertFalse(update.replace_launcher(self.dir / 'missing.exe', self.new))
 
 
+class WindowLogicTest(unittest.TestCase):
+    """installer/guilogic.py: what the launcher's window remembers and shows (gui.py only draws it)."""
+
+    def setUp(self):
+        from installer import guilogic
+        self.g = guilogic
+        self.work = tempfile.TemporaryDirectory()
+        self.base = Path(self.work.name) / 'DKB-Recomp'
+
+    def tearDown(self):
+        self.work.cleanup()
+
+    def test_settings_round_trip_and_opt_out(self):
+        self.assertEqual(self.g.Settings.load(self.base), self.g.Settings())   # nothing saved: check at start
+        self.g.Settings(dest='D:\\Игры\\DKB Bananza', check_updates=False).save(self.base)
+        loaded = self.g.Settings.load(self.base)
+        self.assertEqual((loaded.dest, loaded.check_updates), ('D:\\Игры\\DKB Bananza', False))
+        (self.base / self.g.SETTINGS).write_text('{broken', encoding='utf-8')
+        self.assertEqual(self.g.Settings.load(self.base), self.g.Settings())
+        (self.base / self.g.SETTINGS).write_text('{"dest": 5, "check_updates": "no"}', encoding='utf-8')
+        self.assertEqual(self.g.Settings.load(self.base), self.g.Settings(dest='', check_updates=True))
+
+    def test_default_install_folder_is_beside_the_tools(self):
+        dest = Path(self.g.default_dest(self.base))
+        self.assertEqual(dest.parent, self.base.parent)
+        self.assertNotEqual(dest, self.base)
+
+    def test_install_state(self):
+        dest = Path(self.work.name) / 'game'
+        self.assertIsNone(self.g.install_state(str(dest)))
+        self.assertIsNone(self.g.install_state(''))
+        dest.mkdir()
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': {'check': {}}}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'unfinished')
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': {'dkb_verify': {}}}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'unfinished')   # no game exe yet
+        (dest / self.g.GAME_EXE).write_bytes(b'')
+        self.assertEqual(self.g.install_state(str(dest)), 'ready')
+        steps = {'compile': {'finished': '2026-11-18T10:00:00Z'}, 'dkb_verify': {'finished': '2026-11-18T10:05:00Z'}}
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'ready')
+        steps['compile']['finished'] = '2026-11-19T09:00:00Z'   # an update recompiled; its check did not finish
+        (dest / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': steps}), encoding='utf-8')
+        self.assertEqual(self.g.install_state(str(dest)), 'unfinished')
+
+    def test_update_line(self):
+        files = Files(self.work.name)
+        newer = update.Offer('v0.5.0', files.version, 1, 'notes', 'page', files.manifest)
+        page_only = update.Offer('v0.5.0', 'v0.5.0', 1, 'notes', 'page', None)
+        older = update.Offer('v0.3.0', files.version, -1, '', 'page', files.manifest)
+        same = update.Offer('v0.5.0', files.version, 0, '', 'page', files.manifest)
+        status = self.g.update_status
+        self.assertEqual(status(newer, None), (('ui.update_offer', {'tag': 'v0.5.0'}), True))
+        self.assertEqual(status(page_only, None), (('ui.update_page_only', {'tag': 'v0.5.0'}), False))
+        self.assertEqual(status(older, None), (('ui.update_older', {'tag': 'v0.3.0'}), False))
+        self.assertEqual(status(older, None, allow_downgrade=True)[1], True)
+        self.assertEqual(status(same, None), (('ui.update_none', {}), False))
+        self.assertEqual(status(None, 'no answer'), (('ui.update_offline', {'detail': 'no answer'}), False))
+        self.assertEqual(status(None, None), (('ui.update_off', {}), False))
+
+    def test_update_log(self):
+        launcher = self.g.Launcher(base=self.base)
+        launcher.note('check: latest v0.5.0')
+        self.assertIn('check: latest v0.5.0', launcher.log.read_text(encoding='utf-8'))
+        self.assertEqual(launcher.temp, self.base / 'temp')
+
+
 class ReleaseToolTest(unittest.TestCase):
     """tools/make_release.py: the launcher's strings and the files published beside the zip."""
 

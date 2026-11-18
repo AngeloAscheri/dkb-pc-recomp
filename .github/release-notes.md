@@ -2,6 +2,8 @@
 
 Draft, not released. The 0.4.1 notes follow below, unchanged.
 
+- Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
+
 - `console = 0` also closes a Windows Terminal window: the game frees its console instead of hiding the window (#238, #364).
 - #372 Leave the translator's emulated compare-exchange loop after 1024 attempts (@roverdrubber)
 - dotnet no longer adds a dead folder to the user's PATH on each install (c222918).
@@ -134,7 +136,9 @@ Pull requests since 0.4.0: roverdrubber, Zorkats, GlebShekovtsov, thatbananaman0
 
 | Package | For | Status |
 |---|---|---|
+| `DKB-Launcher.exe` | Windows 10/11 x64 | New, the simplest way: one small file. Put it in a folder of its own and start it; it downloads the tools zip below, checks its SHA-256, builds the game from your dump and offers each later release with one click (docs/installer.md, "Launcher and updates"). |
 | `DKB-Setup-<version>-windows.zip` | Windows 10/11 x64 | Supported. Carries its own tools and the installer window: unpack, run `DKB-Setup.exe`, pick your dump. |
+| `dkb-release.txt` | the launcher | The version, the file names, sizes and SHA-256 the launcher checks the two files above against. |
 | `DKB-Setup-<version>-linux-x86_64.tar.gz` | Linux x86-64, kernel 6.7 or later | Preview. Source package with `setup.sh`: you install the system packages it lists (`./setup.sh --check`), then it runs the command-line installer. |
 | `DKB-Setup-<version>-macos-arm64.zip` | macOS 14.4 or later, Apple silicon | Preview. Same idea with `setup.command`. Play is not verified and the destructible terrain is missing (Metal has no geometry stage). |
 
