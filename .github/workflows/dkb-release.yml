@@ -5,15 +5,18 @@ name: DKB setup zip
 # Beside the Windows zip, make_release.py writes DKB-Launcher.exe and dkb-release.txt, the manifest the launcher updates
 # from (docs/installer.md, "Launcher and updates"); the release must carry all three under these names.
 # A manual run or a push to a tag only uploads the zips as workflow artifacts; a tag named v* also publishes them as a
-# GitHub release with the notes of .github/release-notes.md (0.x is experimental, see issue #85).
+# GitHub release with the notes of .github/release-notes.md (0.x is experimental, see issue #85): v0.4.2 as the latest
+# release, v0.4.2-rc1 as a pre-release, which the launcher never offers (tools/check_release.py).
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
 
+# The build jobs only read the repository; only the publish job, which runs nothing but GitHub's own checkout and
+# artifact download, may write a release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   zip:
@@ -145,6 +148,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [zip, linux, macos, appimage]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # gh release create
     steps:
       - uses: actions/checkout@v4   # for .github/release-notes.md
       - uses: actions/download-artifact@v4
@@ -152,19 +157,17 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Check the launcher manifest against the tag and the files
+        id: manifest
         run: |
-          # The launcher installs the release whose dkb-release.txt names its own tag, and downloads the zip it names
+          # The launcher installs the release whose dkb-release.txt names its own tag, and checks the files' size and
+          # SHA-256 against it: they must be the bytes published here. A pre-release tag (v0.4.2-rc1) is published as
+          # a pre-release, which no launcher offers (tools/check_release.py).
           cat dist/dkb-release.txt
-          grep -qx "tag $GITHUB_REF_NAME" dist/dkb-release.txt || { echo "::error::dkb-release.txt does not name $GITHUB_REF_NAME: VERSION and the tag disagree"; exit 1; }
-          # and every launcher checks the files' SHA-256 and size against it: they must be the bytes published here
-          for kind in tools launcher; do
-            read -r sha size name _ <<<"$(awk -v k="$kind" '$1 == k { print $2, $3, $4 }' dist/dkb-release.txt)"
-            test -n "$name" && test -f "dist/$name" || { echo "::error::dkb-release.txt names '$name' ($kind), which is not among the release files"; exit 1; }
-            test "$(stat -c %s "dist/$name")" = "$size" || { echo "::error::$name is not the size dkb-release.txt gives"; exit 1; }
-            echo "$sha  dist/$name" | sha256sum -c --quiet - || { echo "::error::$name does not match the SHA-256 dkb-release.txt gives"; exit 1; }
-          done
+          kind=$(python3 tools/check_release.py dist "$GITHUB_REF_NAME") || { echo "$kind"; exit 1; }
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.manifest.outputs.kind }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/DKB-Setup-* dist/DKB-Launcher.exe dist/dkb-release.txt --repo "$GITHUB_REPOSITORY" --latest --title "DKB Recomp $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/DKB-Setup-* dist/DKB-Launcher.exe dist/dkb-release.txt --repo "$GITHUB_REPOSITORY" "--$KIND" --title "DKB Recomp $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes

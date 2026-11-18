@@ -254,10 +254,13 @@ tools <sha256> <bytes> DKB-Setup-0.4.2+abc1234-windows.zip DKB-Setup
 launcher <sha256> <bytes> DKB-Launcher.exe
 ```
 
-The release workflow (`.github/workflows/dkb-release.yml`) uploads all three as the Windows artifact and, on a `v*`
-tag, checks that the manifest names that tag and the zip it lists before it publishes them with the release. The tag
-must be `v` and the repository's `VERSION`. Older releases have no manifest: the launcher's first start then says so
-and points to the release page.
+The release workflow (`.github/workflows/dkb-release.yml`) uploads all three as the Windows artifact. On a `v*` tag,
+`tools/check_release.py` then checks that the manifest reads as the launcher reads it, names the tag and gives the size
+and SHA-256 of the files about to be published, and the job publishes them. A tag `v` plus the repository's `VERSION`
+becomes the latest release. A pre-release tag (`v0.4.2-rc1`; its manifest names `v0.4.2`) becomes a pre-release,
+which neither the launcher nor the window ever offers. Only that publish job may write to the repository; the build
+jobs only read it. Older releases have no manifest: the launcher's first start then says so and points to the release
+page.
 
 **Testing without a release.** A launcher built with `-DDKB_LAUNCHER_TEST` (never a release: the release build has no
 such variables) reads `DKB_LAUNCHER_BASE` in place of the `DKB-Recomp` folder, `DKB_LAUNCHER_MANIFEST` and

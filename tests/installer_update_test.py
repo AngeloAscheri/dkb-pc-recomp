@@ -444,6 +444,16 @@ class CheckTest(unittest.TestCase):
         with self.assertRaises(UpdateError):
             update.check('0.4.1', Opener(self.answers))
 
+    def test_release_candidate_tag_is_not_offered(self):
+        """A v*-rc* tag the workflow publishes (as a pre-release) is never an update, even marked as the latest"""
+        for flags in ({'prerelease': True}, {}):
+            self.answers[update.API] = self.files.api(tag_name='v0.5.0-rc1', **flags)
+            self.answers[update.release_url('v0.5.0-rc1', update.MANIFEST)] = self.files.text.encode()
+            with self.subTest(flags=flags), self.assertRaises(UpdateError) as e:
+                update.check('0.4.1', Opener(self.answers))
+            self.assertEqual(e.exception.id, 'update.offline')
+            self.assertIsNone(update.newer_release('0.4.1', lambda: json.loads(self.files.api(tag_name='v0.5.0-rc1'))))
+
 
 class DownloadTest(unittest.TestCase):
     def setUp(self):
@@ -872,6 +882,51 @@ class WindowLogicTest(unittest.TestCase):
         launcher.note('check: latest v0.5.0')
         self.assertIn('check: latest v0.5.0', launcher.log.read_text(encoding='utf-8'))
         self.assertEqual(launcher.temp, self.base / 'temp')
+
+
+class CheckReleaseTest(unittest.TestCase):
+    """tools/check_release.py, the release workflow's check before it publishes."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import check_release
+        self.c = check_release
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.files = Files(self.work.name)
+        (Path(self.work.name) / update.MANIFEST).write_text(self.files.text, encoding='ascii', newline='\n')
+        self.dist = Path(self.work.name)
+
+    def test_release_and_pre_release_tags(self):
+        self.assertEqual(self.c.check(self.dist, 'v0.5.0'), 'latest')
+        for tag in ('v0.5.0-rc1', 'v0.5.0-rc.2', 'v0.5.0-beta1'):   # the tags the workflow published before
+            self.assertEqual(self.c.check(self.dist, tag), 'prerelease', tag)
+        for tag in ('v0.5.1', 'v0.5.1-rc1', 'v0.5.0-', 'v0.5.0-rc 1', 'release-0.5.0', '0.5.0'):
+            with self.subTest(tag), self.assertRaises(self.c.ReleaseError):
+                self.c.check(self.dist, tag)
+
+    def test_files_that_are_not_the_manifests(self):
+        zip_path = self.files.zip
+        zip_path.write_bytes(self.files.zip_bytes[:-1] + bytes([self.files.zip_bytes[-1] ^ 1]))   # same size
+        with self.assertRaisesRegex(self.c.ReleaseError, 'SHA-256'):
+            self.c.check(self.dist, 'v0.5.0')
+        zip_path.write_bytes(self.files.zip_bytes + b'x')
+        with self.assertRaisesRegex(self.c.ReleaseError, 'bytes'):
+            self.c.check(self.dist, 'v0.5.0')
+        zip_path.unlink()
+        with self.assertRaisesRegex(self.c.ReleaseError, 'not among'):
+            self.c.check(self.dist, 'v0.5.0')
+        (self.dist / update.MANIFEST).write_text('dkb-release 2\n')
+        with self.assertRaisesRegex(self.c.ReleaseError, 'not one the launcher reads'):
+            self.c.check(self.dist, 'v0.5.0')
+
+    def test_command_line(self):
+        with patch('builtins.print') as printed:
+            self.assertEqual(self.c.main([str(self.dist), 'v0.5.0-rc1']), 0)
+        printed.assert_called_with('prerelease')
+        with patch('builtins.print') as printed:
+            self.assertEqual(self.c.main([str(self.dist), 'v0.6.0']), 1)
+        self.assertTrue(printed.call_args[0][0].startswith('::error::'))
 
 
 class ReleaseToolTest(unittest.TestCase):
