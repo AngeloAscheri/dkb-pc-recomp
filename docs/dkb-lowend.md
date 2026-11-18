@@ -170,3 +170,33 @@ caches. The second minute and the end move with where the recording ends, so the
 | 4, 3 (the new default) | 41.0 | 47 | 41.6, 21.2 |
 
 So from 4 logical processors the default is 3 threads. Below 60 fps the scene stays bound by the replay thread.
+
+### Where the replay's time goes on 6 logical processors
+
+Same setup, 3 threads, `TOTK_TRACE=perf`. In the heavy part (frames 1740 to 2800, about 24,000 draws a frame) the game
+presents every second vsync (33.3 ms) and the replay takes 20 to 26 ms a frame against 11.5 ms on 16 logical processors.
+
+- The workers record about 26,000 draws a frame at 1.5 to 1.7 us a draw, 33 to 43 ms of CPU a frame
+  (`slow frame ... slice workers by part`, CPU about equal to the wall time, so they are not preempted). On 16 logical
+  processors the cost per draw is the same; five workers share it.
+- The walk waits 10 to 15 ms a frame for held slices (`waits for held slices`: 700 to 880 ms per 60 frames, against 150
+  on 16). A probe of every wait by its cause and by the op the walk was in put nearly all of them at the take-back of a
+  released render target in `vk_texture.c` `entry_of`, reached from the target resolution of `CLEAR_COLOR` and
+  `CLEAR_DS` (about 4 a frame, about 3 ms each). Those targets share their storage with other entries and come back
+  with a new initialization serial, so the barrier is needed: a held slice's finalized slot at that address would
+  follow the taken-back entry instead of the one its pass saw (`slot_resolve`).
+- Tried without effect on the first minute (42.8 to 43.3 fps, 21 to 38 frames over 50 ms, inside the run-to-run
+  spread): letting the walk record held slices while it waits at those clears (it found none left to take: the
+  workers had them all in hand), finer slices (`(expected - drawn) / 8`) so it found some (about 10 a frame),
+  `TOTK_PAR_DEFER_DEPTH=1`, and `TOTK_PAR_DEFER=0`.
+- The process uses 3.3 to 4 logical processors of the 6 in that part, and the four busiest threads (the walk, the two
+  workers and the game's main thread) about half a processor each. Six logical processors are three cores, so the
+  workers and the game's threads share cores through SMT; a fourth replay thread made each draw slower (1.8 to 1.9 us),
+  which is why 4 threads matched 3.
+- Reaching 60 fps there needs the frame's CPU work (about 80 ms over every thread) to fall by a third, which means a
+  cheaper draw on the workers: by `DKB_DRAW_PROFILE` no one section dominates a slice's 1.7 us (bind-sig 250 ns, sets
+  225, vertex buffers 230, uniform buffers 210, the other ops 270).
+- The level transition (frames 1530 to 1620, about 9 draws a frame) replays in 14 ms a frame on 6 logical processors
+  against 0.2 ms on 16, most of it under "rest of the walk" with the CPU busy (up to 77 ms of CPU in a 125 ms replay).
+  Those frames make most of the first minute's frames over 50 ms; a sampling profile of the render thread over them
+  caught only the game's waits, so the cause is still open.
