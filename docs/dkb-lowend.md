@@ -196,7 +196,14 @@ presents every second vsync (33.3 ms) and the replay takes 20 to 26 ms a frame a
 - Reaching 60 fps there needs the frame's CPU work (about 80 ms over every thread) to fall by a third, which means a
   cheaper draw on the workers: by `DKB_DRAW_PROFILE` no one section dominates a slice's 1.7 us (bind-sig 250 ns, sets
   225, vertex buffers 230, uniform buffers 210, the other ops 270).
-- The level transition (frames 1530 to 1620, about 9 draws a frame) replays in 14 ms a frame on 6 logical processors
-  against 0.2 ms on 16, most of it under "rest of the walk" with the CPU busy (up to 77 ms of CPU in a 125 ms replay).
-  Those frames make most of the first minute's frames over 50 ms; a sampling profile of the render thread over them
-  caught only the game's waits, so the cause is still open.
+- The level transition (frames 1530 to 1620, about 9 draws a frame) replayed in 11 to 12 ms a frame on 6 logical
+  processors against 0.2 ms on 16, under "rest of the walk" with the CPU busy (up to 77 ms of CPU in a 125 ms replay).
+  The time was the walk's `rec_drain` at the end of each submission: the recorder had 0.1 ms of work but woke 5 to 30
+  ms after its event was set, while the walk spun and yielded. During the load six of the game's threads keep every
+  logical processor busy at normal priority, as did the recorder and the replaying thread, so each waited a quantum
+  behind them (a sampling profile hid it: the sampler's own thread changed the scheduling, and those frames replayed in
+  under 1 ms). The recorder now runs at the highest priority and `submit_record` raises the replaying thread above
+  normal for the replay. Transition window replay 0.25 and 0.23 ms a frame (was 11 to 12.4), first minute 43.8 and
+  43.5 fps with 15 and 21 frames over 50 ms (was 42.7 to 42.9 fps, 19 to 30); on 16 logical processors 58.5 fps, 6
+  over 50 ms. What is left over 50 ms in the first minute is the game's own loading outside the replay and the first
+  frame of the heavy part (pool imports).
