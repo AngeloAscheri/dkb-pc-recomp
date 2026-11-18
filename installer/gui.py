@@ -614,12 +614,17 @@ class App:
             zip_path = update.download(tools, offer.tag, base / 'downloads', progress=progress,
                                        cancelled=self.update_stop.is_set)
             self.launcher.note(f'update to {offer.tag}: downloaded and checked {zip_path.name}')
+            if self.update_stop.is_set():   # Cancel after the last block came in: the checked zip is not unpacked
+                zip_path.unlink(missing_ok=True)
+                raise update.UpdateError('update.cancelled')
             self.later(self.update_progress, ('ui.update_unpacking', {}), None)
             folder = update.stage(zip_path, base, offer.manifest)
             zip_path.unlink(missing_ok=True)
             self.launcher.note(f'update to {offer.tag}: unpacked into {folder}')
             if self.update_closing:   # closed while it unpacked: the folder stays for the next try, nothing starts
                 return
+            if self.update_stop.is_set():   # Cancel before its button went grey: the folder stays, nothing starts
+                raise update.UpdateError('update.cancelled')
             self.hand_over(offer.tag)
         self.update_worker_body(f'update to {offer.tag}', work)
 
