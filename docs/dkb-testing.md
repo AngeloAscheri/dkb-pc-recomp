@@ -151,6 +151,18 @@ The settings keep TotK Recomp's `TOTK_` names, so its fixes apply without a rena
 Command-line options: `--seconds S` stops the run after S seconds of game time, and `--shot frame.png` with it saves
 that frame. A shot is for your own debugging; do not post it if it shows game content.
 
+`TOTK_SHOTS=<lo>-<hi>:<step>` saves every step-th present from lo to hi as `f<n>.png` in `TOTK_SHOTS_DIR` (the
+current folder by default), box-filtered to 480x270 (`TOTK_SHOTS_FULL=1`: full size); `TOTK_SHOTS=w<lo>-<hi>:<step>`
+takes them by seconds of game time instead (`boot.c` `series_shot`). The presented texture may be 8-bit RGBA or BGRA,
+or RGB10A2, which 3.2.0 presents with its own HDR output (`hdr_native` on an HDR10 display): its PQ codes are decoded,
+averaged as light, taken to Rec. 709 and tone mapped to sRGB with the paper white at 203 nits (`shot_pixels`), a
+picture for comparing runs, not a colour-exact one. Another format gets one line and no files. For pictures of the
+same game moment in two runs, step the game a fixed 1/60 s a frame (`TOTK_FIXED_STEP=1` with `TOTK_REALTIME=1`,
+[controls.md](controls.md)), give the runs the same input script and compare the k-th shots of `w` series (their
+present numbers can differ by one). Loading still takes a different number of frames in each run, so a scene after a
+load drifts by a second or more: on the Hilltop reload route two runs of one build differed by 14-18 dB PSNR, as
+much as two builds did, and a draw whose pipeline is still building is skipped (the shots do not wait for builds).
+
 ### Scripted runs without anyone playing
 
 `tools/scenario.py` starts the game from a private save, plays a button script into it and says how the run ended
