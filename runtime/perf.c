@@ -50,6 +50,7 @@ void prof_start(void) {
     flight_init();
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
+    if (rt_trace & RT_TRACE_PERF) plat_op_trace();   // operations in flight (platform.h), for ops_frame_log and vk_memory.c
     perf_on = perf_base || overlay >= 2;
     if (prof_sampler_start()) atexit(prof_write);   // a --seconds run ends in _exit: boot.c calls prof_write itself first
 }
@@ -155,7 +156,10 @@ uint64_t perf_begin(void) {
     return t;
 }
 
-void perf_replay_thread(void) { prof_replay_tid = plat_thread_id(); }
+void perf_replay_thread(void) {
+    prof_replay_tid = plat_thread_id();
+    plat_op_role(PLAT_OP_REPLAY);
+}
 void perf_main_thread(void) { prof_main_tid = plat_thread_id(); }
 
 void perf_end(int kind, uint64_t t0) {
@@ -472,10 +476,39 @@ static void ph_frame(uint64_t frame, uint64_t d, uint64_t rep, int slow) {
     }
 }
 
+// TOTK_TRACE=perf: the host operations (platform.h plat_op_begin) that ended in a slow frame, by thread role and kind,
+// so that a long frame outside the replay (a layer's teardown and load) splits into pool finalizes, thaws, imports,
+// releases, file reads and the system calls inside them. Taken every present, logged for the slow ones.
+static void ops_frame_log(uint64_t frame, int slow) {
+    static PlatOpTotal t[PLAT_OP_ROLES][PLAT_OP_N];
+    plat_op_totals(t);
+    if (!slow) return;
+    static const int order[PLAT_OP_ROLES] = {PLAT_OP_GAME, PLAT_OP_REPLAY, PLAT_OP_RENDER, PLAT_OP_OTHER};
+    char line[3000];
+    size_t o = 0;
+    line[0] = 0;
+    for (int i = 0; i < PLAT_OP_ROLES; i++) {
+        int r = order[i], first = 1;
+        for (int k = 0; k < PLAT_OP_N && o < sizeof line - 160; k++) {
+            if (!t[r][k].calls) continue;
+            if (first) o += (size_t)snprintf(line + o, sizeof line - o, "%s%s: ", o ? "; " : "", plat_op_role_name(r));
+            o += (size_t)snprintf(line + o, sizeof line - o, "%s%s %llu (%.2f ms, longest %.2f)", first ? "" : ", ",
+                                  plat_op_name(k), (unsigned long long)t[r][k].calls, t[r][k].ns / 1e6,
+                                  t[r][k].max_ns / 1e6);
+            first = 0;
+        }
+    }
+    rt_log("perf: slow frame %llu host operations that ended in it (nested ones also count in their outer one): %s",
+           (unsigned long long)frame, o ? line : "none");
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
+    static uint32_t op_render;   // the thread plat_op_role was told is the render thread
     prof_render_tid = plat_thread_id();
+    if (op_render != prof_render_tid && prof_render_tid != prof_replay_tid)
+        op_render = prof_render_tid, plat_op_role(PLAT_OP_RENDER);
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);
@@ -509,6 +542,7 @@ void perf_present(uint64_t frame) {
                    frame_ns[PERF_PACE] / 1e6, rep / 1e6);
     }
     ph_frame(frame, d, rep, last && d >= slow_ns);
+    ops_frame_log(frame, last && d >= slow_ns);
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;
     if (!win_start) win_start = now;

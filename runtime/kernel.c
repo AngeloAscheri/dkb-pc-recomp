@@ -1610,6 +1610,7 @@ static void thread_main(void *p) {
     RtThread *t = p;
     tcur = t;
     t->tid = plat_thread_id();
+    plat_op_role(PLAT_OP_GAME);   // TOTK_TRACE=perf: its host operations count as the game's (perf.c ops_frame_log)
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
@@ -1659,6 +1660,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
     t->cpu->sp = t->stack_top;
     t->tid = plat_thread_id();
     perf_main_thread();
+    plat_op_role(PLAT_OP_GAME);
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
