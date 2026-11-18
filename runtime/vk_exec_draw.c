@@ -360,6 +360,10 @@ typedef struct DrawCtx {
         NVNbufferRange vin[16];              // the ranges they were resolved from, under vk_mem_gen vgen
         uint64_t vgen;
         int vb_valid;
+        VkBuffer ib;                         // index buffer last bound (bind_ib), valid while ib_valid
+        VkDeviceSize ib_off;
+        VkIndexType ib_type;
+        int ib_valid;
         uint8_t support[SUPPORT_BYTES];      // last support buffer and where it lives
         float sup_in[3];                     // the gfx_support_fill arguments it was filled from
         VkBuffer sup_buf;
@@ -3821,10 +3825,18 @@ static void bind_vertex_buffers(VkExec *ex) {
     memcpy(dc->B.vcls, vcls, sizeof vcls), memcpy(dc->B.vpool, vpool, sizeof vpool);
     memcpy(dc->B.vin, ex->vbuf, sizeof dc->B.vin);
     dc->B.vgen = gen;
-    if (dc->B.vb_valid && !memcmp(dc->B.vb, vb, sizeof vb) && !memcmp(dc->B.vo, vo, sizeof vo) && !memcmp(dc->B.vsz, vsz, sizeof vsz) &&
-        (dyn || !memcmp(dc->B.vstr, vstr, sizeof vstr)))
-        return;
-    vkCmdBindVertexBuffers2(ex->cb, 0, 17, vb, vo, vsz, dyn ? NULL : vstr);
+    // Only the bindings from the first that differs from the bound one to the last are bound again: most draws change
+    // one or two streams, and the driver's cost on a slice grows with the count. The others keep what the command
+    // buffer has bound (B), strides included.
+    int lo = 0, hi = 16;
+    if (dc->B.vb_valid) {
+#define VB_DIFF(b) (dc->B.vb[b] != vb[b] || dc->B.vo[b] != vo[b] || dc->B.vsz[b] != vsz[b] || (!dyn && dc->B.vstr[b] != vstr[b]))
+        while (lo < 17 && !VB_DIFF(lo)) lo++;
+        if (lo == 17) return;
+        while (!VB_DIFF(hi)) hi--;
+#undef VB_DIFF
+    }
+    vkCmdBindVertexBuffers2(ex->cb, (uint32_t)lo, (uint32_t)(hi - lo + 1), vb + lo, vo + lo, vsz + lo, dyn ? NULL : vstr + lo);
     ex->recorded++;
     for (int b = 0; b < 17; b++)
         if (vcls[b]) vk_mem_count(vcls[b], VK_MUSE_VB, vsz[b]);
@@ -4429,14 +4441,26 @@ static void note_work(const VkExec *ex, int kind, uint64_t work) {
     vk_sync_note(kind, a, b, work);
 }
 
+// Binds an index buffer unless the command buffer has it bound already: a run of draws of one mesh, which the game
+// repeats with only a uniform block changed, binds the same buffer at every draw, and on a slice each bind is a driver
+// call. Nothing else in a command buffer changes its index buffer binding; B starts invalid in every new one. The
+// bind counts in ex->recorded either way, as a skipped descriptor build does (bind_resources), so the counts of two
+// translators with different B still agree.
+static void bind_ib(VkExec *ex, VkBuffer b, VkDeviceSize o, VkIndexType type) {
+    DrawCtx *const dc = DC_OF(ex);
+    ex->recorded++;
+    if (dc->B.ib_valid && dc->B.ib == b && dc->B.ib_off == o && dc->B.ib_type == type) return;
+    vkCmdBindIndexBuffer(ex->cb, b, o, type);
+    dc->B.ib = b, dc->B.ib_off = o, dc->B.ib_type = type, dc->B.ib_valid = 1;
+}
+
 static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType type) {
     DrawCtx *const dc = DC_OF(ex);
     VkBuffer b;
     VkDeviceSize o;
     memcpy(scratch(ex, bytes, &b, &o), data, bytes);
     dig_index(dc, b, o, data, bytes);
-    vkCmdBindIndexBuffer(ex->cb, b, o, type);
-    ex->recorded++;
+    bind_ib(ex, b, o, type);
 }
 
 // The Bananza reset vertex program loses stores through pointers loaded from a list. Match both locally confirmed
@@ -4473,8 +4497,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         uint32_t q = n / 4;
         if (q <= QUAD_MAX && standins.ready) {   // the shared list, shifted to the first vertex by the vertex offset
             dig_index(dc, standins.qbuf, (uint64_t)first << 32 | q, NULL, 0);   // the digest still tells draws apart
-            vkCmdBindIndexBuffer(ex->cb, standins.qbuf, 0, VK_INDEX_TYPE_UINT32);
-            ex->recorded++;
+            bind_ib(ex, standins.qbuf, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(ex->cb, 6 * q, inst, 0, (int32_t)first, (uint32_t)d->base_instance);
             ex->recorded++;
             note_work(ex, 0, (uint64_t)n * inst);
@@ -4569,8 +4592,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         if (!sp.buffer)   // a staged pool left unbacked (vk.h VK_MEM_USE)
             return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
         dig_index(dc, sp.buffer, sp.offset, NULL, 0);
-        vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        ex->recorded++;
+        bind_ib(ex, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
         VK_MEM_BOUND(sp);
     }
@@ -4604,9 +4626,9 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
         return warn_once(W_INDIRECT, "indirect draw arguments at %#llx or index buffer %#llx are not backed: draws skipped",
                          (unsigned long long)d->ind, (unsigned long long)d->ibuf);
     dig_index(dc, ib.buffer, ib.offset, NULL, 0), dig_index(dc, ip.buffer, ip.offset, NULL, 0);
-    vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    bind_ib(ex, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
-    ex->recorded += 2;
+    ex->recorded++;
     note_work(ex, 1, 0);
     // An imported pool's GPU address is its host address (bind_range reads it the same way); device memory is not.
     if (!ip.alloc && vk_sync_noting()) vk_sync_note_args(d->ind);
