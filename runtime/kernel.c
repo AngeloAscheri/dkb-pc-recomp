@@ -891,6 +891,46 @@ static void stall_dump(uint64_t idle_ns) {
     unlock();
 }
 
+// A one-off report from a guest thread (runtime/patches.c edge_report): who holds each virtual core, with priority,
+// core mask and where its host thread runs, to name a thread that ran beside the caller. Each owner is stopped once
+// under G for its rip and resumed at once; the lines are logged after G is released, so a sampled thread that holds the
+// log's lock cannot block the report. The calling thread is listed without a sample.
+void kern_cores_report(const char *tag) {
+    struct { uint32_t h; int prio, now, self, sampled; uint64_t mask, rip, lr; } o[NCORE];
+    int got = 0;
+    for (int i = 0; i < 200 && !(got = plat_mutex_trylock(&G)); i++) plat_sleep_ms(1);
+    if (!got) {
+        rt_log("%s: the scheduler lock stayed held for 200 ms: no core report", tag);
+        return;
+    }
+    for (int i = 0; i < NCORE; i++) {
+        RtThread *t = g_core_owner[i];
+        memset(&o[i], 0, sizeof o[i]);
+        if (!t) continue;
+        o[i].h = t->handle, o[i].prio = t->prio, o[i].now = prio_of(t), o[i].mask = t->mask, o[i].self = t == tcur;
+        o[i].lr = t->cur ? t->cur->x[30] : 0;
+        uint64_t rsp;
+        if (!o[i].self && t->hthr && plat_intr_stop(t->hthr, &o[i].rip, &rsp)) {
+            plat_intr_resume(t->hthr, 0);
+            o[i].sampled = 1;
+        }
+    }
+    unlock();
+    uintptr_t b = plat_exe_base();
+    char lr[128];
+    for (int i = 0; i < NCORE; i++) {
+        if (!o[i].h) {
+            rt_log("%s: core %d free", tag, i);
+            continue;
+        }
+        rt_log("%s: core %d owner %#x p%d (now %d) mask %#llx%s host rip %s%#llx%s, guest lr %s", tag, i, o[i].h,
+               o[i].prio, o[i].now, (unsigned long long)o[i].mask, o[i].self ? " (this thread)" : "",
+               o[i].sampled ? "exe+" : "", (unsigned long long)(o[i].sampled ? o[i].rip - b : 0),
+               o[i].sampled ? (o[i].rip >= g_gen_lo && o[i].rip <= g_gen_hi ? " (lifted code)" : "") : " (not sampled)",
+               o[i].lr ? ldr_describe(o[i].lr, lr, sizeof lr) : "-");
+    }
+}
+
 static void stall_main(void *arg) {
     uint64_t lim = (uint64_t)(uintptr_t)arg * 1000000000ull, next = 0;
     for (;;) {
