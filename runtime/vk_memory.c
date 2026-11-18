@@ -1386,20 +1386,86 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
     vk_guest_written(addr, size);
 }
 
+// vk_gpu_written_many without the shadow storage. The GPU writes of a command buffer, about 14,800 ranges a frame in
+// Hilltop, reach it on the completion thread before the fence counts as done (vk_exec_draw.c cb_done), so the guest
+// thread waiting in nvnSyncWait waits for them. Through vk_gpu_written_into one by one, each range took the pool lock
+// and gen_lock and a generation of its own: about 0.37 ms a frame. Here a batch of ranges takes both locks once (BATCH
+// bounds how long other threads wait for gen_lock), and the ranges through a pool's mirror share one generation: two
+// such stamps of one page give it the same own_chunk note as two generations in a row would (the second keeps a note
+// the first made and keeps 0 after a 0), and nothing reads the pages between them while gen_lock is held. Any other
+// stamp (vk_guest_written's) takes a generation of its own and ends the shared one, so an own_chunk note never survives
+// a newer write the mirror does not hold. A page the previous range of the same pool stamped with the same generation
+// is not stamped again. TOTK_STAMP_BATCH=0 stamps one by one as before; "ab" for an in-run A/B.
+static void written_batch(const VkGpuWrite *w, int n) {
+    enum { BATCH = 1024 };
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("STAMP_BATCH", "1");
+    if (!RT_KNOB_ON(mode) || !vk_mirror_on) {
+        for (int i = 0; i < n; i++) vk_gpu_written_into(w[i].addr, w[i].size, w[i].buf);
+        return;
+    }
+    for (int i = 0; i < n;) {
+        int end = n - i > BATCH ? i + BATCH : n;
+        pool_lock_shared();
+        plat_mutex_lock(&gen_lock);
+        uint32_t g = 0;                          // the shared generation of mirror stamps, 0 after another stamp
+        const PoolRec *prev = NULL;
+        uint64_t prev_lo = 0, prev_hi = 0;       // pages the previous mirror range stamped with g
+        for (; i < end; i++) {
+            uint64_t addr = w[i].addr, size = w[i].size;
+            if (!size || nvn_gpu_only(addr)) continue;   // vk_guest_written stamps nothing for those
+            uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+            const pidx_ent *e = w[i].buf ? pidx_find(&pool_index, addr, size) : NULL;
+            const PoolRec *r = e ? e->buf : NULL;
+            if (!r || ms_get(r) != MS_ON || r->mbuf != w[i].buf || addr < r->import_lo || addr + size > r->import_hi) {
+                stamp_range(lo, hi, ++gen_now);   // as vk_guest_written
+                g = 0, prev = NULL;
+                continue;
+            }
+            if (!g) g = ++gen_now;
+            uint64_t from = lo;
+            if (r == prev && lo >= prev_lo && lo <= prev_hi) {   // continues the span already stamped with g
+                if (prev_hi > from) from = prev_hi;
+                if (hi > prev_hi) prev_hi = hi;
+            } else {
+                prev_lo = lo, prev_hi = hi;
+            }
+            prev = r;
+            uint32_t mgen = r->mgen;
+            for (uint64_t a = from; a < hi; a += 1ull << GEN_PAGE_SHIFT) {
+                uint32_t *s = gen_slot(a, 1);
+                if (!s) continue;
+                uint64_t ci = a >> GEN_CHUNK_SHIFT;
+                if (!own_chunk[ci] && !(own_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t))))
+                    rt_fatal("vk: out of memory for page generations");
+                uint32_t *o = &own_chunk[ci][(a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)], prior = *s;
+                stamp_page(a, g);
+                *o = prior <= mgen || prior == *o ? g : 0;
+            }
+        }
+        plat_mutex_unlock(&gen_lock);
+        plat_mutex_unlock_shared(&pool_lock);
+    }
+}
+
 // One submission's GPU writes with the shadow storage. A heavy Bananza frame reports about 4,400 of them (a thousand
 // 15,000-byte storage buffers among them, 15 MiB in all), and one vk_gpu_written per range cost the completion thread
 // 6.7 ms a frame in the cave after the tutorial: every call searched the whole pending list, took four locks, and its
 // copy faulted once per write-watched page. The game's threads wait for these fences, so that time was frame time. Here
 // the ranges are sorted once, their pages are thawed and marked written in runs (plat_mem_prewrite), the copies run
-// under one hold of the locks, and one pass over the pending list removes them. Without the shadow storage each range
-// goes through vk_gpu_written_into as before.
+// under one hold of the locks, and one pass over the pending list removes them. Without the shadow storage the ranges
+// are stamped in batches (written_batch).
 static int wb_cmp(const void *x, const void *y) {
     const uint64_t *a = x, *b = y;
     return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1];
 }
 
 void vk_gpu_written_many(const VkGpuWrite *in, int n) {
-    if (!shadow_on || n < 4) {
+    if (!shadow_on) {
+        written_batch(in, n);
+        return;
+    }
+    if (n < 4) {
         for (int i = 0; i < n; i++) vk_gpu_written_into(in[i].addr, in[i].size, in[i].buf);
         return;
     }
