@@ -149,6 +149,22 @@ The settings keep TotK Recomp's `TOTK_` names, so its fixes apply without a rena
 Command-line options: `--seconds S` stops the run after S seconds of game time, and `--shot frame.png` with it saves
 that frame. A shot is for your own debugging; do not post it if it shows game content.
 
+### Scripted runs without anyone playing
+
+`tools/scenario.py` starts the game from a private save, plays a button script into it and says how the run ended
+(completed, crashed, device lost, hung) and whether it was slow, from the frame times (`tools/perf_check.py`). A
+scenario is `tests/scenarios/<name>.toml`; its save is a copy of one of your profiles in `build/saves/<name>/` and is
+never committed. `tests/scenarios/README.md` says how to make one.
+
+    python tools/scenario.py --list
+    python tools/scenario.py tutorial-cave --build build/dkb100 --repeat 3
+    python tools/scenario.py tutorial-cave --warp HillLevelStage      start in another stage (tools/save_warp.py)
+    python tools/scenario.py tutorial-cave --sweep "LevelStage$"      once per matching stage
+
+`--warp` rewrites the stage in the run's copy of the save, so one save reaches every stage
+(`python tools/save_warp.py --stages` lists them). Each run's log, last frame and verdict go to `build/scenarios/`; they
+are derived from the game, so keep them out of reports unless you have checked they show nothing of it.
+
 ## Add-on content (untested in game)
 
 Nothing in the game has been run with add-on content (DLC) yet: the reader (`runtime/aoc_romfs.c`) is checked on a
