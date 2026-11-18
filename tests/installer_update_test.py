@@ -514,5 +514,48 @@ class LauncherTest(unittest.TestCase):
         self.assertFalse(update.replace_launcher(self.dir / 'missing.exe', self.new))
 
 
+class ReleaseToolTest(unittest.TestCase):
+    """tools/make_release.py: the launcher's strings and the files published beside the zip."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import make_release
+        self.m = make_release
+        self.work = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.work.cleanup()
+
+    def test_launcher_header(self):
+        out = Path(self.work.name) / 'launcher_text.h'
+        self.m.launcher_header(out, 'dkb')
+        text = out.read_text(encoding='ascii')
+        for key in self.m.LAUNCHER_TEXT:
+            for lang in ('EN', 'RU'):
+                self.assertIn(f'#define LAUNCHER_{key.upper()}_{lang} L"', text)
+        self.assertIn(f'#define LAUNCHER_REPO L"{update.REPO}"', text)
+        self.assertNotIn('\\u000a', text)   # C allows no universal character name for a newline
+        self.assertIn('\\n', text)
+        self.m.launcher_header(out, 'totk')
+        self.assertIn('#define LAUNCHER_REPO L""', out.read_text(encoding='ascii'))   # TotK: only the setup
+
+    def test_manifest_and_launcher_beside_the_zip(self):
+        folder = Path(self.work.name) / 'DKB-Setup'
+        folder.mkdir()
+        (folder / 'DKB-Setup.exe').write_bytes(b'MZ launcher')
+        semver = (ROOT / 'VERSION').read_text(encoding='utf-8').strip()
+        zip_path = Path(self.work.name) / f'DKB-Setup-{semver}+abc1234-windows.zip'
+        zip_path.write_bytes(b'PK zip')
+        with patch.object(self.m, 'GAME', 'dkb'), patch.object(self.m, 'version', return_value=semver + '+abc1234'), \
+                patch('builtins.print'):
+            self.m.write_launcher_release(folder, zip_path)
+        manifest = update.parse_manifest((zip_path.parent / update.MANIFEST).read_bytes())
+        self.assertEqual((manifest.tag, manifest.version), ('v' + semver, semver + '+abc1234'))
+        self.assertEqual(manifest.tools.sha256, sha(b'PK zip'))
+        self.assertEqual(manifest.tools.top, 'DKB-Setup')
+        self.assertEqual((zip_path.parent / self.m.LAUNCHER).read_bytes(), b'MZ launcher')
+        self.assertEqual(manifest.launcher.sha256, sha(b'MZ launcher'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -2,6 +2,8 @@ name: DKB setup zip
 
 # Builds DKB-Setup-<version>-windows.zip (the portable tools, the source and the installer GUI) and the Linux and macOS
 # source packages DKB-Setup-<version>-linux-x86_64.tar.gz and -macos-arm64.zip (tools/make_release_posix.py), and the self-contained Linux AppImage, with no game data.
+# Beside the Windows zip, make_release.py writes DKB-Launcher.exe and dkb-release.txt, the manifest the launcher updates
+# from (docs/installer.md, "Launcher and updates"); the release must carry all three under these names.
 # A manual run or a push to a tag only uploads the zips as workflow artifacts; a tag named v* also publishes them as a
 # GitHub release with the notes of .github/release-notes.md (0.x is experimental, see issue #85).
 
@@ -34,7 +36,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: DKB-Setup-windows
-          path: build/release/DKB-Setup-*-windows.zip
+          path: |
+            build/release/DKB-Setup-*-windows.zip
+            build/release/DKB-Launcher.exe
+            build/release/dkb-release.txt
           if-no-files-found: error
 
   linux:
@@ -146,8 +151,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Check the launcher manifest against the tag and the files
+        run: |
+          # The launcher installs the release whose dkb-release.txt names its own tag, and downloads the zip it names
+          cat dist/dkb-release.txt
+          grep -qx "tag $GITHUB_REF_NAME" dist/dkb-release.txt || { echo "::error::dkb-release.txt does not name $GITHUB_REF_NAME: VERSION and the tag disagree"; exit 1; }
+          zip=$(awk '$1 == "tools" { print $4 }' dist/dkb-release.txt)
+          test -f "dist/$zip" || { echo "::error::dkb-release.txt names $zip, which is not among the release files"; exit 1; }
+          test -f dist/DKB-Launcher.exe || { echo "::error::DKB-Launcher.exe is missing"; exit 1; }
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/DKB-Setup-* --repo "$GITHUB_REPOSITORY" --latest --title "DKB Recomp $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/DKB-Setup-* dist/DKB-Launcher.exe dist/dkb-release.txt --repo "$GITHUB_REPOSITORY" --latest --title "DKB Recomp $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes

@@ -170,6 +170,16 @@
 
  "launcher.title": "TotK Setup",
  "launcher.python_missing": "The setup files are incomplete: the python folder next to TotK-Setup.exe is missing. Unpack the whole archive again and start TotK-Setup.exe from the unpacked folder.",
+ "launcher.confirm": "This launcher keeps the build tools in\n{base}\n\nIt downloads them now from the project's releases on GitHub (several hundred MB). You choose your copy of the game in the next window, and nothing outside that folder changes. Continue?",
+ "launcher.checking": "Looking for the latest release on GitHub...",
+ "launcher.downloading": "Downloading the build tools {tag} ({total} MB)...",
+ "launcher.unpacking": "Checking and unpacking the build tools...",
+ "launcher.no_release": "No release on GitHub carries the launcher's dkb-release.txt yet. Download the setup zip from {url} instead.",
+ "launcher.network": "GitHub could not be reached ({detail}). Check the internet connection and start the launcher again. Nothing was installed.",
+ "launcher.checksum": "The download does not match the checksum the release lists, so it was deleted and nothing was installed. Start the launcher again to retry.",
+ "launcher.unpack_failed": "The build tools could not be unpacked into {path} with Windows' tar.exe. Check the free space and your antivirus, then start the launcher again.",
+ "launcher.write_failed": "{path} cannot be written. Put the launcher in a folder of your own (not Program Files) and start it there.",
+ "launcher.start_failed": "No version that can start was found in {path}. Delete that folder and start the launcher again to download one.",
 
  "lang.ja": "Japanese",
  "lang.en-US": "English (US)",
