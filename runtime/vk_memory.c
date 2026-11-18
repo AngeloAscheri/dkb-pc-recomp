@@ -3186,7 +3186,9 @@ static struct {
     StJob *q[ST_SORT_Q];
     int head, n;
 } SS = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT, .done = PLAT_COND_INIT};
-static volatile int64_t st_sort_ns;   // TOTK_TRACE=perf, since the last staged line: the sorts' time
+// TOTK_TRACE=perf, since the last staged line: the sorts' time; the readers' waits for a sort and their time, [0] by
+// staged_upload (the replay thread), [1] by staged_wb_done (the completion thread).
+static volatile int64_t st_sort_ns, st_sort_waits[2], st_sort_wait_ns[2];
 
 // The sort thread, or the replay thread (TOTK_STAGED_FETCH_TEST, whose staged_ref_record reads the list next, or when
 // the thread could not be started). j->sorted is the last write to the job: a reader may free it right after.
@@ -3223,11 +3225,14 @@ static void st_sorter(void *arg) {
 
 // Before a reader of j->o: returns once the list is sorted. The sort thread sets the flag before it takes the lock to
 // broadcast, so a reader that found the flag clear under the lock is waiting when the broadcast comes.
-static void st_sorted_wait(const StJob *j) {
+static void st_sorted_wait(const StJob *j, int who) {
     if (__atomic_load_n(&j->sorted, __ATOMIC_ACQUIRE)) return;
+    uint64_t t0 = qpc();
     plat_mutex_lock(&SS.lock);
     while (!__atomic_load_n(&j->sorted, __ATOMIC_ACQUIRE)) plat_cond_wait(&SS.done, &SS.lock);
     plat_mutex_unlock(&SS.lock);
+    plat_inc64(&st_sort_waits[who]);
+    plat_add64(&st_sort_wait_ns[who], (int64_t)(qpc() - t0));
 }
 
 // staged_split_own, the job's list complete: the sort thread takes it (or this thread sorts it, see above).
@@ -4160,7 +4165,7 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
     plat_mutex_lock(&st_lock);
     // The owned lists st_blocked reads are sorted (st_sort_job), waited for before own_lock, which fetches take.
     for (const StJob *j = st_jobs; j; j = j->next)
-        if (j->ended && j->fence < fence) st_sorted_wait(j);
+        if (j->ended && j->fence < fence) st_sorted_wait(j, 0);
     if (staged_fault) plat_mutex_lock(&own_lock);   // the own lists stay as they are while they are read
     uint64_t tb = qpc();
     ncut = 0;
@@ -4396,7 +4401,7 @@ static void staged_wb_done(void *arg) {
     StJob *j = arg;
     uint64_t t_done = qpc();
     st_in_wb = 1;
-    st_sorted_wait(j);   // the sort thread's until sorted (st_sort_job)
+    st_sorted_wait(j, 1);   // the sort thread's until sorted (st_sort_job)
     if (j->no) {   // TOTK_STAGED_WB=fault: the writes that stay in the mirror
         if (j->tbuf) vmaInvalidateAllocation(vk_ctx()->vma, j->talloc, 0, VK_WHOLE_SIZE);   // TOTK_STAGED_FETCH_TEST
         for (int i = 0; i < j->no;) {
@@ -5571,18 +5576,21 @@ static void mirror_log(uint64_t frame) {
     if (staged_min) {
         int64_t wn = plat_xchg64(&st_wbcpu_ns, 0), wb = plat_xchg64(&st_wbcpu_bytes, 0);
         int64_t sn = plat_xchg64(&st_sort_ns, 0);
+        int64_t sw0 = plat_xchg64(&st_sort_waits[0], 0), swt0 = plat_xchg64(&st_sort_wait_ns[0], 0);
+        int64_t sw1 = plat_xchg64(&st_sort_waits[1], 0), swt1 = plat_xchg64(&st_sort_wait_ns[1], 0);
         rt_log("mem: staged frame %llu: per frame: upload %.3f MiB in %.1f ranges (%.3f MiB of write-backs in flight "
                "left out), CPU copy %.3f ms (blocked bytes looked up in %.3f ms for %.1f ranges, %.1f pieces found, "
                "staging buffers %.2f in %.3f ms, copies from guest memory %.3f ms); write-back %.3f MiB in %.1f ranges, "
                "recorded in %.3f ms, split for the own lists in %.3f ms (%.0f ranges, %.0f pieces), sorted in %.3f ms "
-               "(sort thread), "
+               "(sort thread; waits for it by the uploads %.2f, %.3f ms, at the fence %.2f, %.3f ms), "
                "%.3f MiB copied into guest memory in %.3f ms (completion thread); so far: first fills %d (%.0f MiB, %.1f "
                "ms in all), pools imported after all %d",
                (unsigned long long)frame, a.st_up_bytes / f / M, a.st_up_ranges / f, a.st_skip_bytes / f / M,
                qpc_ms(a.st_up_t) / f, qpc_ms(a.st_blk_t) / f, a.st_blk_n / f, a.st_blk_ranges / f,
                a.st_stg_n / f, qpc_ms(a.st_stg_t) / f, qpc_ms(a.st_cpy_t) / f,
                a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f,
-               qpc_ms(a.st_sp_loop_t) / f, a.st_sp_in / f, a.st_sp_pieces / f, qpc_ms((uint64_t)sn) / f, wb / f / M,
+               qpc_ms(a.st_sp_loop_t) / f, a.st_sp_in / f, a.st_sp_pieces / f, qpc_ms((uint64_t)sn) / f, sw0 / f,
+               qpc_ms((uint64_t)swt0) / f, sw1 / f, qpc_ms((uint64_t)swt1) / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
         const volatile StCount *s = &stc[0];
