@@ -2375,8 +2375,8 @@ typedef struct {
     // by part: the lookups of the blocked bytes (st_blocked: the upload ranges looked up, the pieces found, their time),
     // the staging buffers it took and their time, the copies out of guest memory.
     uint64_t pro_t, st_blk_t, st_blk_n, st_blk_ranges, st_stg_n, st_stg_t, st_cpy_t;
-    // TOTK_TRACE=perf: staged_split_own's sort and page split (time each), the ranges it took and the pieces it made.
-    uint64_t st_sp_sort_t, st_sp_loop_t, st_sp_in, st_sp_pieces;
+    // TOTK_TRACE=perf: staged_split_own's page split (its time), the ranges it took and the pieces it made.
+    uint64_t st_sp_loop_t, st_sp_in, st_sp_pieces;
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -2915,6 +2915,7 @@ typedef struct StJob {
     int n, cap;
     StRange *o;                         // TOTK_STAGED_WB=fault: the GPU writes that stay in the mirror (own_take)
     int no, co;
+    int sorted;                         // 0 while the sort thread has o (st_sort_queue); readers st_sorted_wait first
     uint32_t sub;                       // msub of the submission
     VkBuffer tbuf;                      // TOTK_STAGED_FETCH_TEST: the reference copy of the o ranges (staged_ref_record)
     VmaAllocation talloc;
@@ -3164,16 +3165,108 @@ static void own_cut(PoolRec *r, const struct KeptRange *cut, int n) {
     own_listed(r);
 }
 
+// ---- the sort of a job's owned ranges, on a thread of its own
+// Every reader of a job's owned ranges (j->o) wants them sorted by pool and offset, the ranges that overlap or touch
+// joined: st_blocked's binary search, staged_wb_done's runs per pool and own_take's merge. staged_split_own builds the
+// list in the order the submission noted its GPU writes, and this thread sorts it. Sorted on the replay thread at the
+// end of every submission, the 11,000 to 19,000 staged write-back ranges a frame of the Hilltop Layer of Surf Hills
+// (3.2.0) with TOTK_MIRROR_STAGED=all took 0.15 to 0.27 ms of it; without staged mirrors the write-back thread sorts the
+// same ranges for the held parts' write-backs (wb_job_run), beside the replay. The first reader, the next submission's
+// first staged upload, comes about a millisecond later, and a reader that comes before the sort is done waits for it
+// (st_sorted_wait). The thread only sorts memory the replay thread handed it (no lock, no Vulkan call, no pool record
+// read), so every wait for it ends, a lost device included; if it cannot be started the replay thread sorts.
+#define STRANGE_LESS(x, y) ((x)->r != (y)->r ? (uintptr_t)(x)->r < (uintptr_t)(y)->r : (x)->off < (y)->off)
+MSORT_DEFINE(sort_st_ranges, StRange, STRANGE_LESS)
+#define ST_SORT_Q 16
+static struct {
+    PlatMutex lock;
+    PlatCond cv, done;   // a job queued; a job sorted (so also room in the queue)
+    PlatThread *t;
+    int failed;          // the thread could not be started: the replay thread sorts
+    StJob *q[ST_SORT_Q];
+    int head, n;
+} SS = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT, .done = PLAT_COND_INIT};
+static volatile int64_t st_sort_ns;   // TOTK_TRACE=perf, since the last staged line: the sorts' time
+
+// The sort thread, or the replay thread (TOTK_STAGED_FETCH_TEST, whose staged_ref_record reads the list next, or when
+// the thread could not be started). j->sorted is the last write to the job: a reader may free it right after.
+static void st_sort_job(StJob *j) {
+    static _Thread_local StRange *sbuf;
+    static _Thread_local size_t scap;
+    uint64_t t0 = qpc();
+    sort_st_ranges(j->o, (size_t)j->no, &sbuf, &scap);
+    int o = 0;
+    for (int i = 0; i < j->no; i++) {
+        StRange *l = o ? &j->o[o - 1] : NULL;
+        if (l && l->r == j->o[i].r && j->o[i].off <= l->off + l->size) {
+            if (j->o[i].off + j->o[i].size > l->off + l->size) l->size = j->o[i].off + j->o[i].size - l->off;
+        } else j->o[o++] = j->o[i];
+    }
+    j->no = o;
+    plat_add64(&st_sort_ns, (int64_t)(qpc() - t0));
+    __atomic_store_n(&j->sorted, 1, __ATOMIC_RELEASE);
+}
+
+static void st_sorter(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&SS.lock);
+    for (;;) {
+        while (!SS.n) plat_cond_wait(&SS.cv, &SS.lock);
+        StJob *j = SS.q[SS.head];
+        plat_mutex_unlock(&SS.lock);
+        st_sort_job(j);
+        plat_mutex_lock(&SS.lock);
+        SS.head = (SS.head + 1) % ST_SORT_Q, SS.n--;
+        plat_cond_broadcast(&SS.done);
+    }
+}
+
+// Before a reader of j->o: returns once the list is sorted. The sort thread sets the flag before it takes the lock to
+// broadcast, so a reader that found the flag clear under the lock is waiting when the broadcast comes.
+static void st_sorted_wait(const StJob *j) {
+    if (__atomic_load_n(&j->sorted, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&SS.lock);
+    while (!__atomic_load_n(&j->sorted, __ATOMIC_ACQUIRE)) plat_cond_wait(&SS.done, &SS.lock);
+    plat_mutex_unlock(&SS.lock);
+}
+
+// staged_split_own, the job's list complete: the sort thread takes it (or this thread sorts it, see above).
+static void st_sort_queue(StJob *j) {
+    plat_mutex_lock(&SS.lock);
+    if (!SS.t && !SS.failed && !(SS.t = plat_thread_new(st_sorter, NULL, "vk staged sort"))) {
+        SS.failed = 1;
+        rt_log("mem: the staged sort thread could not be started; the replay thread sorts the owned ranges");
+    }
+    if (SS.failed) {
+        plat_mutex_unlock(&SS.lock);
+        st_sort_job(j);
+        return;
+    }
+    while (SS.n == ST_SORT_Q) plat_cond_wait(&SS.done, &SS.lock);
+    // No reader sees the job yet: st_blocked takes ended jobs only, and its fence comes after the submission.
+    __atomic_store_n(&j->sorted, 0, __ATOMIC_RELAXED);
+    SS.q[(SS.head + SS.n) % ST_SORT_Q] = j;
+    SS.n++;
+    plat_cond_signal(&SS.cv);
+    plat_mutex_unlock(&SS.lock);
+}
+
+static void st_sort_drain(void) {   // staged_shutdown: no job is being sorted when the jobs are freed
+    plat_mutex_lock(&SS.lock);
+    while (SS.n) plat_cond_wait(&SS.done, &SS.lock);
+    plat_mutex_unlock(&SS.lock);
+}
+
 // vk_mem_mirror_end, fault mode: the staged write-back ranges in stw split by page; those on pages the CPU has read
-// (fetched) stay in stw for the fence copy-back, the rest become the job's owned ranges.
+// (fetched) stay in stw for the fence copy-back (staged_wb_record sorts them), the rest become the job's owned ranges,
+// in the order the ranges came (a piece inside or right after the last one joins it), sorted by the sort thread
+// (above). The bytes each list gets are those the sorted split gave, and the sort joins what overlaps or touches, so
+// the lists are the same.
 static void staged_split_own(void) {
-    static MRange *sbuf, *fb;
-    static size_t scap;
+    static MRange *fb;
     static int nfb, cfb;
     StJob *j = st_cur;
     if (!j) rt_fatal("mem: a staged write-back outside a submission's recording");
-    uint64_t t0 = qpc();
-    sort_ranges(stw, (size_t)nstw, &sbuf, &scap);
     uint64_t t1 = qpc();
     nfb = 0;
     for (int i = 0; i < nstw; i++) {
@@ -3183,10 +3276,10 @@ static void staged_split_own(void) {
         for (uint64_t x = a; x < b;) {
             uint64_t e = (x & ~0xfffull) + 0x1000;
             if (e > b) e = b;
+            StRange *l = j->no ? &j->o[j->no - 1] : NULL;
             if (r->cpu_read && __atomic_load_n(&r->cpu_read[x >> 12], __ATOMIC_RELAXED)) {
                 range_add(&fb, &nfb, &cfb, r, x, e - x);
-            } else if (j->no && j->o[j->no - 1].r == r && j->o[j->no - 1].off + j->o[j->no - 1].size >= x) {
-                StRange *l = &j->o[j->no - 1];
+            } else if (l && l->r == r && l->off <= x && l->off + l->size >= x) {
                 if (e > l->off + l->size) l->size = e - l->off;
             } else {
                 if (j->no == j->co) grow((void **)&j->o, &j->co, sizeof *j->o);
@@ -3196,7 +3289,9 @@ static void staged_split_own(void) {
             mrep.st_sp_pieces++;
         }
     }
-    mrep.st_sp_sort_t += t1 - t0, mrep.st_sp_loop_t += qpc() - t1, mrep.st_sp_in += (uint64_t)nstw;
+    mrep.st_sp_loop_t += qpc() - t1, mrep.st_sp_in += (uint64_t)nstw;
+    if (j->no && fetch_test) st_sort_job(j);   // staged_ref_record, next, reads the sorted list
+    else if (j->no) st_sort_queue(j);
     nstw = 0;
     uint64_t fbb = 0;
     for (int i = 0; i < nfb; i++) range_add(&stw, &nstw, &cstw, fb[i].r, fb[i].off, fb[i].size), fbb += fb[i].size;
@@ -4063,6 +4158,9 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
     // hold the lock. No job ends meanwhile: vk_mem_mirror_end runs on this thread. A fetch that empties an own range
     // after this only makes guest memory equal the mirror there.
     plat_mutex_lock(&st_lock);
+    // The owned lists st_blocked reads are sorted (st_sort_job), waited for before own_lock, which fetches take.
+    for (const StJob *j = st_jobs; j; j = j->next)
+        if (j->ended && j->fence < fence) st_sorted_wait(j);
     if (staged_fault) plat_mutex_lock(&own_lock);   // the own lists stay as they are while they are read
     uint64_t tb = qpc();
     ncut = 0;
@@ -4298,6 +4396,7 @@ static void staged_wb_done(void *arg) {
     StJob *j = arg;
     uint64_t t_done = qpc();
     st_in_wb = 1;
+    st_sorted_wait(j);   // the sort thread's until sorted (st_sort_job)
     if (j->no) {   // TOTK_STAGED_WB=fault: the writes that stay in the mirror
         if (j->tbuf) vmaInvalidateAllocation(vk_ctx()->vma, j->talloc, 0, VK_WHOLE_SIZE);   // TOTK_STAGED_FETCH_TEST
         for (int i = 0; i < j->no;) {
@@ -4364,6 +4463,7 @@ static void staged_wb_done(void *arg) {
 // came (vk_sync_shutdown dropped their callbacks).
 static void staged_shutdown(VkCtx *c) {
     nstq = nstw = 0;
+    st_sort_drain();   // the sort thread holds no job of those freed below
     plat_mutex_lock(&st_lock);
     while (st_jobs) {
         StJob *j = st_jobs;
@@ -4924,6 +5024,7 @@ static void mirror_begin(void) {
         StJob *j = calloc(1, sizeof *j);
         if (!j) rt_fatal("vk: out of memory");
         j->fence = vk_sync_issued() + 1;
+        j->sorted = 1;   // until staged_split_own hands o to the sort thread
         plat_mutex_lock(&st_lock);
         j->next = st_jobs, st_jobs = j;
         plat_mutex_unlock(&st_lock);
@@ -5469,19 +5570,19 @@ static void mirror_log(uint64_t frame) {
            a.presnap_unused_bytes / f / M, ver);
     if (staged_min) {
         int64_t wn = plat_xchg64(&st_wbcpu_ns, 0), wb = plat_xchg64(&st_wbcpu_bytes, 0);
+        int64_t sn = plat_xchg64(&st_sort_ns, 0);
         rt_log("mem: staged frame %llu: per frame: upload %.3f MiB in %.1f ranges (%.3f MiB of write-backs in flight "
                "left out), CPU copy %.3f ms (blocked bytes looked up in %.3f ms for %.1f ranges, %.1f pieces found, "
                "staging buffers %.2f in %.3f ms, copies from guest memory %.3f ms); write-back %.3f MiB in %.1f ranges, "
-               "recorded in %.3f ms, split for the own lists in %.3f ms (sort %.3f, %.0f ranges; page split %.3f, %.0f "
-               "pieces), "
+               "recorded in %.3f ms, split for the own lists in %.3f ms (%.0f ranges, %.0f pieces), sorted in %.3f ms "
+               "(sort thread), "
                "%.3f MiB copied into guest memory in %.3f ms (completion thread); so far: first fills %d (%.0f MiB, %.1f "
                "ms in all), pools imported after all %d",
                (unsigned long long)frame, a.st_up_bytes / f / M, a.st_up_ranges / f, a.st_skip_bytes / f / M,
                qpc_ms(a.st_up_t) / f, qpc_ms(a.st_blk_t) / f, a.st_blk_n / f, a.st_blk_ranges / f,
                a.st_stg_n / f, qpc_ms(a.st_stg_t) / f, qpc_ms(a.st_cpy_t) / f,
                a.st_wb_bytes / f / M, a.st_wb_ranges / f, qpc_ms(a.st_wb_t) / f,
-               qpc_ms(a.st_sp_sort_t + a.st_sp_loop_t) / f, qpc_ms(a.st_sp_sort_t) / f, a.st_sp_in / f, qpc_ms(a.st_sp_loop_t) / f,
-               a.st_sp_pieces / f, wb / f / M,
+               qpc_ms(a.st_sp_loop_t) / f, a.st_sp_in / f, a.st_sp_pieces / f, qpc_ms((uint64_t)sn) / f, wb / f / M,
                qpc_ms((uint64_t)wn) / f, n_staged_fills, st_fill_bytes / M, qpc_ms((uint64_t)st_fill_ns),
                n_staged_imports);
         const volatile StCount *s = &stc[0];
