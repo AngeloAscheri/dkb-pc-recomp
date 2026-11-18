@@ -953,13 +953,28 @@ static uint32_t *own_chunk[GEN_CHUNKS];   // gen_lock
 // Every write-watch query of the generation table (gen_lock held exclusively): calls, bytes and time since the last
 // mirror summary, all consumers together; the queries that found written pages (they also flush TLBs) apart.
 static uint64_t ww_calls, ww_bytes, ww_ticks, ww_dirty_calls, ww_dirty_ticks, ww_pages;
+// TOTK_TRACE=perf (#317): the same queries' time on the CPU (plat_self_cpu_ns), so that a query that waits (in the
+// kernel, for another thread's VirtualQuery or VirtualProtect over the same reservation) shows apart from one that
+// works; the time by consumer; and the slowest query of the window with its range and answer.
+enum { WW_CHECK, WW_SNAP, WW_SHADOW, WW_DIRTY, WW_FREEZE, WW_WHO_N };
+static const char *const ww_who_name[WW_WHO_N] = {"texture check", "snapshot", "shadow sync", "dirty census", "freeze"};
+static uint64_t ww_cpu_ns, ww_who_ns[WW_WHO_N], ww_slow_ns, ww_slow_cpu, ww_slow_addr, ww_slow_size, ww_slow_pages;
+static int ww_slow_who;
 
-static uint64_t ww_query(uint64_t addr, uint64_t size) {
-    uint64_t t0 = qpc();
+static uint64_t ww_query(uint64_t addr, uint64_t size, int who) {
+    int perf = (rt_trace & RT_TRACE_PERF) != 0;
+    uint64_t c0 = perf ? plat_self_cpu_ns() : 0, t0 = qpc();
     uint64_t n = mem_written_pages(addr, size, gen_pages, sizeof gen_pages / sizeof *gen_pages);
     uint64_t dt = qpc() - t0;
     ww_ticks += dt, ww_calls++, ww_bytes += size;
     if (n && n != UINT64_MAX) ww_dirty_calls++, ww_dirty_ticks += dt, ww_pages += n;
+    if (perf) {
+        uint64_t cpu = plat_self_cpu_ns() - c0;
+        ww_cpu_ns += cpu, ww_who_ns[who] += dt;
+        if (dt > ww_slow_ns)
+            ww_slow_ns = dt, ww_slow_cpu = cpu, ww_slow_addr = addr, ww_slow_size = size,
+            ww_slow_pages = n == UINT64_MAX ? 0 : n, ww_slow_who = who;
+    }
     return n;
 }
 
@@ -1020,7 +1035,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
     while (!frozen) {
-        uint64_t n = ww_query(lo, hi - lo);
+        uint64_t n = ww_query(lo, hi - lo, WW_CHECK);
         if (n == UINT64_MAX) { tracked = 0; break; }
         for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
         if (n < sizeof gen_pages / sizeof *gen_pages) break;   // a full answer may have left pages for the next call
@@ -1064,7 +1079,7 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         int tracked = 1;
         if (!g) g = ++gen_now;
         for (;;) {
-            uint64_t n = ww_query(a, b - a);
+            uint64_t n = ww_query(a, b - a, WW_SNAP);
             if (n == UINT64_MAX) { tracked = 0; break; }
             for (uint64_t j = 0; j < n; j++) stamp_page(gen_pages[j], g);
             if (n < sizeof gen_pages / sizeof *gen_pages) break;
@@ -1175,9 +1190,9 @@ static uint64_t page_lo(const PoolRec *r) { return r->lo & ~0xfffull; }
 static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~0xfffull; }
 
 // gen_lock held exclusively. 0: the range is not write-watched.
-static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g, int who) {
     for (;;) {
-        uint64_t n = ww_query(lo, hi - lo);
+        uint64_t n = ww_query(lo, hi - lo, who);
         if (n == UINT64_MAX) return 0;
         for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
         if (n < sizeof gen_pages / sizeof *gen_pages) return 1;
@@ -1313,7 +1328,7 @@ static void shadow_sync_pool(PoolRec *r) {
         if (mem_frozen(a)) { a = b; continue; }
         while (b < hi && !mem_frozen(b)) b = b + (1ull << REG_SHIFT) < hi ? b + (1ull << REG_SHIFT) : hi;
         s_queries++;
-        if (!query_stamp(a, b, g)) tracked = 0;
+        if (!query_stamp(a, b, g, WW_SHADOW)) tracked = 0;
         a = b;
     }
     uint32_t since = r->sgen;
@@ -1615,10 +1630,10 @@ void vk_mem_dirty_submit(void) {
         for (; j < n && page_lo(dlist[j]) <= hi + DIRTY_GAP; j++)
             if (page_hi(dlist[j]) > hi) hi = page_hi(dlist[j]);
         queries++;
-        int ok = query_stamp(lo, hi, g);
+        int ok = query_stamp(lo, hi, g, WW_DIRTY);
         for (int k = i; k < j; k++) {
             dlist[k]->untracked = 0;
-            if (!ok) queries++, dlist[k]->untracked = (uint8_t)!query_stamp(page_lo(dlist[k]), page_hi(dlist[k]), g);
+            if (!ok) queries++, dlist[k]->untracked = (uint8_t)!query_stamp(page_lo(dlist[k]), page_hi(dlist[k]), g, WW_DIRTY);
         }
         i = j;
     }
@@ -2607,7 +2622,7 @@ static void freeze_pass(void) {
         if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
         done++;
         if (!mem_freeze(a)) { n_frz_refused++; continue; }
-        query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
+        query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now, WW_FREEZE);
     }
 }
 
@@ -3038,6 +3053,12 @@ static void mirror_log(uint64_t frame) {
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
     ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
+    uint64_t wcpu = ww_cpu_ns, who[WW_WHO_N], sl_ns = ww_slow_ns, sl_cpu = ww_slow_cpu, sl_a = ww_slow_addr,
+             sl_n = ww_slow_size, sl_p = ww_slow_pages;
+    int sl_who = ww_slow_who;
+    memcpy(who, ww_who_ns, sizeof who);
+    memset(ww_who_ns, 0, sizeof ww_who_ns);
+    ww_cpu_ns = ww_slow_ns = ww_slow_cpu = ww_slow_addr = ww_slow_size = ww_slow_pages = 0;
     plat_mutex_unlock(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
@@ -3049,6 +3070,26 @@ static void mirror_log(uint64_t frame) {
                "or mapping change %llu, refused %llu",
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
                fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr);
+    if (rt_trace & RT_TRACE_PERF) {
+        // #317: the queries' wall time against their CPU time, the slowest one, and what else asked the kernel about
+        // guest memory meanwhile (VirtualQuery and VirtualProtect by kind, the pointer guards' cache misses).
+        PlatVmStat vm[PLAT_VM_N];
+        plat_vm_stats(vm);
+        uint64_t gc, gm;
+        rt_guard_stats(&gc, &gm);
+        char vq[PLAT_VM_N][96];
+        static const char *const vm_name[PLAT_VM_N] = {"readable", "state", "lazy heap", "protect"};
+        for (int k = 0; k < PLAT_VM_N; k++)
+            snprintf(vq[k], sizeof vq[k], "%s %.1f (%.3f ms, longest %.2f ms, run %.0f MiB)", vm_name[k],
+                     vm[k].calls / wf, vm[k].ns / 1e6 / wf, vm[k].max_ns / 1e6, vm[k].max_run / 1048576.0);
+        rt_log("mem: write-watch frame %llu: per frame, on the CPU %.3f ms of %.3f ms; by consumer ms: %s %.3f, %s %.3f, "
+               "%s %.3f, %s %.3f, %s %.3f; slowest %.3f ms (%.3f on the CPU) over %.1f MiB at %#llx, %llu pages, by %s; "
+               "host memory calls per frame: %s, %s, %s, %s; pointer guards %.0f, cache misses %.1f",
+               (unsigned long long)frame, wcpu / 1e6 / wf, qpc_ms(wt) / wf, ww_who_name[0], who[0] / 1e6 / wf,
+               ww_who_name[1], who[1] / 1e6 / wf, ww_who_name[2], who[2] / 1e6 / wf, ww_who_name[3], who[3] / 1e6 / wf,
+               ww_who_name[4], who[4] / 1e6 / wf, sl_ns / 1e6, sl_cpu / 1e6, sl_n / 1048576.0, (unsigned long long)sl_a,
+               (unsigned long long)sl_p, ww_who_name[sl_who], vq[0], vq[1], vq[2], vq[3], gc / wf, gm / wf);
+    }
     if (!vk_mirror_on) return;
     plat_mutex_lock(&mirror_stat_lock);
     MirrorAcc a = macc;

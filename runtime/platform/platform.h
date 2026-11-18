@@ -436,6 +436,20 @@ void plat_mem_walk(void (*fn)(uint64_t base, uint64_t size, int kind, void *arg)
 // Bytes of [base, base+size) that are in the process working set (resident). Windows only (QueryWorkingSetEx); the
 // other hosts return 0.
 uint64_t plat_mem_resident(uint64_t base, uint64_t size);
+// The host's own address-space queries and protection changes, for TOTK_TRACE=perf (#317). On Windows a VirtualQuery
+// reports the whole run of pages that share the queried page's state, so its cost grows with that run (about 5 us per
+// resident MiB: a page in a long read-write stretch of the committed guest heap costs milliseconds), and while it runs
+// a GetWriteWatch over the same reservation waits. Counted per kind of caller since the last call; the other hosts,
+// whose queries cost no such scan, report zeros.
+enum { PLAT_VM_READABLE, PLAT_VM_STATE, PLAT_VM_LAZY, PLAT_VM_PROTECT, PLAT_VM_N };
+typedef struct {
+    uint64_t calls, ns, max_ns;
+    uint64_t max_run;   // the longest run a query reported, in bytes (0 for PLAT_VM_PROTECT)
+} PlatVmStat;
+void plat_vm_stats(PlatVmStat out[PLAT_VM_N]);
+// The calling thread's CPU time in ns (user and kernel), fine-grained (Windows: QueryThreadCycleTime, where
+// plat_thread_cpu_ns has GetThreadTimes' 15.6 ms steps), for telling work from waiting in one timed call.
+uint64_t plat_self_cpu_ns(void);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;
