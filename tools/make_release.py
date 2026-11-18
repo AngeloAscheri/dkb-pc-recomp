@@ -493,9 +493,41 @@ def build_launcher(out, llvm):
     # winhttp.dll and bcrypt.dll are not KnownDLLs, so without the flag Windows looks for them first in the exe's own
     # folder: a DLL of that name left in Downloads beside DKB-Launcher.exe would run inside it. 0x800 is
     # LOAD_LIBRARY_SEARCH_SYSTEM32, which the loader then uses for every static import of the exe.
+    exe = out / (GAMES[GAME]['name'] + '.exe')
     run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-municode', '-Wall', '-Wl,-s',
          f'-Wl,--dependent-load-flag={DEPENDENT_LOAD_FLAG}', '-I', work, *launcher_sources(GAME), res,
-         '-o', out / (GAMES[GAME]['name'] + '.exe')], env=env)
+         '-o', exe], env=env)
+    check_launcher(exe)
+
+
+def check_launcher(exe):
+    """Stop the build when the linker did not write the flag into the exe (a linker that ignores the option)."""
+    flags = dependent_load_flags(exe)
+    if flags != int(DEPENDENT_LOAD_FLAG, 16):
+        sys.exit(f'{exe}: DependentLoadFlags {flags:#x}, not {DEPENDENT_LOAD_FLAG}')
+    print(f'{exe.name}: DependentLoadFlags {flags:#x}')
+
+
+def dependent_load_flags(path):
+    """DependentLoadFlags of a PE32+ image: the field of its load configuration directory (IMAGE_LOAD_CONFIG_DIRECTORY64
+    at offset 0x4e) the loader uses as the search flags of every static import; 0 when the image has none."""
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    if data[pe:pe + 4] != b'PE\0\0' or struct.unpack_from('<H', data, pe + 24)[0] != 0x20b:
+        raise ValueError(f'{path}: not a PE32+ image')
+    sections, optional_size = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+    opt = pe + 24
+    if struct.unpack_from('<I', data, opt + 108)[0] <= 10:   # NumberOfRvaAndSizes: no load configuration entry
+        return 0
+    rva = struct.unpack_from('<I', data, opt + 112 + 10 * 8)[0]   # data directory 10, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG
+    if not rva:
+        return 0
+    for i in range(sections):
+        virtual_size, virtual, raw_size, raw = struct.unpack_from('<IIII', data, opt + optional_size + 40 * i + 8)
+        if virtual <= rva < virtual + max(virtual_size, raw_size):
+            at = raw + rva - virtual
+            return struct.unpack_from('<H', data, at + 0x4e)[0] if struct.unpack_from('<I', data, at)[0] >= 0x50 else 0
+    raise ValueError(f'{path}: the load configuration is in no section')
 
 
 def launcher_sources(game):

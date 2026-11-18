@@ -338,15 +338,17 @@ class LauncherBuildTest(unittest.TestCase):
     """The launcher builds tools/make_release.py makes: the release has no test overrides, the TotK setup none of the
     download code."""
 
-    def build(self, *flags_and_sources, name):
+    def build(self, *flags_and_sources, name, game='dkb'):
         sys.path.insert(0, str(ROOT / 'tools'))
         import make_release
-        work = Path(self.work.name)
-        make_release.launcher_header(work / 'launcher_text.h', 'dkb')
+        work = Path(self.work.name) / game
+        make_release.launcher_header(work / 'launcher_text.h', game)
         out = work / name
         subprocess.run([CLANG, '-O1', '-mwindows', '-municode', '-Wall', '-Werror', '-Wno-missing-field-initializers',
-                        '-I', str(work), *map(str, flags_and_sources), '-o', str(out)], check=True, capture_output=True,
+                        '-fuse-ld=lld', '-I', str(work), *map(str, flags_and_sources), '-o', str(out)], check=True,
+                       capture_output=True,
                        env={**os.environ, 'PATH': str(Path(CLANG).parent) + os.pathsep + os.environ.get('PATH', '')})
+        self.exe = out
         return out.read_bytes()
 
     def setUp(self):
@@ -367,10 +369,24 @@ class LauncherBuildTest(unittest.TestCase):
     def test_totk_setup_has_no_download_code(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         import make_release
-        exe = self.build(*make_release.launcher_sources('totk'), name='totk.exe').upper()
+        exe = self.build(*make_release.launcher_sources('totk'), name='totk.exe', game='totk').upper()
         self.assertNotIn(b'WINHTTP.DLL', exe)
         self.assertNotIn(b'BCRYPT.DLL', exe)
         self.assertNotIn('dkb-release.txt'.upper().encode('utf-16-le'), exe)
+
+    def test_dependent_load_flags_are_read_back(self):
+        """make_release.check_launcher reads the flag out of the linked exe, so a linker that dropped the option
+        stops the build instead of publishing a launcher that loads a winhttp.dll from its own folder."""
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import make_release
+        sources = make_release.launcher_sources('dkb')
+        self.build('-Wl,--dependent-load-flag=0x800', *sources, name='flag.exe')
+        self.assertEqual(make_release.dependent_load_flags(self.exe), 0x800)
+        make_release.check_launcher(self.exe)
+        self.build(*sources, name='plain.exe')
+        self.assertEqual(make_release.dependent_load_flags(self.exe), 0)
+        with self.assertRaises(SystemExit):
+            make_release.check_launcher(self.exe)
 
 
 class CheckTest(unittest.TestCase):
@@ -978,10 +994,11 @@ class ReleaseToolTest(unittest.TestCase):
             out = Path(self.work.name) / 'out'
             with patch.object(self.m, 'run', side_effect=lambda cmd, **kw: commands.append([str(c) for c in cmd])), \
                     patch.object(self.m, 'launcher_header'), patch.object(self.m, 'clean_env', return_value={}), \
-                    patch.object(self.m, 'GAME', game):
+                    patch.object(self.m, 'check_launcher') as checked, patch.object(self.m, 'GAME', game):
                 self.m.build_launcher(out, Path(self.work.name) / 'llvm')
             link = next(c for c in commands if Path(c[0]).name == 'clang.exe')
             self.assertIn('-Wl,--dependent-load-flag=0x800', link, game)
+            self.assertEqual(checked.call_args[0][0], Path(link[link.index('-o') + 1]))   # the flag is read back
             sources = {Path(c).name for c in link if c.endswith('.c')}
             if game == 'dkb':
                 self.assertEqual(sources, {'launcher.c', 'manifest.c', 'fetch.c'})
