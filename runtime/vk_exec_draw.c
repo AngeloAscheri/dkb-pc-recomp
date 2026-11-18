@@ -851,19 +851,22 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
     VkBufferCopy regions[128];
     uint32_t nregions = 0;
     vk_exec_barrier(ex);   // the copies follow every earlier access to the records
+    int unbacked = 0;   // a staged pool was left unbacked by a use below
     for (uint32_t i = 0, n = batch ? nsorted : list.count; i < n; i++) {
         uint64_t addr = batch ? sorted[i] : pointers[i];
         if (!addr) continue;
         VkMemSpan span;
-        if (!vk_mem_resolve(addr, sizeof record, &span))
-            rt_fatal("vk: an indirect-reset mapping changed during replay");
+        // A staged pool left unbacked at a use (vk.h VK_MEM_USE): its records are not reset, nor noted by
+        // reset_batch, whose resolve of them would now fail; neither do the later targets in that pool, which no
+        // longer resolve. The other targets' records still are: a list with a target that was unbacked already is
+        // refused whole by the check above, before any copy is recorded.
+        int ok = vk_mem_resolve(addr, sizeof record, &span);
+        if (!ok && !unbacked) rt_fatal("vk: an indirect-reset mapping changed during replay");
         // Commit first-use imports to their mirror before choosing the destination. A later indirect bind must
         // read this same backing rather than create a mirror from the old contents.
-        VK_MEM_USE(span);
-        // A staged pool left unbacked at this use (vk.h VK_MEM_USE): its record is not reset, nor noted by reset_batch,
-        // whose resolve of it would now fail. The other targets' records still are: a list with a target that was
-        // unbacked already is refused whole by the check above, before any copy is recorded.
-        if (!span.buffer) {
+        if (ok) VK_MEM_USE(span);
+        if (!ok || !span.buffer) {
+            unbacked = 1;
             if (batch) sorted[i] = 0;
             continue;
         }
