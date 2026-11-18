@@ -218,3 +218,48 @@ presents every second vsync (33.3 ms) and the replay takes 20 to 26 ms a frame a
   a draw in the heavy part before, 0.89 and 0.89 after; first minute 43.8 and 43.6 fps before, 43.5 and 43.6 after
   (the heavy part still presents every second vsync), frames over 50 ms 22 and 23 before, 14 and 16 after; second
   minute 50.8 and 49.1 fps before, 53.5 and 55.1 after.
+
+## Weak GPU (clock locked at 900 MHz)
+
+The RTX 5060 Ti with its graphics clock locked at 900 MHz (`nvidia-smi -lgc 210,900`, by an administrator) stands in
+for a weak GPU: about a third of its boost clock. Same layer -200 recording on a player's save (3.2.0), 16 logical
+processors, 60 fps limit, warm caches, the game's own upscaler, frame generation off, SDR. `gpu avg` is the perf
+trace's GPU time per frame in the heavy part (frames 1800 to 3000).
+
+| Output, `scene_res` | 3D scene | first minute fps | second minute fps | `gpu avg` (ms) |
+| --- | --- | --- | --- | --- |
+| 1920x1080, auto (default) | 931x524 to 1280x720 | 55.8, 55.8, 55.5 | 58.7, 58.9, 58.6 | 9.3 to 9.7 |
+| 1920x1080, full | 1920x1080 | 54.3 | 56.5 | 11.6 to 11.8 |
+| 2560x1440, auto | 1241x699 to 1706x960 | 52.6 | 56.8 | 11.7 to 12.0 |
+| 2560x1440, full | 2560x1440 | 50.8, 51.1, 50.7 | 50.2, 51.0, 49.9 | 14.8 to 15.3 |
+
+`TOTK_PASS_GPU=1` (`docs/dkb-testing.md`) splits the GPU time by pass and op. In the heavy part at 1920x1080 auto,
+per frame: the scene passes at the 3D size about 3.6 ms (two 2-target passes 2.2 ms, about seven 3-target passes 1.3
+ms), dispatches 3.0 ms in 87 a frame (one compute shader 1.5 ms in 43 dispatches of about 34 us, its count following
+the terrain: 6 to 76 a frame), 35 colour clears 0.33 ms, the shadow map 0.2 ms, 17 post-process passes at 1280x720
+0.2 ms. At 2560x1440 full the 3-target passes take 3.9 to 5.0 ms and the 2-target ones 2.4 ms: the scene's own
+shading grows with its size, and that is where a weak GPU goes.
+
+What the runtime adds is small next to that:
+
+- The mirror prologues (guest memory copied to the GPU before a part) 0.19 ms, uploads 0.02 to 0.07 ms, the window's
+  present 0.06 to 0.09 ms. No depth twin was copied in this scene.
+- The full barrier before each pass, clear and dispatch (`vk_exec.c` `barrier_to`), as yuzu and Eglantine end every
+  render pass with one: what runs between a pass's end and the next mark is about 1 ms at a full-size scene. At a
+  scaled scene the figure reads 3.1 ms, but the sum of all keys then runs 2.4 ms over `gpu avg`; held-back parts of
+  one submission complete in one callback, so that line counts some time twice.
+- `TOTK_CS_BARRIER=1` and `game` changed nothing here (2.95 and 2.84 ms of dispatches against 3.03, 50.8 fps at
+  2560x1440 full against 50.8): the dispatches follow passes, not other dispatches, so the full barrier before them
+  stays.
+- Depth-stencil D24S8 is drawn as D32S8 (`vk_formats.c`), on two passes a frame at the full size (0.13 ms at 931x524,
+  0.83 ms at 2560x1440). Using D24S8 where the device has it would change depth precision, so it is not a change
+  without a rendering difference.
+
+The GPU is not what holds the default setting back: at 1920x1080 auto it is busy 9.4 ms of a 16.7 ms frame, and the
+first minute's misses come from the level transition and the first frames of the heavy part. At 2560x1440 full it is
+busy 15 ms of a 20 ms frame (50 fps).
+
+Recommended for a weak GPU: `scene_res = auto`, so the game's dynamic resolution draws the scene at two thirds of the
+output on each side, with the game's own upscaler (the default; DLSS and FSR were not measured here). `full` costs 2.3
+ms a frame of GPU time at 1920x1080 and 3.3 ms at 2560x1440. Each step up in output resolution costs about as much as
+`full` at the step below: keep the output at the monitor's size, and lower it before turning `full` on.
