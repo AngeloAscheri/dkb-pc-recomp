@@ -326,7 +326,9 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 //   mirror is created on first use and sp.buffer becomes it (same offsets); a pool that stays imported keeps its buffer.
 // - VK_MEM_PICK where a copy, fill or update reads or writes a span: the mirror if the pool has one, never a new one,
 //   except for a staged pool (TOTK_MIRROR_STAGED), whose spans resolve with a null buffer: both give it its mirror, or
-//   import it when it cannot have one. Code that uses sp.buffer calls one of them first.
+//   import it when it cannot have one. Code that uses sp.buffer calls one of them first, and skips the span when
+//   sp.buffer is still null after it (a staged pool with neither a mirror nor an import: vk_memory.c staged_import
+//   leaves it unbacked, as a pool whose first-use import failed), as it does a span vk_mem_resolve did not return.
 // - vk_mem_gpu_wrote after recording a GPU write of [sp.offset, sp.offset + size) into sp.buffer: a mirror's bytes go
 //   back to guest memory at the end of the submission. No-op for imported buffers.
 // - vk_mem_mirror_begin at the start of a submission's recording, vk_mem_mirror_end (records the write-backs; returns

@@ -2907,18 +2907,19 @@ static int nstq, cstq, nstw, cstw;
 static MRange *st_blk;                  // st_lock: union of the write-back ranges in flight (st_blk_update)
 static int nst_blk, cst_blk, st_blk_dirty = 1;
 static uint64_t st_blk_fence;           // st_lock: the prologue fence it was built for
-static volatile int32_t n_staged_imports, n_staged_fills;
+static volatile int32_t n_staged_imports, n_staged_fills, n_staged_import_failures;
 static volatile int64_t st_fill_ns, st_fill_bytes, st_wbcpu_ns, st_wbcpu_bytes;
 // What became of the staged pools, [0] since the start (the staged line), [1] since the last present (staged_frame_log):
 // mirrors whose first fill went into a prologue (small: count, mirror bytes, written bytes copied, CPU copy time) or
 // through staged_fill (big); imports after all by reason (the MR_ reasons of a refused mirror, then the first use on a
-// helper thread and a refusal without a reason, as for a pool finalized meanwhile) with their bytes; releases (all,
+// helper thread and a refusal without a reason, as for a pool finalized meanwhile) with their bytes, and those whose
+// import failed as well (left unbacked, staged_import) with their bytes; releases (all,
 // never imported and so with no GPU wait, of those the ones only CPU paths had resolved, with a mirror, imported after
 // all) and the time vk_pool_fini took for them.
 enum { SI_HELPER = MR_N, SI_GONE, SI_N };
 static const char *const si_name[SI_N] = {"budget", "untracked", "overlapping", "allocation", "helper thread", "other"};
 typedef struct {
-    int64_t small_n, small_bytes, small_copied, small_ns, big_n, imp_n[SI_N], imp_bytes[SI_N];
+    int64_t small_n, small_bytes, small_copied, small_ns, big_n, imp_n[SI_N], imp_bytes[SI_N], imp_failed, imp_failed_bytes;
     int64_t rel_n, rel_never, rel_cpu, rel_mirror, rel_imported, rel_ns;
     int64_t drop_n, drop_bytes;   // released pools that dropped GPU-owned bytes unfetched (staged_forget), and the bytes
 } StCount;
@@ -2944,12 +2945,14 @@ static void staged_frame_log(uint64_t frame) {
     for (int k = 0; k < SI_N; k++) imp += c.imp_n[k];
     rt_log("mem: frame %llu: staged pools: %lld mirrors filled in a prologue (%.1f MiB, %.1f MiB of written pages "
            "copied in %.1f ms), %lld by staged_fill; imported after all %lld (budget %lld, untracked %lld, overlapping %lld, "
-           "allocation %lld, helper thread %lld, other %lld); released %lld in %.1f ms (never imported %lld, with a mirror "
-           "%lld, imported %lld), %lld of them dropping %.3f MiB of GPU-owned bytes unfetched",
+           "allocation %lld, helper thread %lld, other %lld), import failed and left unbacked %lld (%.1f MiB); released "
+           "%lld in %.1f ms (never imported %lld, with a mirror %lld, imported %lld), %lld of them dropping %.3f MiB of "
+           "GPU-owned bytes unfetched",
            (unsigned long long)frame, (long long)c.small_n, c.small_bytes / M, c.small_copied / M, c.small_ns / 1e6,
            (long long)c.big_n, (long long)imp, (long long)c.imp_n[MR_BUDGET], (long long)c.imp_n[MR_UNTRACKED],
            (long long)c.imp_n[MR_OVERLAP], (long long)c.imp_n[MR_ALLOC], (long long)c.imp_n[SI_HELPER],
-           (long long)c.imp_n[SI_GONE], (long long)c.rel_n, c.rel_ns / 1e6, (long long)c.rel_never,
+           (long long)c.imp_n[SI_GONE], (long long)c.imp_failed, c.imp_failed_bytes / M, (long long)c.rel_n,
+           c.rel_ns / 1e6, (long long)c.rel_never,
            (long long)c.rel_mirror, (long long)c.rel_imported, (long long)c.drop_n, c.drop_bytes / M);
 }
 
@@ -3764,8 +3767,11 @@ static void ft_log(uint64_t frame) {
 
 // The span's pool resolved without a buffer (staged_pending) and the mirror cannot serve this use: import it after
 // all, as lazy_import does on a first GPU use. Logged once per pool (the first 32) and counted by reason (stc: an MR_
-// reason of the refused mirror, SI_HELPER or SI_GONE). Neither a mirror nor an import is the one case a resolved span
-// cannot be given a buffer, so it stops the game with a line instead of binding no buffer.
+// reason of the refused mirror, SI_HELPER or SI_GONE). When the import fails too, the pool ends as one whose first-use
+// import failed (resolve_locked, lazy_import): lazy_import has logged and counted it (n_import_failures), the pool is
+// no longer staged_pending and has no buffer, so every later resolve reports its addresses as unbacked, and the users
+// of those skip them. This span stays without a buffer, and its user skips it the same way (VK_MEM_USE and VK_MEM_PICK
+// in vk.h); the pool gets a line (the first 32) and is counted in the staged lines (imp_failed).
 static void staged_import(VkMemSpan *sp, int why) {
     static const char *const text[SI_N] = {"its VRAM mirror does not fit the budget", "its range is not write-watched",
                                            "it overlaps or shares a page with another pool",
@@ -3776,9 +3782,18 @@ static void staged_import(VkMemSpan *sp, int why) {
     pool_lock_shared();   // as resolve_locked: the record stays alive while lazy_import runs
     int ok = lazy_import(r, -1, "for a staged pool after all");
     plat_mutex_unlock_shared(&pool_lock);
-    if (!ok)
-        rt_fatal("mem: staged pool %#llx+%#llx has neither a mirror nor an import (%s)", (unsigned long long)r->lo,
-                 (unsigned long long)r->size, text[why]);
+    if (!ok) {
+        sp->buffer = VK_NULL_HANDLE;
+        if (!plat_xchg32(&r->sfell, 1)) {   // once per pool: the spans resolved before the failure come here too
+            long n = plat_inc32(&n_staged_import_failures);
+            ST_ADD(imp_failed, 1), ST_ADD(imp_failed_bytes, r->size);
+            if (n <= 32)
+                rt_log("mem: staged pool %#llx+%#llx has neither a mirror nor an import (%s): its uses are skipped as "
+                       "those of an unbacked pool (%ld so far)", (unsigned long long)r->lo, (unsigned long long)r->size,
+                       text[why], n);
+        }
+        return;
+    }
     if (!plat_xchg32(&r->sfell, 1)) {
         long n = plat_inc32(&n_staged_imports);
         ST_ADD(imp_n[why], 1), ST_ADD(imp_bytes[why], r->size);
@@ -5402,11 +5417,13 @@ static void mirror_log(uint64_t frame) {
                 o += (size_t)snprintf(imp + o, sizeof imp - o, ", %s %lld (%.1f MiB)", si_name[k], (long long)s->imp_n[k],
                                       s->imp_bytes[k] / M);
         rt_log("mem: staged pools frame %llu: so far: mirrors with the first fill in a prologue %lld (%.1f MiB, %.1f MiB of "
-               "written pages copied in %.1f ms), by staged_fill %lld; imported after all %d%s; released %lld in %.1f ms "
+               "written pages copied in %.1f ms), by staged_fill %lld; imported after all %d%s; import failed and left "
+               "unbacked %d (%.1f MiB); released %lld in %.1f ms "
                "(never imported, no GPU wait: %lld, %lld of them resolved only by CPU paths; with a mirror %lld; imported "
                "%lld), owned bytes dropped unfetched %.2f MiB",
                (unsigned long long)frame, (long long)s->small_n, s->small_bytes / M, s->small_copied / M,
-               s->small_ns / 1e6, (long long)s->big_n, n_staged_imports, imp, (long long)s->rel_n, s->rel_ns / 1e6,
+               s->small_ns / 1e6, (long long)s->big_n, n_staged_imports, imp, n_staged_import_failures,
+               s->imp_failed_bytes / M, (long long)s->rel_n, s->rel_ns / 1e6,
                (long long)s->rel_never, (long long)s->rel_cpu, (long long)s->rel_mirror, (long long)s->rel_imported,
                own_drop_bytes / M);
         mem_probe_log(frame, 0);

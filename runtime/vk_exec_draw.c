@@ -700,7 +700,7 @@ static int written_overlaps(VkExec *ex, uint64_t addr, uint64_t size) {
 
 // TOTK_RESET_BATCH: the nonnull targets in address order (*out, the replaying thread's buffer, *n of them), and whether
 // two share a byte, as reset_targets_overlap answers. msort returns at once on a list already in order.
-static int reset_sort(const uint64_t *pointers, uint32_t count, const uint64_t **out, uint32_t *n) {
+static int reset_sort(const uint64_t *pointers, uint32_t count, uint64_t **out, uint32_t *n) {
     static uint64_t *sorted, *sbuf;   // the replaying thread's
     static size_t cap, scap;
     if (cap < count) {
@@ -741,6 +741,10 @@ static void reset_batch(VkExec *ex, const uint64_t *sorted, uint32_t n) {
     }
     uint32_t nr = 0;
     for (uint32_t i = 0, j; i < n; i = j) {
+        if (!sorted[i]) {   // a target the copies skipped (vk_exec_reset_indirect): nothing written
+            j = i + 1;
+            continue;
+        }
         uint64_t lo = sorted[i], hi = lo + rec;
         for (j = i + 1; j < n && sorted[j] == hi; j++) hi += rec;
         // The run's first record resolves as its copy did. A run of more records is noted with that span only when
@@ -838,7 +842,7 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
     // once per run of adjacent records (reset_batch) instead of once per record.
     static int batch_mode = -1;
     uint32_t nsorted = 0;
-    const uint64_t *sorted = NULL;
+    uint64_t *sorted = NULL;
     int ordered;
     if (knob_on(&batch_mode, "RESET_BATCH", "1")) ordered = reset_sort(pointers, list.count, &sorted, &nsorted);
     else ordered = reset_targets_overlap(pointers, list.count);
@@ -856,6 +860,13 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
         // Commit first-use imports to their mirror before choosing the destination. A later indirect bind must
         // read this same backing rather than create a mirror from the old contents.
         VK_MEM_USE(span);
+        // A staged pool left unbacked at this use (vk.h VK_MEM_USE): its record is not reset, nor noted by reset_batch,
+        // whose resolve of it would now fail. The other targets' records still are: a list with a target that was
+        // unbacked already is refused whole by the check above, before any copy is recorded.
+        if (!span.buffer) {
+            if (batch) sorted[i] = 0;
+            continue;
+        }
         if (ordered) vk_exec_barrier(ex);   // preserves the input order of duplicate or overlapping target ranges
         VkBufferCopy copy = {source_offset, span.offset, sizeof record};
         if (!ordered) {
@@ -1670,6 +1681,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (sp.offset % align == 0) {
         if (written && IS_HELPER(dc) && vk_spec_fail(VK_SPEC_WRITE)) return 0;   // as note_written
         VK_MEM_USE(sp);
+        if (!sp.buffer) return 0;   // a staged pool left unbacked (vk.h VK_MEM_USE): as an unbacked address
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         if (written) {
             // In a slice, a store over a uniform snapshot copy depends on the draw order (vk_usnap.c vk_usnap_drop).
@@ -3789,6 +3801,7 @@ static void bind_vertex_buffers(VkExec *ex) {
         VkMemSpan sp;
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
         VK_MEM_USE(sp);
+        if (!sp.buffer) continue;   // a staged pool left unbacked (vk.h VK_MEM_USE): the zero stand-in, as unbacked
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
         vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
     }
@@ -4538,6 +4551,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         return warn_once(W_INDEX, "index buffer %#llx is not aligned to its index size: draw skipped", (unsigned long long)d->ibuf);
     } else {
         VK_MEM_USE(sp);
+        if (!sp.buffer)   // a staged pool left unbacked (vk.h VK_MEM_USE)
+            return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
         dig_index(dc, sp.buffer, sp.offset, NULL, 0);
         vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         ex->recorded++;
@@ -4570,6 +4585,9 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     merge_note(ex, 2, d->prim, 0, 0, d->itype, d->ibuf, 1, 0);
     VK_MEM_USE(ip);
     VK_MEM_USE(ib);
+    if (!ip.buffer || !ib.buffer)   // a staged pool left unbacked (vk.h VK_MEM_USE)
+        return warn_once(W_INDIRECT, "indirect draw arguments at %#llx or index buffer %#llx are not backed: draws skipped",
+                         (unsigned long long)d->ind, (unsigned long long)d->ibuf);
     dig_index(dc, ib.buffer, ib.offset, NULL, 0), dig_index(dc, ip.buffer, ip.offset, NULL, 0);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
@@ -4894,6 +4912,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
     vk_exec_barrier_cs(ex);   // its arguments may come from the dispatch before (DRAW_INDIRECT in the compute barrier)
     VK_MEM_USE(ip);
+    if (!ip.buffer)   // a staged pool left unbacked (vk.h VK_MEM_USE)
+        return warn_once(W_INDIRECT, "indirect dispatch arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     dc->c0_dim[0] = dc->c0_dim[1] = dc->c0_dim[2] = 0;
     c0_lay_set(ex, cs);
@@ -4929,6 +4949,8 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VkDeviceSize o;
     memcpy(scratch(ex, u->size, &b, &o), u->data, u->size);
     VK_MEM_PICK(sp);
+    if (!sp.buffer)   // a staged pool left unbacked (vk.h VK_MEM_PICK)
+        return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
     VkBufferCopy cp = {o, sp.offset, u->size};
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
     vk_mem_gpu_wrote(&sp, u->size);
