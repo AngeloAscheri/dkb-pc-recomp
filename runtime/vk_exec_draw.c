@@ -4570,53 +4570,58 @@ static int mvk_upscale_blit(VkExec *ex, const GfxShader *cs) {
 // over more than a few workgroups, from a single-sampled 2D B10G11R11 texture of at least 256 pixels a side into a
 // larger B10G11R11 image of the same aspect ratio (1280x720 or the dynamic 1397x786 into 1920x1080). The MoltenVK blit
 // (mvk_upscale_blit) keeps to the hashes: it replaces the dispatch without the further checks DLSS and FSR 3.1 make.
-// The hash of a shader's SPIR-V, taken once per shader (gfx_shader_spirv_fnv), timed for TOTK_TRACE=perf.
+// The declared slots and then the images are looked at before the hash, which only adds the listed shaders to the ones
+// the images take: hashing a shader's SPIR-V (once per shader, gfx_shader_spirv_fnv) costs about a nanosecond a byte,
+// and every new compute shader of a layer's first frame paid it here on the replay thread: 26 hashes, 5.3 ms, the
+// longest 4.6 ms, in the Hilltop Layer's first frame (TOTK_TRACE=perf, 3.2.0), none with this order. The line that
+// names a shader the images took hashes it a frame later (seen_log).
 static uint64_t spirv_hash(const GfxShader *cs) {
-    uint64_t ph = perf_ph_begin();   // a part of the replay (perf.c ph_frame)
+    uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); cached after the first
     uint64_t h = gfx_shader_spirv_fnv(cs);
     perf_ph_end(PERF_PH_SPIRV_HASH, ph);
     return h;
 }
 
+// The shaders taken by their images (the first 4), logged by seen_log with their hash a frame later.
+typedef struct { const GfxShader *cs; uint32_t aw, ah, bw, bh; int same; uint64_t caller; } TakenCs;
+static TakenCs taken_cs[4];
+static int ntaken_cs, nlogged_taken;
+
 static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
-    uint64_t h = spirv_hash(cs);
-    if (mvk_upscale_cs(h)) return 1;
-    if (!info || !d) return 0;
     int ntex = 0, nimg = 0, fit = 1;
-    for (uint32_t i = 0; i < info->n_bindings; i++) {
+    for (uint32_t i = 0; info && i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
         if (!bd->res) continue;
         if (bd->kind == GFX_RES_TEX) ntex++, fit &= bd->res->slot == 0;
         if (bd->kind == GFX_RES_IMG) nimg++, fit &= bd->res->slot == 1 && (bd->res->flags & 4);   // 4: written
     }
-    if (!fit || ntex != 1 || nimg != 1 || (int64_t)d->x * d->y < 16 || d->z != 1) return 0;
-    uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
-    view_t vs, vd;
-    int hvs = 0, hvd = 0;
-    const VkTexImage *a = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
-    const VkTexImage *b = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
-    // The output must be strictly larger: with equal sizes this shape (one B10G11R11 texture in, one written image out,
-    // 256 or more wide) is also any same-size post-process compute pass, so it could not be told from the upscaler. The
-    // one exception is native anti-aliasing (dkb_wide.c dkb_native_aa): the game's upscale step is then made to run at
-    // full size, and that dispatch is known by the guest address that issues it, not by its shape.
-    int same = a && b && b->width == a->width && b->height == a->height && dkb_native_aa_issued_by(d->caller);
-    if (!a || !b || a->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || b->format != a->format || a->samples > 1 ||
-        b->samples > 1 || a->type != VK_IMAGE_TYPE_2D || b->type != VK_IMAGE_TYPE_2D || a->width < 256 ||
-        a->height < 256 || (!same && (b->width <= a->width || b->height <= a->height)))
-        return 0;
-    double aspect = (double)a->width / a->height - (double)b->width / b->height;
-    if (aspect < -0.02 || aspect > 0.02) return 0;
-    static uint64_t told[4];   // the first few hashes taken by shape, for the list in mvk_upscale_cs
-    static int ntold;
-    int i = 0;
-    while (i < ntold && told[i] != h) i++;
-    if (i == ntold && ntold < 4) {
-        told[ntold++] = h;
-        rt_log("upscaler: compute shader %016llx is taken for the game's upscaler by its images (%ux%u -> %ux%u%s, "
-               "issued at %#llx)", (unsigned long long)h, a->width, a->height, b->width, b->height,
-               same ? ": the same size, native anti-aliasing" : "", (unsigned long long)d->caller);
+    if (info && (!fit || ntex != 1 || nimg != 1)) return 0;
+    // By its images first: a shader taken by them needs no hash (the hash list below only adds shaders).
+    if (info && d && (int64_t)d->x * d->y >= 16 && d->z == 1) {
+        uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
+        view_t vs, vd;
+        int hvs = 0, hvd = 0;
+        const VkTexImage *a = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
+        const VkTexImage *b = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
+        // The output must be strictly larger: with equal sizes this shape (one B10G11R11 texture in, one written image
+        // out, 256 or more wide) is also any same-size post-process compute pass, so it could not be told from the
+        // upscaler. The one exception is native anti-aliasing (dkb_wide.c dkb_native_aa): the game's upscale step is
+        // then made to run at full size, and that dispatch is known by the guest address that issues it, not by its
+        // shape.
+        int same = a && b && b->width == a->width && b->height == a->height && dkb_native_aa_issued_by(d->caller);
+        double aspect = a && b ? (double)a->width / a->height - (double)b->width / b->height : 1.0;
+        if (a && b && a->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && b->format == a->format && a->samples <= 1 &&
+            b->samples <= 1 && a->type == VK_IMAGE_TYPE_2D && b->type == VK_IMAGE_TYPE_2D && a->width >= 256 &&
+            a->height >= 256 && (same || (b->width > a->width && b->height > a->height)) && aspect >= -0.02 &&
+            aspect <= 0.02) {
+            int i = 0;
+            while (i < ntaken_cs && taken_cs[i].cs != cs) i++;
+            if (i == ntaken_cs && ntaken_cs < 4)
+                taken_cs[ntaken_cs++] = (TakenCs){cs, a->width, a->height, b->width, b->height, same, d->caller};
+            return 1;
+        }
     }
-    return 1;
+    return mvk_upscale_cs(spirv_hash(cs));
 }
 
 // upscaler = dlss (experimental): the same dispatch of the game's upscaler is replaced by NVIDIA DLSS on its input
@@ -4625,27 +4630,49 @@ static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info
 // runs. NGX binds its own pipelines and descriptors into the command buffer (FSR 3.1 its own pushes), so the caller
 // forgets the bound state (vk_exec_draw_new_cb) after it; -1 (it failed after it may have bound its own): the caller
 // also binds the game's pipeline and resources again before its dispatch.
+// The upscaler is matched by hash or shape (game_upscaler): with DLSS, FSR 3.1 or FSR 4 on, the compute shaders seen
+// that were not it (the first 48 distinct) are listed, so a run that never reaches the upscaler shows which dispatch it
+// missed. The line names a shader by the hash of its SPIR-V, which takes milliseconds for a large shader, and a layer's
+// first frame meets dozens of new ones before its upscale: so a shader is noted at its dispatch with its image sizes,
+// and seen_log, at the first dispatch of each frame, hashes and logs one noted shader. The replay thread only.
+typedef struct { const GfxShader *cs; uint32_t aw, ah, bw, bh; int af, bf; } SeenCs;
+static SeenCs seen_cs[48];
+static int nseen_cs, nlogged_cs;
+
+static void seen_note(VkExec *ex, const GfxShader *cs) {
+    int i = 0;
+    while (i < nseen_cs && seen_cs[i].cs != cs) i++;
+    if (i < nseen_cs || nseen_cs == 48) return;
+    uint64_t ds = ex->tex[NVN_STAGE_CS][0], dd = ex->img[NVN_STAGE_CS][1];
+    view_t ws, wd;
+    int hws = 0, hwd = 0;
+    const VkTexImage *a = ds ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(ds), &ws, &hws) : NULL;
+    const VkTexImage *b = dd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(dd), &wd, &hwd) : NULL;
+    seen_cs[nseen_cs++] = (SeenCs){cs, a ? a->width : 0, a ? a->height : 0, b ? b->width : 0, b ? b->height : 0,
+                                   a ? (int)a->format : 0, b ? (int)b->format : 0};
+}
+
+static void seen_log(void) {
+    static uint64_t last = UINT64_MAX;
+    uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if ((nlogged_cs == nseen_cs && nlogged_taken == ntaken_cs) || f == last) return;
+    last = f;
+    if (nlogged_taken < ntaken_cs) {   // the first few hashes taken by shape, for the list in mvk_upscale_cs
+        const TakenCs *t = &taken_cs[nlogged_taken++];
+        rt_log("upscaler: compute shader %016llx is taken for the game's upscaler by its images (%ux%u -> %ux%u%s, "
+               "issued at %#llx)", (unsigned long long)spirv_hash(t->cs), t->aw, t->ah, t->bw, t->bh,
+               t->same ? ": the same size, native anti-aliasing" : "", (unsigned long long)t->caller);
+        return;
+    }
+    const SeenCs *s = &seen_cs[nlogged_cs++];
+    rt_log("dlss: (DLSS, FSR 3.1 and FSR 4) compute shader %016llx is not the game's upscaler (tex0 %ux%u fmt %d, img1 %ux%u fmt %d)",
+           (unsigned long long)spirv_hash(s->cs), s->aw, s->ah, s->af, s->bw, s->bh, s->bf);
+}
+
 static int dlss_upscale(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
     if (!vk_temporal_wanted()) return 0;
     if (!game_upscaler(ex, cs, info, d)) {
-        // The upscaler is matched by hash or shape (game_upscaler): with DLSS, FSR 3.1 or FSR 4 on, list the compute shaders
-        // seen (the first 48 distinct) so a run that never reaches the upscaler shows which dispatch it missed.
-        static uint64_t seen[48];
-        static int nseen;
-        uint64_t h = spirv_hash(cs);
-        int i = 0;
-        while (i < nseen && seen[i] != h) i++;
-        if (i == nseen && nseen < 48) {
-            seen[nseen++] = h;
-            uint64_t ds = ex->tex[NVN_STAGE_CS][0], dd = ex->img[NVN_STAGE_CS][1];
-            view_t ws, wd;
-            int hws = 0, hwd = 0;
-            const VkTexImage *a = ds ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(ds), &ws, &hws) : NULL;
-            const VkTexImage *b = dd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(dd), &wd, &hwd) : NULL;
-            rt_log("dlss: (DLSS, FSR 3.1 and FSR 4) compute shader %016llx is not the game's upscaler (tex0 %ux%u fmt %d, img1 %ux%u fmt %d)",
-                   (unsigned long long)h, a ? a->width : 0, a ? a->height : 0, a ? (int)a->format : 0,
-                   b ? b->width : 0, b ? b->height : 0, b ? (int)b->format : 0);
-        }
+        seen_note(ex, cs);
         return 0;
     }
     uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
@@ -4726,7 +4753,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     // the dispatch's binds, and the bound state is forgotten when it recorded. The replay thread's copy only: a
     // TOTK_REPLAY_PAR helper translating a dispatch leaves it to the replay thread.
     if (!OFF_MAIN(dc) && vk_dlss_wanted() && vk_dlss_warm(ex->cb, ex->fence)) vk_exec_draw_new_cb(ex), ex->dirty = VK_EXEC_DIRTY_ALL;
-    if (!OFF_MAIN(dc)) vk_temporal_idle_tick(ex->fence);   // once a frame: an upscaler not chosen lets go (vk_dlss.c)
+    if (!OFF_MAIN(dc)) vk_temporal_idle_tick(ex->fence), seen_log();   // once a frame: an upscaler not chosen lets go (vk_dlss.c)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     dc->c0_dim[0] = (uint32_t)d->x, dc->c0_dim[1] = (uint32_t)d->y, dc->c0_dim[2] = (uint32_t)d->z;
     c0_lay_set(ex, cs);
