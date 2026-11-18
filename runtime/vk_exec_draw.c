@@ -533,6 +533,12 @@ static int stage_origin_on(void) {
     static int mode = -1;
     return knob_on(&mode, "DESC_STAGE_ORIGIN", "1");
 }
+// TOTK_DYN_KEEP (on by default): a pipeline bind keeps B.st, so a draw records only the dynamic states that differ
+// from the last one set. Off forgets B.st at every graphics pipeline bind and records every state again, as before.
+static int dyn_keep_on(void) {
+    static int mode = -1;
+    return knob_on(&mode, "DYN_KEEP", "1");
+}
 
 
 static const char *const BSF_NAME[BSF_N] = {
@@ -3738,6 +3744,7 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
     }
     ex->recorded++;
     dc->B.pipe[k] = p;   // B.st stays: every replay pipeline has the same dynamic states, which a bind leaves as set
+    if (!k && !dyn_keep_on()) dc->B.st_valid = 0;   // TOTK_DYN_KEEP=0: record every state after a bind
 }
 
 static void record_fixed(VkExec *ex) {
