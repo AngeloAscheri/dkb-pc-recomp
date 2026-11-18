@@ -173,3 +173,17 @@ int rt_guard_vcall(uint64_t obj) {
     uint64_t fn = *(const volatile uint64_t *)(uintptr_t)(vt + 0x10);
     return fn >= text && fn < text_end && !(fn & 3) ? 1 : guard_fail("vcall slot", obj, fn);   // code of main
 }
+
+// ---- the job graph builder's edge guards (#317; recomp/patches-dkb458752.txt main+0x111674 and main+0x111678,
+// recomp/patches-dkb100.txt main+0x11d854 and main+0x11d858)
+// The builder makes one node per job of a graph description, records node i in slot base + i of the graph's node
+// table, then walks the description's edges (two u16 job indices each) and looks both ends up in that table. An edge
+// whose slot the build did not fill reads null there: the description held more jobs when its edges were read than
+// when its jobs were. In #317 those were the last one or two edges: a job added with the edges to and from it.
+// rt_guard_edge checks the source (x13) and the target (x12) of each edge before the build follows them; the failing
+// path goes on with the next edge, as for a full link pool.
+
+int rt_guard_edge(uint64_t node) {
+    if (guard_ok(node) && guard_readable(node, 0x30)) return 1;   // the build reads the node's +0x10 .. +0x2b
+    return guard_fail("edge", node, 0);
+}
