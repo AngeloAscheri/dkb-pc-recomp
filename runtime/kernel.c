@@ -1692,7 +1692,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
     uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
     if (!plat_mem_commit(stack, MAIN_STACK))
         rt_fatal("kernel: commit the main thread stack at %#llx failed", (unsigned long long)stack);
-    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 7);
+    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 1ull << MAIN_CORE);   // the kernel starts it on its ideal core alone
     t->started = 1;
     t->is_main = 1;
     t->stack_top = stack + MAIN_STACK;
@@ -1827,12 +1827,20 @@ int kern_svc(Cpu *c, uint32_t imm) {
     if (g_diag > 0 && tcur) tcur->dg_svc = imm;
     switch (imm) {
     case 0x08: {   // CreateThread(-> w1 handle; x1 entry, x2 arg, x3 stack top, w4 priority, w5 core)
-        int prio = (int)x[4], core = (int)x[5];
-        if (!x[1] || !x[3] || prio < 28 || prio > 59 || core < -3 || core > 2) {
+        // As on Horizon (and Eglantine, svc_thread.cpp CreateThread, k_thread.cpp KThread::Initialize), a new thread
+        // may run on its ideal core only until SetThreadCoreMask widens its mask; core -2 is the process's ideal core
+        // (main.npdm META, MAIN_CORE). Bananza creates every thread with -2 and gives most of them a mask, but five
+        // keep the default and so share core 0 with the main thread at a lower or equal priority: they run only while
+        // the main thread waits. One of them, a loader at priority 47, adds a job and its edges to the description of
+        // the main thread's per-frame job graph (3.2.0 f_700056b6dc) without a lock; given cores 0-2 it did so while
+        // the main thread built the graph from that description, and the build met edges to a job it had not made
+        // (#317, recomp/patches-dkb458752.txt main+0x111674).
+        int prio = (int)x[4], core = (int)x[5] == -2 ? MAIN_CORE : (int)x[5];
+        if (!x[1] || !x[3] || prio < 28 || prio > 59 || core < 0 || core >= NCORE) {
             x[0] = R_BAD_STATE;
             return 1;
         }
-        RtThread *t = thr_new(prio, core >= 0 ? core : MAIN_CORE, core >= 0 ? 1ull << core : 7);
+        RtThread *t = thr_new(prio, core, 1ull << core);
         t->entry = x[1];
         t->arg = x[2];
         t->stack_top = x[3] & ~15ull;
@@ -1938,14 +1946,16 @@ int kern_svc(Cpu *c, uint32_t imm) {
         unlock();
         return 1;
     }
-    case 0x0F: {   // SetThreadCoreMask(w0 handle, w1 ideal core, x2 mask): -1 process default, -2/-3 keep the ideal core
+    case 0x0F: {   // SetThreadCoreMask(w0 handle, w1 ideal core, x2 mask): -2 the process's ideal core and that core
+                   // alone, -3 keeps the ideal core, -1 (no ideal core) prefers core 0
         lock();
         RtThread *t = h_get((uint32_t)x[0], O_THREAD);
         if (t) {
             int core = (int)x[1];
             if (core >= 0) t->core = core;
             else if (core == -1) t->core = MAIN_CORE;
-            if (x[2]) t->mask = x[2];
+            if (core == -2) t->core = MAIN_CORE, t->mask = 1ull << MAIN_CORE;   // Horizon: the ideal core alone
+            else if (x[2]) t->mask = x[2];
             if (t == tcur && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) {   // move off a forbidden core
                 core_put(t);
                 core_take(t);

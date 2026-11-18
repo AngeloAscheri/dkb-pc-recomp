@@ -180,10 +180,10 @@ int rt_guard_vcall(uint64_t obj) {
 // The builder makes one node per job of a graph description, records node i in slot base + i of the graph's node
 // table, then walks the description's edges (two u16 job indices each) and looks both ends up in that table. An edge
 // whose slot the build did not fill reads null there: the description held more jobs when its edges were read than
-// when its jobs were. In #317 those were the last one or two edges: a job added with the edges to and from it.
-// rt_guard_edge checks the source (x13) and the target (x12) of each edge before the build follows them; the failing
-// path goes on with the next edge, as for a full link pool. The first failures also log what tells who changed the
-// description (edge_report).
+// when its jobs were. In #317 that was a job added with the edges to and from it, by a loader thread that the console
+// keeps off the main thread's core (runtime/kernel.c, svc 0x08). rt_guard_edge checks the source (x13) and the target
+// (x12) of each edge before the build follows them; the failing path goes on with the next edge, as for a full link
+// pool. The first failures also log what tells who changed the description (edge_report).
 
 static uint64_t rd64(uint64_t a) { uint64_t v = 0; return plat_mem_read(a, &v, 8) ? v : 0; }
 static uint32_t rd32(uint64_t a) { uint32_t v = 0; return plat_mem_read(a, &v, 4) ? v : 0; }
