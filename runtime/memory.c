@@ -92,14 +92,20 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 // read) fails on a read-only page instead of faulting, so file reads thaw their buffer first (mem_thaw), and so does
 // every commit, decommit and protection change here. A region stays thawed for FRZ_HOLD_MS after a mem_thaw: a file
 // read still in flight writes its buffer later. frz_lock is a leaf lock: nothing writes guest memory under it.
+// frz[r] is FRZ_WHOLE for a region that was committed throughout at its freeze, FRZ_HOLES for one with reserved holes.
 #define FRZ_SHIFT 21
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
+enum { FRZ_HOLES = 1, FRZ_WHOLE = 2 };
 static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
 static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
 static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+// TOTK_FRZ_WHOLE=0 (an A/B of the thaw, TOTK_TRACE=perf shows the difference): every region is thawed the way one with
+// holes is, a query per read-only run, from the bottom up. Read at the first freeze (frz_lock), before which nothing
+// is thawed.
+static int frz_whole = -1;
 
 static int heap_lazy(void);
 
@@ -110,13 +116,23 @@ static int watched(uint64_t addr, uint64_t size) {
 }
 
 // frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
-static void thaw_locked(uint64_t r, int why) {
+// writable: the caller already made the region read-write (thaw_range_locked, a run of FRZ_WHOLE regions).
+static void thaw_locked(uint64_t r, int why, int writable) {
     if (why == 2) thaw_ms[r] = (uint32_t)plat_now_ms() | 1;
-    if (!frz[r]) return;
-    // The read-only runs only: freeze_locked left reserved holes (heap pages given back) as they were. Every committed
-    // page of a frozen region was read-write at the freeze, and mapping changes thaw before they run, so these are all
-    // ours.
+    int f = frz[r];
+    if (!f) return;
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, b;
+    // A region committed throughout at its freeze is still committed throughout and read-only: nothing decommits a page
+    // or changes its protection without thawing first (commit, decommit and protect below), the lazy heap's fault handler
+    // and mem_touch commit reserved pages only, and the one race left (win32.c lazy_commit) can only make a page
+    // read-write again. So one protection change thaws it, with no query. A query would report the whole run of
+    // read-only pages after the address, all the frozen regions above it, and on Windows its cost grows with that run:
+    // with a query per region, a layer exit's thaw of the 450 MiB terrain pool (vk_pool_fini, 226 regions) took 50 to
+    // 100 ms under frz_lock, and the replay thread's next write-watch query waited for all of it.
+    if (writable || (f == FRZ_WHOLE && plat_mem_protect(a, FRZ_SIZE, PLAT_PROT_RW))) a = end;
+    // Otherwise the read-only runs only: freeze_locked left reserved holes (heap pages given back) as they were. Every
+    // committed page of a frozen region was read-write at the freeze, and mapping changes thaw before they run, so these
+    // are all ours.
     for (; a < end; a = b)
         if (plat_mem_state(a, end, &b) == PLAT_PROT_READ && !plat_mem_protect(a, b - a, PLAT_PROT_RW))
             rt_fatal("memory: thawing %#llx+%#llx failed", (unsigned long long)a, (unsigned long long)(b - a));
@@ -125,11 +141,30 @@ static void thaw_locked(uint64_t r, int why) {
     plat_inc64(&frz_count[why]);
 }
 
-// frz_lock held exclusively.
+// frz_lock held exclusively. From the top down: a region with holes still queries its runs (thaw_locked), and once
+// the regions above it are writable, the read-only run its query reports ends inside it. Adjacent FRZ_WHOLE regions
+// (up to FRZ_RUN of them) are made writable with one protection change: with one per 2 MiB region (30 to 40 us
+// each), the terrain pool's 220 still made the replay's next write-watch query wait 5 to 9 ms, while with four calls of
+// 1 to 2 ms it mostly got in between them. A run that the call refuses (one that crosses into another reservation) is
+// thawed region by region.
+#define FRZ_RUN 64
 static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     if (!n || a >= RT_ADDRESS_LIMIT) return;
     uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
-    for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
+    if (!frz_whole) {
+        for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why, 0);
+    } else {
+        for (uint64_t r = r1 + 1; r-- > r0;) {
+            uint64_t lo = r;
+            while (frz[r] == FRZ_WHOLE && lo > r0 && frz[lo - 1] == FRZ_WHOLE && r - lo + 1 < FRZ_RUN) lo--;
+            if (lo < r && plat_mem_protect(lo << FRZ_SHIFT, (r - lo + 1) << FRZ_SHIFT, PLAT_PROT_RW)) {
+                for (uint64_t q = lo; q <= r; q++) thaw_locked(q, why, 1);
+                r = lo;
+                continue;
+            }
+            thaw_locked(r, why, 0);
+        }
+    }
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
@@ -139,7 +174,8 @@ void mem_thaw(uint64_t a, uint64_t n) {
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
-// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again. Returns
+// FRZ_WHOLE when the region is one committed run, FRZ_HOLES when it has holes, 0 when it was refused.
 static int freeze_locked(uint64_t r) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
     int n = 0;
@@ -156,18 +192,23 @@ static int freeze_locked(uint64_t r) {
             while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
             return 0;
         }
-    return n > 0;
+    return !n ? 0 : n == 1 && run[0][0] == a && run[0][1] == end && frz_whole ? FRZ_WHOLE : FRZ_HOLES;
 }
 
 int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
-    int ok = 0;
+    int ok = 0, how;
     plat_mutex_lock(&frz_lock);
+    if (frz_whole < 0) {
+        const char *e = cfg_get("TOTK_FRZ_WHOLE");
+        frz_whole = !(e && !strcmp(e, "0"));
+        if (!frz_whole) rt_log("mem: frozen regions are thawed with a query per read-only run (TOTK_FRZ_WHOLE=0)");
+    }
     if (frz[r]) ok = 1;
     else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
-    else if (freeze_locked(r)) {
-        __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
+    else if ((how = freeze_locked(r))) {
+        __atomic_store_n(&frz[r], (uint8_t)how, __ATOMIC_RELEASE);
         plat_inc32(&nfrz);
         plat_inc64(&frz_count[0]);
         ok = 1;
@@ -192,7 +233,7 @@ static int thaw_fault(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
     plat_mutex_lock(&frz_lock);
     int was = frz[a >> FRZ_SHIFT];
-    thaw_locked(a >> FRZ_SHIFT, 1);
+    thaw_locked(a >> FRZ_SHIFT, 1, 0);
     plat_mutex_unlock(&frz_lock);
     if (was) return 1;
     uint64_t end;
