@@ -207,3 +207,14 @@ presents every second vsync (33.3 ms) and the replay takes 20 to 26 ms a frame a
   43.5 fps with 15 and 21 frames over 50 ms (was 42.7 to 42.9 fps, 19 to 30); on 16 logical processors 58.5 fps, 6
   over 50 ms. What is left over 50 ms in the first minute is the game's own loading outside the replay and the first
   frame of the heavy part (pool imports).
+- A sampling profile of the slices (`TOTK_PROFILE`) put the binary search of `vk_usnap.c` `first_above` at about half
+  of `bind_resources`' own samples: every uniform binding of every draw asks it. Four cuts of redundant per-draw work
+  followed: the search starts from its last answer for the address's 64 KiB block; an index buffer the command buffer
+  has bound already is not bound again, and only the changed range of the 17 vertex bindings is; `TOTK_DESC_C0_SERIAL`
+  and `TOTK_DESC_STAGE_ORIGIN`, measured gains left off, are on; and `vk_pipeline_set_dynamic_from` records only the
+  dynamic states whose inputs differ from the last recorded ones, across pipeline binds too, since every replay pipeline
+  has the same dynamic states. `DKB_DRAW_PROFILE` slices: 1809 ns a draw before, 1559 after (uniform buffers 248 to
+  163, state 147 to 106, vertex buffers 146 to 112, other ops 266 to 230). Two runs each at 3F: replay 0.99 and 0.96 us
+  a draw in the heavy part before, 0.89 and 0.89 after; first minute 43.8 and 43.6 fps before, 43.5 and 43.6 after
+  (the heavy part still presents every second vsync), frames over 50 ms 22 and 23 before, 14 and 16 after; second
+  minute 50.8 and 49.1 fps before, 53.5 and 55.1 after.

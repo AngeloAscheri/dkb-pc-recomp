@@ -3737,8 +3737,7 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
         if (crumb) rec_crumb(ex->cb, VK_CRUMB_BIND, vk_crumb_bind_note(p, o[0], o[1], o[2]));
     }
     ex->recorded++;
-    dc->B.pipe[k] = p;
-    if (!k) dc->B.st_valid = 0;
+    dc->B.pipe[k] = p;   // B.st stays: every replay pipeline has the same dynamic states, which a bind leaves as set
 }
 
 static void record_fixed(VkExec *ex) {
@@ -4392,7 +4391,7 @@ static int prepare_draw_impl(VkExec *ex, int prim, int32_t count, int restart) {
     if (dc->MR.want) merge_pick(ex, &s, &p, &info);   // a run of draws that may go as instances (vk_exec_draw_merge)
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!dc->B.st_valid || memcmp(&dc->B.st, &s, sizeof s)) {
-        vk_pipeline_set_dynamic(ex->cb, &s);
+        vk_pipeline_set_dynamic_from(ex->cb, &s, dc->B.st_valid ? &dc->B.st : NULL);   // only what differs from B.st
         ex->recorded++;
         dc->B.st = s, dc->B.st_valid = 1;
     }
