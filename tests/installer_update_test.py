@@ -606,6 +606,18 @@ class ReleaseToolTest(unittest.TestCase):
         self.m.launcher_header(out, 'totk')
         self.assertIn('#define LAUNCHER_REPO L""', out.read_text(encoding='ascii'))   # TotK: only the setup
 
+    def test_launcher_loads_its_dlls_from_system32_only(self):
+        """The launcher is run from Downloads: its static imports (winhttp.dll, bcrypt.dll) must not be looked for
+        beside it, where a downloaded DLL of that name would be loaded instead of Windows' own."""
+        commands = []
+        out = Path(self.work.name) / 'out'
+        with patch.object(self.m, 'run', side_effect=lambda cmd, **kw: commands.append([str(c) for c in cmd])), \
+                patch.object(self.m, 'launcher_header'), patch.object(self.m, 'clean_env', return_value={}):
+            self.m.build_launcher(out, Path(self.work.name) / 'llvm')
+        link = next(c for c in commands if Path(c[0]).name == 'clang.exe')
+        self.assertIn('-Wl,--dependent-load-flag=0x800', link)
+        self.assertIn('-lwinhttp', link)
+
     def test_manifest_and_launcher_beside_the_zip(self):
         folder = Path(self.work.name) / 'DKB-Setup'
         folder.mkdir()

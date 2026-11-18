@@ -21,7 +21,9 @@
    launcher releases: there the program is only the setup). DKB_LAUNCHER_BASE replaces the DKB-Recomp folder, and
    DKB_LAUNCHER_MANIFEST and DKB_LAUNCHER_DOWNLOAD the two GitHub links (http only to this machine), for tests.
    Build: llvm/bin/llvm-windres -I runtime -O coff launcher.rc -o launcher_rc.o, then
-   llvm/bin/clang -O2 -mwindows -municode launcher.c launcher_rc.o -lwinhttp -lbcrypt -lcomctl32 -o DKB-Setup.exe */
+   llvm/bin/clang -O2 -mwindows -municode -Wl,--dependent-load-flag=0x800 launcher.c launcher_rc.o -lwinhttp -lbcrypt
+   -lcomctl32 -o DKB-Setup.exe. The flag (LOAD_LIBRARY_SEARCH_SYSTEM32) makes Windows load winhttp.dll and bcrypt.dll,
+   which are not KnownDLLs, from System32 only, never from the folder the exe was downloaded to. */
 #ifndef UNICODE
 #define UNICODE
 #endif

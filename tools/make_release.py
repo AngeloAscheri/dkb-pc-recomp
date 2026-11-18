@@ -464,6 +464,7 @@ def c_wide(text):
 LAUNCHER_TEXT = ('title', 'python_missing', 'confirm', 'checking', 'downloading', 'unpacking', 'no_release', 'network',
                  'checksum', 'unpack_failed', 'write_failed', 'start_failed')
 LAUNCHER = 'DKB-Launcher.exe'   # the standalone download: the same file as the folder's DKB-Setup.exe
+DEPENDENT_LOAD_FLAG = '0x800'   # LOAD_LIBRARY_SEARCH_SYSTEM32 for the launcher's static imports (build_launcher)
 
 
 def launcher_header(path, game=None):
@@ -489,9 +490,12 @@ def build_launcher(out, llvm):
     res = work / 'launcher_rc.o'
     run([llvm / 'bin' / 'llvm-windres.exe', '-I', ROOT / 'runtime', '-O', 'coff',
          ROOT / 'installer' / 'launcher' / 'launcher.rc', '-o', res], env=env)
-    run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-municode', '-Wall', '-Wl,-s', '-I', work,
-         ROOT / 'installer' / 'launcher' / 'launcher.c', res, '-lwinhttp', '-lbcrypt', '-lcomctl32',
-         '-o', out / (GAMES[GAME]['name'] + '.exe')], env=env)
+    # winhttp.dll and bcrypt.dll are not KnownDLLs, so without the flag Windows looks for them first in the exe's own
+    # folder: a DLL of that name left in Downloads beside DKB-Launcher.exe would run inside it. 0x800 is
+    # LOAD_LIBRARY_SEARCH_SYSTEM32, which the loader then uses for every static import of the exe.
+    run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-municode', '-Wall', '-Wl,-s',
+         f'-Wl,--dependent-load-flag={DEPENDENT_LOAD_FLAG}', '-I', work, ROOT / 'installer' / 'launcher' / 'launcher.c',
+         res, '-lwinhttp', '-lbcrypt', '-lcomctl32', '-o', out / (GAMES[GAME]['name'] + '.exe')], env=env)
 
 
 def write_launcher_release(out, zip_path):
