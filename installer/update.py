@@ -412,12 +412,34 @@ def remove_tree(path):
     return not trash.exists()
 
 
+WINDOWS_DEVICES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', *(f'{d}{n}' for d in ('COM', 'LPT')
+                                                                    for n in (*'123456789', '¹', '²', '³'))}
+UNPACK_RATIO = 20           # unpack_limit: at most 20 times the zip's size (the tools zip unpacks to about 3 times)
+UNPACK_FLOOR = 1 << 30      # but always 1 GiB, so that a small zip is never refused for its ratio
+UNPACK_LIMIT = 64 << 30     # and never more than 64 GiB
+
+
+def unpack_limit(asset):
+    """The most a zip of asset may unpack to: UNPACK_RATIO times its checked size, at least UNPACK_FLOOR, at most
+    UNPACK_LIMIT. A zip whose members add up to more (a zip bomb) is refused before anything is written."""
+    return min(UNPACK_LIMIT, max(UNPACK_FLOOR, UNPACK_RATIO * asset.size))
+
+
+def windows_name_ok(part):
+    """Whether Windows creates a file of exactly this name: no character it forbids (<>:"|?* and controls), no trailing
+    dot or space (Windows drops them, so two names could meet), no device name (CON, NUL.txt, COM1...)."""
+    if any(c in '<>:"|?*' or ord(c) < 32 for c in part) or part != part.rstrip(' .'):
+        return False
+    return part.split('.')[0].rstrip(' ').upper() not in WINDOWS_DEVICES
+
+
 def member_path(name, top):
-    """The path below the top folder of a zip member, or UpdateError for a name that could leave the folder."""
+    """The path below the top folder of a zip member, or UpdateError for a name that could leave the folder or that
+    Windows would write under another name."""
     if '\\' in name or name.startswith('/') or ':' in name:
         raise UpdateError('update.zip_bad', name=name)
     parts = PurePosixPath(name).parts
-    if not parts or parts[0] != top or any(p in ('', '.', '..') for p in parts):
+    if not parts or parts[0] != top or any(p in ('', '.', '..') or not windows_name_ok(p) for p in parts):
         raise UpdateError('update.zip_bad', name=name)
     return PurePosixPath(*parts[1:]) if len(parts) > 1 else None
 
@@ -435,6 +457,9 @@ def stage(zip_path, base, manifest):
     try:
         part.mkdir()
         with zipfile.ZipFile(zip_path) as z:
+            limit = unpack_limit(manifest.tools)
+            if sum(info.file_size for info in z.infolist()) > limit:   # zipfile writes no more than file_size each
+                raise UpdateError('update.zip_large', size=limit)
             for info in z.infolist():
                 rel = member_path(info.filename, manifest.tools.top)
                 if rel is None:

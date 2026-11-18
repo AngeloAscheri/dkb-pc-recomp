@@ -303,6 +303,67 @@ class CancelTest(unittest.TestCase):
             p.kill()
 
 
+class LauncherWindowTest(unittest.TestCase):
+    """The launcher's window (installer/gui.py App with a Launcher): closing it during an update, and its worker
+    reaching a window that is gone."""
+
+    def setUp(self):
+        try:
+            import tkinter as tk
+            self.root = tk.Tk()
+        except Exception as e:   # no tkinter, or no display
+            self.skipTest(f'no Tk: {e}')
+        self.root.withdraw()
+        from installer import gui
+        from installer.guilogic import Launcher
+        self.gui = gui
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.app = gui.App(self.root, 'en', layouts.find(None), game='bananza',
+                           launcher=Launcher(base=Path(self.work.name) / 'DKB-Recomp'))
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def test_close_during_an_update_asks_then_stops_it(self):
+        from unittest.mock import patch
+        from installer import update
+        app = self.app
+        app.begin_update('ui.updating', 'v9.9.9', ('ui.update_downloading', {'done': 0, 'total': 1}))
+        with patch.object(self.gui.messagebox, 'askyesno', return_value=False) as asked:
+            app.on_close()
+        asked.assert_called_once()
+        self.assertFalse(app.update_stop.is_set())   # "no": the update goes on, the window stays
+        self.assertTrue(self.root.winfo_exists())
+        with patch.object(self.gui.messagebox, 'askyesno', return_value=True):
+            app.on_close()
+        self.assertTrue(app.update_stop.is_set() and app.update_closing)
+        self.assertTrue(self.root.winfo_exists())    # it closes once the worker has stopped
+
+        def cancelled():   # what update.download raises once it sees update_stop (and deletes its .part file)
+            raise update.UpdateError('update.cancelled')
+        app.update_worker_body('update to v9.9.9', cancelled)
+        self.assertFalse(app.update_running)
+        self.root.update()
+        with self.assertRaises(Exception):
+            self.root.winfo_exists()   # destroyed
+        app.later(app.show_home)       # a worker's last message to a window that is gone is dropped, not raised
+
+    def test_a_handed_over_update_closes_the_window(self):
+        from unittest.mock import patch
+        app = self.app
+        app.begin_update('ui.going_back', 'v0.0.1', ('ui.update_starting', {'tag': 'v0.0.1'}))
+        with patch.object(self.gui.update, 'start_version', return_value='started') as started:
+            app.update_worker_body('go back to v0.0.1', lambda: app.hand_over('v0.0.1'))
+        self.assertEqual(started.call_args[0][1], 'v0.0.1')
+        self.root.update()
+        with self.assertRaises(Exception):
+            self.root.winfo_exists()
+
+
 class SmokeTest(unittest.TestCase):
     def test_every_screen_in_both_languages(self):
         try:

@@ -312,6 +312,22 @@ def update_status(offer, error, allow_downgrade=False):
     return ('ui.update_none', {}), False
 
 
+def release_page(url):
+    """url when it is a page on https://github.com/ (where every release page is), else None: the home screen opens
+    no other link it was handed"""
+    return url if isinstance(url, str) and url.startswith('https://github.com/') and '\\' not in url else None
+
+
+def previous_version(base, own):
+    """The tag the home screen can go back to: versions/previous.txt's, when it is not `own` (the running version) and
+    its folder still holds its Python; else None."""
+    from . import update
+    tag = update.read_pointer(base, 'previous')
+    if not tag or tag == own or not update.version_python(Path(base) / 'versions' / tag).is_file():
+        return None
+    return tag
+
+
 def play_command(dest):
     return [str(Path(dest) / GAME_EXE)]
 

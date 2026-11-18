@@ -37,7 +37,8 @@ from . import layout as layouts
 from . import update
 from .guilogic import (DKB_STEP_ORDER, DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Launcher, Model,
                        Process, Settings, amount, default_dest, default_game_language, describe_event, install_state,
-                       parse_line, play_command, update_status, windows_ui_language)
+                       parse_line, play_command, previous_version, release_page, update_status,
+                       windows_ui_language)
 
 POLL_MS = 100
 GLYPH = {PENDING: '\u25cb', RUNNING: '\u25b6', DONE: '\u2714', SKIPPED: '\u2013', FAILED: '\u2716'}
@@ -146,6 +147,14 @@ def fix_dpi_awareness():
         set_context(ctypes.c_void_p(-4))   # PER_MONITOR_AWARE_V2; an already configured process keeps its context
 
 
+def open_page(url):
+    """A release page in the browser. Only a https://github.com/ link (guilogic.release_page): the link comes from
+    GitHub's answer, and webbrowser hands anything else, a file path too, to the shell to open."""
+    page = release_page(url)
+    if page:
+        webbrowser.open(page)
+
+
 class App:
     def __init__(self, root, ui_lang, layout, run_args=None, game='totk', check_updates=False, launcher=None):
         self.root, self.layout = root, layout
@@ -232,21 +241,18 @@ class App:
             return
         try:
             self.root.after(0, fn, *args)
-        except RuntimeError:   # Tk is already gone
+        except (RuntimeError, tk.TclError):   # Tk is already gone: destroyed, or its main loop has ended
             pass
 
     def check_update(self):
         """Background lookup of a newer release; the label appears only when there is one (never blocks the window)."""
         found = update.newer_release(self.layout.release)
-        if found and not self.closing:
-            try:
-                self.root.after(0, self.show_update, *found)
-            except RuntimeError:   # Tk is already gone
-                pass
+        if found:
+            self.later(self.show_update, *found)
 
     def show_update(self, tag, url):
         self.bind_text(self.update_label, 'text', 'ui.update_available', tag=tag)
-        self.update_label.bind('<Button-1>', lambda _e: webbrowser.open(url))
+        self.update_label.bind('<Button-1>', lambda _e: open_page(url))
         self.update_label.pack(before=self.body.winfo_children()[0], anchor='w', pady=(0, 8))
         self.fit()
 
@@ -458,8 +464,9 @@ class App:
         row.pack(side='bottom', fill='x', pady=(8, 0))
         self.check_button = self.button(row, 'ui.check_now', self.check_now)
         self.check_button.pack(side='left')
-        self.page_button = self.button(row, 'ui.release_page', lambda: self.offer and webbrowser.open(self.offer.page))
+        self.page_button = self.button(row, 'ui.release_page', lambda: self.offer and open_page(self.offer.page))
         self.update_button = ttk.Button(row, command=self.start_update, style='Accent.TButton')
+        self.go_back_button = ttk.Button(row, command=self.go_back)
         return f
 
     def build_update(self):
@@ -479,6 +486,9 @@ class App:
         self.update_error.pack(anchor='w', pady=(8, 0))
         self.update_step = ('', {})
         self.update_failure = None
+        self.update_target = ('ui.updating', '')   # the screen's title and the tag it switches to
+        self.update_running = False                # a worker thread downloads, unpacks or hands over
+        self.update_closing = False                # the window was closed during it: it closes when the worker ends
         return f
 
     def show_home(self):
@@ -511,7 +521,17 @@ class App:
                 button.pack_forget()
         if self.offer:
             self.update_button.configure(text=self.cat('ui.update_now', tag=self.offer.tag))
+        back = self.previous_tag()
+        if back:
+            self.go_back_button.configure(text=self.cat('ui.go_back', tag=back))
+            self.go_back_button.pack(side='right', padx=(0, 8))
+        else:
+            self.go_back_button.pack_forget()
         self.fit()
+
+    def previous_tag(self):
+        """The version the home screen offers to go back to (guilogic.previous_version), or None."""
+        return previous_version(self.launcher.base, update.own_tag(self.launcher.base, self.layout.root))
 
     def toggle_check(self):
         self.settings.check_updates = bool(self.check_var.get())
@@ -545,19 +565,39 @@ class App:
     def start_update(self):
         """Download, check and unpack the offered release in the background, then hand over to its window."""
         offer = self.offer
-        if not self.update_offered or offer is None or self.process:
+        if not self.update_offered or offer is None or self.process or self.update_running:
             return
-        self.update_stop.clear()
-        self.update_step, self.update_failure = ('ui.update_downloading', {'done': 0, 'total': -(-offer.manifest.tools.size >> 20)}), None
-        self.update_back.pack_forget()
-        self.update_cancel.pack(side='right')
-        self.update_cancel.state(['!disabled'])
-        self.update_bar.configure(value=0)
-        self.refresh_update()
-        self.show('update')
+        self.begin_update('ui.updating', offer.tag,
+                          ('ui.update_downloading', {'done': 0, 'total': -(-offer.manifest.tools.size >> 20)}))
         self.launcher.note(f'update to {offer.tag}: {offer.manifest.tools.name}, {offer.manifest.tools.size} bytes, '
                            f'sha256 {offer.manifest.tools.sha256}')
         threading.Thread(target=self.update_worker, args=(offer,), daemon=True).start()
+
+    def go_back(self):
+        """Start the previous version again in place of this one: its window confirms its start like an update's
+        (update.confirm_start makes it current.txt and this one previous.txt) and brings the game folder back to it.
+        Nothing is downloaded; this version stays, so the next check offers it again."""
+        tag = self.previous_tag()
+        if not tag or self.process or self.update_running:
+            return
+        if not messagebox.askyesno(self.cat('ui.title'), self.cat('ui.go_back_confirm', tag=tag, current=self.layout.release)):
+            return
+        self.begin_update('ui.going_back', tag, ('ui.update_starting', {'tag': tag}))
+        self.update_progress(self.update_step, None)
+        self.launcher.note(f'go back to {tag} from {self.layout.release}')
+        threading.Thread(target=self.update_worker_body, args=(f'go back to {tag}', lambda: self.hand_over(tag)),
+                         daemon=True).start()
+
+    def begin_update(self, title_id, tag, step):
+        self.update_stop.clear()
+        self.update_running, self.update_closing = True, False
+        self.update_target, self.update_step, self.update_failure = (title_id, tag), step, None
+        self.update_back.pack_forget()
+        self.update_cancel.pack(side='right')
+        self.update_cancel.state(['!disabled'])
+        self.update_bar.configure(mode='determinate', value=0)
+        self.refresh_update()
+        self.show('update')
 
     def update_worker(self, offer):
         base, tools = self.launcher.base, offer.manifest.tools
@@ -569,7 +609,8 @@ class App:
             if now - shown[0] > 0.2 or done == size:
                 shown[0] = now
                 self.later(self.update_progress, ('ui.update_downloading', {'done': done >> 20, 'total': total}), done / size)
-        try:
+
+        def work():
             zip_path = update.download(tools, offer.tag, base / 'downloads', progress=progress,
                                        cancelled=self.update_stop.is_set)
             self.launcher.note(f'update to {offer.tag}: downloaded and checked {zip_path.name}')
@@ -577,21 +618,44 @@ class App:
             folder = update.stage(zip_path, base, offer.manifest)
             zip_path.unlink(missing_ok=True)
             self.launcher.note(f'update to {offer.tag}: unpacked into {folder}')
-            self.later(self.update_progress, ('ui.update_starting', {'tag': offer.tag}), None)
-            result = update.start_version(base, offer.tag, self.launcher.exe, ('--lang', self.cat.lang))
-            self.launcher.note(f'update to {offer.tag}: its window {result}')
-            if result == 'failed':
-                current = update.read_pointer(base, 'current') or self.layout.release
-                self.later(self.update_failed, ('ui.update_start_failed', {'tag': offer.tag, 'current': current,
-                                                                           'log': str(self.launcher.log)}))
-            else:
-                self.later(self.root.destroy)
+            if self.update_closing:   # closed while it unpacked: the folder stays for the next try, nothing starts
+                return
+            self.hand_over(offer.tag)
+        self.update_worker_body(f'update to {offer.tag}', work)
+
+    def hand_over(self, tag):
+        """tag's window started with --after-update; this window closes once it confirms, or says why it did not"""
+        base = self.launcher.base
+        self.later(self.update_progress, ('ui.update_starting', {'tag': tag}), None)
+        result = update.start_version(base, tag, self.launcher.exe, ('--lang', self.cat.lang))
+        self.launcher.note(f'{tag}: its window {result}')
+        if result == 'failed':
+            current = update.read_pointer(base, 'current') or self.layout.release
+            self.later(self.update_failed, ('ui.update_start_failed', {'tag': tag, 'current': current,
+                                                                       'log': str(self.launcher.log)}))
+        else:
+            self.update_closing = True
+
+    def update_worker_body(self, what, work):
+        """work() on the worker thread, its failure shown on the update screen; the window closes afterwards when it
+        was closed meanwhile or the new version's window took over"""
+        try:
+            work()
         except update.UpdateError as e:
-            self.launcher.note(f'update to {offer.tag}: {e.id} {e.params}')
-            self.later(self.update_failed, (e.id, e.params))
+            self.launcher.note(f'{what}: {e.id} {e.params}')
+            if e.id != 'update.cancelled' or not self.update_closing:
+                self.later(self.update_failed, (e.id, e.params))
         except OSError as e:
-            self.launcher.note(f'update to {offer.tag}: {type(e).__name__} {e}')
-            self.later(self.update_failed, ('update.stage_failed', {'path': str(base), 'detail': str(e)}))
+            self.launcher.note(f'{what}: {type(e).__name__} {e}')
+            self.later(self.update_failed, ('update.stage_failed', {'path': str(self.launcher.base), 'detail': str(e)}))
+        finally:
+            self.update_running = False
+            if self.update_closing:
+                self.later(self.close_after_update)
+
+    def close_after_update(self):
+        self.update_bar.stop()   # its animation would fire once more into a destroyed window
+        self.root.destroy()
 
     def update_progress(self, step, fraction):
         self.update_step = step
@@ -614,9 +678,10 @@ class App:
         self.refresh_update()
 
     def refresh_update(self):
-        if not self.launcher or not self.offer:
+        title_id, tag = self.update_target
+        if not self.launcher or not tag:
             return
-        self.update_title.configure(text=self.cat('ui.updating', tag=self.offer.tag))
+        self.update_title.configure(text=self.cat(title_id, tag=tag))
         id, params = self.update_step
         self.update_phase.configure(text=self.cat(id, **params) if id else '')
         if self.update_failure:
@@ -849,6 +914,13 @@ class App:
             self.process.cancel()
 
     def on_close(self):
+        if self.launcher and self.update_running:
+            # The download stops at its next block and its .part file is deleted (update.fetch_to); an unpack is not
+            # cut half way, and a finished one starts nothing. The window closes when the worker is done.
+            if not self.update_closing and messagebox.askyesno(self.cat('ui.title'), self.cat('ui.confirm_cancel_update')):
+                self.update_closing = True
+                self.update_stop.set()
+            return
         if self.process:
             if not messagebox.askyesno(self.cat('ui.title'), self.cat('ui.confirm_cancel')):
                 return
@@ -961,6 +1033,10 @@ def selftest(layout, shots=None, game='totk'):
         (built / 'dkb-install.json').write_text(json.dumps({'format': 1, 'steps': {'dkb_verify': {}}}), encoding='utf-8')
         (built / play_command(built)[0]).write_bytes(b'')
         Settings(dest=str(built)).save(launcher.base)
+        before = update.version_python(launcher.base / 'versions' / 'v0.0.1')   # a previous version: Go back shows
+        before.parent.mkdir(parents=True)
+        before.write_bytes(b'')
+        update.write_pointer(launcher.base, 'previous', 'v0.0.1')
     app = App(root, 'en', layout, game=game, launcher=launcher)
     steps, mixed = [], []
     destination = 'Z:/selftest/Bananza' if game == 'bananza' else 'Z:/selftest/TotK'
@@ -974,6 +1050,7 @@ def selftest(layout, shots=None, game='totk'):
         app.show_home()
         shot(f'home-offer-{tag}')
         app.update_step = ('ui.update_downloading', {'done': 40, 'total': 131})
+        app.update_target = ('ui.updating', offer.tag)
         app.update_failure = None
         app.update_progress(app.update_step, 0.3)
         app.show('update')

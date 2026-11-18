@@ -545,6 +545,32 @@ class StageTest(unittest.TestCase):
             self.assert_untouched()
             self.assertFalse((Path(self.work.name) / 'evil.txt').exists())
 
+    def test_names_windows_would_change_are_refused(self):
+        """Windows drops a trailing dot or space, opens a device for CON or NUL.txt and forbids <>:"|?*: such a member
+        would be written under another name than the zip gives, or not at all."""
+        for name in ('DKB-Setup/tools/x.', 'DKB-Setup/tools/x ', 'DKB-Setup/tools/.. /y', 'DKB-Setup/CON',
+                     'DKB-Setup/tools/nul.txt', 'DKB-Setup/Com1.log', 'DKB-Setup/lpt¹', 'DKB-Setup/a<b',
+                     'DKB-Setup/a|b', 'DKB-Setup/a?b', 'DKB-Setup/a*b', 'DKB-Setup/a"b', 'DKB-Setup/a\x01b',
+                     'DKB-Setup/conin$'):
+            files = Files(self.work.name, extra_members=[(name, b'x')])
+            with self.subTest(name), self.assertRaises(UpdateError) as e:
+                self.stage(files)
+            self.assertEqual(e.exception.id, 'update.zip_bad')
+            self.assert_untouched()
+        for fine in ('DKB-Setup/console.txt', 'DKB-Setup/CONFIG', 'DKB-Setup/com10', 'DKB-Setup/.hidden', 'DKB-Setup/a b'):
+            self.assertIsNotNone(update.member_path(fine, 'DKB-Setup'), fine)
+
+    def test_zip_that_unpacks_past_the_limit_is_refused(self):
+        files = Files(self.work.name, extra_members=[('DKB-Setup/big.bin', b'\0' * (1 << 20))])
+        with patch.object(update, 'UNPACK_FLOOR', 1 << 19), patch.object(update, 'UNPACK_RATIO', 0):   # a 512 KiB cap
+            with self.assertRaises(UpdateError) as e:
+                self.stage(files)
+        self.assertEqual(e.exception.id, 'update.zip_large')
+        self.assert_untouched()
+        self.assertEqual(update.unpack_limit(update.Asset('0' * 64, 1, 'a.zip')), update.UNPACK_FLOOR)
+        self.assertEqual(update.unpack_limit(update.Asset('0' * 64, 8 << 30, 'a.zip')), update.UNPACK_LIMIT)
+        self.assertEqual(update.unpack_limit(update.Asset('0' * 64, 700 << 20, 'a.zip')), 20 * (700 << 20))
+
     def test_zip_of_another_version_is_rolled_back(self):
         files = Files(self.work.name, version_text='0.4.9+0000000')
         with self.assertRaises(UpdateError) as e:
@@ -643,6 +669,39 @@ class SwitchTest(unittest.TestCase):
                                       timeout=1, sleep=lambda s: None)
         self.assertEqual(result, 'slow')
         self.assertEqual(update.read_pointer(self.base, 'current'), 'v0.4.1')
+
+    def test_going_back_is_a_confirmed_start_of_the_previous_version(self):
+        """The home screen's Go back starts previous.txt's version with --after-update; its confirm_start swaps the
+        two pointers and keeps both folders, so the newer one is offered (and staged from its folder) again."""
+        from installer import guilogic
+        update.confirm_start(self.base, 'v0.5.0')   # current v0.5.0, previous v0.4.1
+        for tag in ('v0.4.1', 'v0.5.0'):
+            python = update.version_python(self.base / 'versions' / tag)
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_bytes(b'')
+        self.assertEqual(guilogic.previous_version(self.base, 'v0.5.0'), 'v0.4.1')
+        self.assertIsNone(guilogic.previous_version(self.base, 'v0.4.1'))   # that one runs: nothing to go back to
+        seen = []
+
+        def spawn(cmd, cwd):   # the previous version's window: confirms its own start, as gui.start_launcher does
+            seen.append(cmd)
+            update.confirm_start(self.base, Path(cwd).name)
+            return FakeProcess(lambda polls: None)
+        self.assertEqual(update.start_version(self.base, 'v0.4.1', None, spawn=spawn, sleep=lambda s: None), 'started')
+        self.assertIn('--after-update', seen[0])
+        self.assertEqual((update.read_pointer(self.base, 'current'), update.read_pointer(self.base, 'previous')),
+                         ('v0.4.1', 'v0.5.0'))
+        self.assertTrue((self.base / 'versions' / 'v0.5.0').is_dir())
+        self.assertEqual(guilogic.previous_version(self.base, 'v0.4.1'), 'v0.5.0')
+        (update.version_python(self.base / 'versions' / 'v0.5.0')).unlink()   # its Python gone: not offered
+        self.assertIsNone(guilogic.previous_version(self.base, 'v0.4.1'))
+
+    def test_release_pages_only_on_github(self):
+        from installer.guilogic import release_page
+        self.assertEqual(release_page('https://github.com/x/y/releases/tag/v1'), 'https://github.com/x/y/releases/tag/v1')
+        for url in ('http://github.com/x', 'https://github.com.evil.example/x', 'file:///C:/Windows/notepad.exe',
+                    'C:\\Windows\\notepad.exe', 'https://github.com/..\\..\\x', None, 5, ''):
+            self.assertIsNone(release_page(url), url)
 
     def test_pointers_refuse_junk(self):
         (self.base / 'versions' / 'current.txt').write_text('..\\..\\evil\n')

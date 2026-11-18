@@ -205,9 +205,13 @@ asks once. `--no-update-check` and `DKB_NO_UPDATE_CHECK=1` turn it off as well.
 2. It downloads the tools zip to `downloads/<sha256>.zip.part`, three tries, counting the bytes and hashing as they
    come; a file longer than the manifest says, cut short, or with another SHA-256 is deleted. Only a match is renamed
    to `<sha256>.zip`.
-3. It unpacks the zip into `versions/<tag>.part` (every member must lie under the zip's one top folder: no absolute
-   path, no `..`, no link), checks that the result holds the manifest's `VERSION`, its Python and the installer, and
-   renames it to `versions/<tag>`. Any failure removes the `.part` folder; the installed version is untouched.
+3. It unpacks the zip into `versions/<tag>.part`. Every member must lie under the zip's one top folder (no absolute
+   path, no `..`, no link) and have a name Windows keeps as it is (no `<>:"|?*` or control character, no trailing dot
+   or space, no device name such as `CON` or `NUL.txt`). The members together may unpack to at most 20 times the zip's
+   size, never less than 1 GiB and never more than 64 GiB (`update.unpack_limit`). It then checks that the result holds
+   the manifest's `VERSION`, its Python and the installer, and renames it to `versions/<tag>`. Any failure removes the
+   `.part` folder; the installed version is untouched. Closing the window during the update asks first. The download
+   then stops and its `.part` file is deleted; an unpack runs to its end but nothing starts.
 4. It starts the new version's window with `--after-update` and waits until that window confirms its start: it writes
    its own tag to `current.txt` and the old one to `previous.txt`. If the new window exits first, `current.txt` still
    names the old version, the old window says so and the next start of the launcher runs the old version.
@@ -228,6 +232,12 @@ run again, the home screen shows the game as not built (`guilogic.install_state`
 from the steps already done. Steps the check does not depend on (shaders, wide layouts, prompts) never hold Play back. The previous version folder stays until the next update and is the one the launcher starts when the current one
 has lost its Python (an antivirus removing files). Older version folders are removed when a new version confirms its
 start; a folder still in use stays and goes at a later start.
+
+**Going back.** While `previous.txt` names a version whose folder still holds its Python, the home screen offers
+"Go back to <tag>". After the player confirms, the window starts that version with `--after-update`, exactly as an
+update does with a new one. Its start (`update.confirm_start`) makes it `current.txt` and the running version
+`previous.txt`, and its setup run brings the game folder back to it. Nothing is downloaded and both folders stay, so
+the next check offers the newer version again, unpacked already.
 
 **Uninstall.** Delete the install folder (it holds the saves), `DKB-Recomp` and `DKB-Launcher.exe`. The launcher
 writes nothing to the registry, the Start menu or AppData; the GPU driver's own shader cache stays in the driver's
