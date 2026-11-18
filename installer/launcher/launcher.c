@@ -288,13 +288,18 @@ static int text_sink(void *user, const void *data, DWORD n)
     return 1;
 }
 
-typedef struct { HANDLE file; BCRYPT_HASH_HANDLE hash; } FileSink;
+typedef struct { HANDLE file; BCRYPT_HASH_HANDLE hash; int write_failed; } FileSink;
 
+/* write_failed tells a full disk (or a folder that refuses writes) apart from a connection that broke off */
 static int file_sink(void *user, const void *data, DWORD n)
 {
     FileSink *f = (FileSink *)user;
     DWORD put = 0;
-    return WriteFile(f->file, data, n, &put, NULL) && put == n && BCryptHashData(f->hash, (PUCHAR)data, n, 0) == 0;
+    if (!WriteFile(f->file, data, n, &put, NULL) || put != n) {
+        f->write_failed = 1;
+        return 0;
+    }
+    return BCryptHashData(f->hash, (PUCHAR)data, n, 0) == 0;
 }
 
 /* ---- the manifest (dkb-release.txt, installer/update.py parse_manifest) ----------------------------------------- */
@@ -384,7 +389,7 @@ static int fetch_tools(Job *job, const Manifest *m, const wchar_t *url, const wc
         fill(line, TEXT_CHARS, T(DOWNLOADING), pairs);
         status(line, 0);
         BCRYPT_ALG_HANDLE alg;
-        FileSink sink;
+        FileSink sink = {0};
         if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)) break;
         if (BCryptCreateHash(alg, &sink.hash, NULL, 0, NULL, 0, 0)) { BCryptCloseAlgorithmProvider(alg, 0); break; }
         sink.file = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -402,8 +407,17 @@ static int fetch_tools(Job *job, const Manifest *m, const wchar_t *url, const wc
         int hashed = sha_hex(sink.hash, have);
         BCryptDestroyHash(sink.hash);
         BCryptCloseAlgorithmProvider(alg, 0);
-        if (got && hashed && !strcmp(have, m->sha)) return MoveFileExW(part, zip, MOVEFILE_REPLACE_EXISTING);
+        if (got && hashed && !strcmp(have, m->sha)) {
+            if (MoveFileExW(part, zip, MOVEFILE_REPLACE_EXISTING)) return 1;
+            DeleteFileW(part);
+            job_fail(job, T(WRITE_FAILED), L"path", zip);
+            return 0;
+        }
         DeleteFileW(part);
+        if (sink.write_failed) {   /* the disk, not the network: trying again would fail the same way */
+            job_fail(job, T(WRITE_FAILED), L"path", part);
+            return 0;
+        }
         if (got) {   /* the whole file came and it is not the release's: nothing of it is kept, nothing runs */
             job_fail(job, T(CHECKSUM), NULL, NULL);
             return 0;
@@ -621,6 +635,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE previous, LPWSTR args, int show)
     DWORD b = GetEnvironmentVariableW(L"DKB_LAUNCHER_BASE", base, PATH_CHARS);
     if (!b || b >= PATH_CHARS) swprintf(base, PATH_CHARS, L"%ls\\DKB-Recomp", folder);
     for (size_t len = wcslen(base); len > 3 && base[len - 1] == L'\\'; len--) base[len - 1] = 0;   /* "x\" would end the quote */
+    /* Every path built below base (versions\<tag>.part\<top>\python\pythonw.exe is the longest, under 320 characters
+       more) must fit PATH_CHARS: swprintf cuts a longer one short, and a cut path can name another folder of the base,
+       which remove_tree would then delete */
+    if (wcslen(base) > PATH_CHARS - 320) { say_with(T(WRITE_FAILED), L"path", base); return 1; }
     swprintf(old, PATH_CHARS, L"%ls.old", exe);
     DeleteFileW(old);   /* still running (an update moments ago): it goes next time */
     swprintf(head, CMD_CHARS, L"--launcher \"%ls\" --base \"%ls\"", exe, base);
