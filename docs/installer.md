@@ -111,7 +111,8 @@ The Bananza steps are:
    dialog background pane and stores its title effects in `static.Product.200`. Overlay preparation preserves the
    player's resolution and HUD settings.
 8. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
-   remove only owned staging/build directories. Logs remain in the temporary folder. Setup does not start the game.
+   remove only owned staging/build directories. Logs remain in the temporary folder. The setup itself does not start
+   the game; the window's finish screen has a Play button that does, once the folder checks out as finished.
 
 The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `.id`, `exefs/`, packed `romfs/`,
 `romfs-index.bin`, `dkb.ini`, `dkb-install.json`, the `shader-cache/` folder of step 6, and twelve
@@ -144,6 +145,106 @@ A full generation/build and a title-screen run from the finished folder are sepa
 installer tests do not establish game compatibility. No completed install, game-derived output or cache belongs in a
 release or pull request. Release assembly in `tools/make_release*.py` still describes the inherited TotK package; a
 Bananza release must include the complete runtime source/dependencies rather than its old runtime archive.
+
+## Launcher and updates (Windows)
+
+`DKB-Launcher.exe` on the release page is the one file a player downloads (about 100 KB). It is the same program as
+the zip's `DKB-Setup.exe` (`installer/launcher/launcher.c`): beside a `python\` folder it starts the setup window as
+before and passes its own arguments on, anywhere else it is the launcher.
+
+What the player does:
+
+1. Puts `DKB-Launcher.exe` in a folder of its own (for example `C:\Games\DKB\`) and starts it.
+2. The first start asks before it downloads anything, then reads `dkb-release.txt` of the latest release, downloads
+   the tools zip it names (the same `DKB-Setup-<version>-windows.zip`), checks its size and SHA-256 and unpacks it
+   with Windows' own `tar.exe`. A file that does not match is deleted and nothing is unpacked or run.
+3. The setup window opens with the install folder proposed beside the launcher's folder (`DKB-Bananza`); the player
+   picks the `.nup` or the ExeFS and RomFS folders, as with the zip, and the setup builds the game.
+4. From then on the launcher opens on its home screen: Play (starts `dkb.exe` from the install folder and closes the
+   launcher), Open folder, Install or rebuild (the form), and the release check.
+
+Everything the launcher keeps is in `DKB-Recomp` beside it (`installer/update.py` describes each file):
+
+```
+DKB-Recomp/
+  launcher.json            the install folder and the "look for a new release at start" setting
+  versions/current.txt     the version that starts; previous.txt the one before it
+  versions/<tag>/          an unpacked release zip (its own Python, LLVM, sources and installer)
+  downloads/               the zip while it downloads; deleted once unpacked
+  temp/                    the setup's work folder, shared by every version (--temp)
+  logs/launcher.log        what each check, download, verification and update did
+```
+
+The game folder stays as described above: saves in `profile/`, `dkb.ini`, the shader cache, all beside `dkb.exe`.
+
+**The check.** At each start the window asks GitHub's API for the latest release of this repository (when the API
+does not answer, for instance past its 60 requests an hour, it reads `dkb-release.txt` from the release's download
+link instead). That is the only request; it carries a generic User-Agent and no personal data, and nothing is
+downloaded until the player clicks Update. The home screen then says one of: a newer release is available, with its
+notes as GitHub has them and an Update button; this is the latest release; the latest release is older (no update
+offered, unless the window was started with `--allow-downgrade`); or GitHub could not be asked (offline: Play still
+works). A release made before the launcher (no `dkb-release.txt`) is offered with its page only. Versions compare by
+their numbers (0.10.0 is newer than 0.9.9, the commit after `+` does not count); pre-releases and drafts are never
+offered. The tick box under it turns the check at start off (`launcher.json` `"check_updates": false`); Check now still
+asks once. `--no-update-check` and `DKB_NO_UPDATE_CHECK=1` turn it off as well.
+
+**The update**, on one click:
+
+1. The window checks that the release's `dkb-release.txt` names the release's own tag and that the API lists both
+   files with the manifest's sizes (and, where GitHub gives one, the same SHA-256 digest).
+2. It downloads the tools zip to `downloads/<sha256>.zip.part`, three tries, counting the bytes and hashing as they
+   come; a file longer than the manifest says, cut short, or with another SHA-256 is deleted. Only a match is renamed
+   to `<sha256>.zip`.
+3. It unpacks the zip into `versions/<tag>.part` (every member must lie under the zip's one top folder: no absolute
+   path, no `..`, no link), checks that the result holds the manifest's `VERSION`, its Python and the installer, and
+   renames it to `versions/<tag>`. Any failure removes the `.part` folder; the installed version is untouched.
+4. It starts the new version's window with `--after-update` and waits until that window confirms its start: it writes
+   its own tag to `current.txt` and the old one to `previous.txt`. If the new window exits first, `current.txt` still
+   names the old version, the old window says so and the next start of the launcher runs the old version.
+5. The new window replaces the launcher exe with its own `DKB-Setup.exe` when they differ (the file came in the checked
+   zip): Windows does not let a running exe be overwritten but does let it be renamed, so the running file becomes
+   `DKB-Launcher.exe.old`, deleted at a later start, and the new one is copied in under the old name and checked again.
+6. It runs the setup on the recorded install folder (`--dest` only, as a resume). The step keys decide what runs
+   again: a release that changes the runtime recompiles, one that changes the lifter relifts, one that changes nothing
+   game-derived skips the build. For 3.2.0 the generated code and objects in the shared `temp/` are reused. The dump
+   recorded at install is read again only when the data step must run again, so keep it where it was. Saves
+   (`profile/`) and the `dkb.ini` settings are kept, as on every setup run.
+
+A failure in the tools part (steps 1 to 4) changes nothing that runs: the installed version and the game folder are
+as they were. A failure or cancel of the setup run in step 6 leaves what the setup's resume handles. Before a rerun
+step finishes (the runner records a step only once it is done, and compile copies `dkb.exe` in at its end) the old
+game still plays and Play stays. After that, until the final check (`dkb_verify`) has run again, the home screen shows
+the game as not built (`guilogic.install_state`) and Install or rebuild finishes it from the steps already done. The previous version folder stays until the next update and is the one the launcher starts when the current one
+has lost its Python (an antivirus removing files). Older version folders are removed when a new version confirms its
+start; a folder still in use stays and goes at a later start.
+
+**Uninstall.** Delete the install folder (it holds the saves), `DKB-Recomp` and `DKB-Launcher.exe`. The launcher
+writes nothing to the registry, the Start menu or AppData; the GPU driver's own shader cache stays in the driver's
+folder.
+
+**Publishing.** `tools/make_release.py --game dkb --zip` writes `DKB-Launcher.exe` and `dkb-release.txt` beside the
+zip (`write_launcher_release`). The manifest is plain text, so the C launcher reads it without a JSON parser:
+
+```
+dkb-release 1
+version 0.4.2+abc1234
+tag v0.4.2
+tools <sha256> <bytes> DKB-Setup-0.4.2+abc1234-windows.zip DKB-Setup
+launcher <sha256> <bytes> DKB-Launcher.exe
+```
+
+The release workflow (`.github/workflows/dkb-release.yml`) uploads all three as the Windows artifact and, on a `v*`
+tag, checks that the manifest names that tag and the zip it lists before it publishes them with the release. The tag
+must be `v` and the repository's `VERSION`. Older releases have no manifest: the launcher's first start then says so
+and points to the release page.
+
+**Testing without a release.** `DKB_LAUNCHER_BASE` replaces the `DKB-Recomp` folder, `DKB_LAUNCHER_MANIFEST` and
+`DKB_LAUNCHER_DOWNLOAD` the manifest link and the download prefix (http is accepted only for 127.0.0.1 and
+localhost). `tests/installer_update_test.py` covers the manifest (good, tampered, truncated), the check (newer, same,
+older, downgrade, offline, API fallback, mismatching digests), the download (good, tampered, truncated, interrupted,
+too long, cancelled), the unpack (good, members leaving the folder, wrong version, damaged zip), the switch of versions
+(confirmed, failed, slow start), the launcher's replacement and the window's settings, all with an injected opener and
+no network. `python -m installer.gui --selftest --shots DIR` draws the home and update screens in both languages.
 
 ## Inherited TotK installer
 
