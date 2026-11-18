@@ -175,7 +175,7 @@ same: the installer builds it and it boots, and nobody has played it. If you try
 The reader looks for `aoc-<index>/` folders next to `dkb.exe` (`<index>` is 0 to 31), each holding `romfs.bin` and
 `aoc-index.bin`. The installer writes them when it is given a `.nup` that holds add-on content: each add-on content
 package (kind `addon` in `extract_nup.py --list`) with a RomFS becomes `aoc-<n>`, where `<n>` is its title id minus the
-application id plus `0x1000` (0 to 31; others are ignored), and the install log has one `aoc: index <n>: <files> files`
+application id minus `0x1000` (0 to 31; others are ignored, with a warning), and the install log has one `aoc: index <n>: <files> files`
 line per pack. A pack that fails is skipped with a warning; the install goes on. With ExeFS and RomFS folders there is
 nothing to read it from, so by hand, from the add-on content's extracted RomFS folder, with `<dlc>` its root and `<n>`
 its index:
