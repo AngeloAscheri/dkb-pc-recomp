@@ -1445,9 +1445,11 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS :
              st == NVN_STAGE_GS ? GFX_STAGE_GS : st == NVN_STAGE_CS ? GFX_STAGE_CS : -1;
     if (gs < 0) return NULL;
+    uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); a translation inside counts apart
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
+    perf_ph_end(PERF_PH_SHADER, ph);
     if (pending && *pending) return NULL;
     if (s) slot_mask_learn(dc, serial, st, s);
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
@@ -4568,8 +4570,16 @@ static int mvk_upscale_blit(VkExec *ex, const GfxShader *cs) {
 // over more than a few workgroups, from a single-sampled 2D B10G11R11 texture of at least 256 pixels a side into a
 // larger B10G11R11 image of the same aspect ratio (1280x720 or the dynamic 1397x786 into 1920x1080). The MoltenVK blit
 // (mvk_upscale_blit) keeps to the hashes: it replaces the dispatch without the further checks DLSS and FSR 3.1 make.
-static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
+// The hash of a shader's SPIR-V, taken once per shader (gfx_shader_spirv_fnv), timed for TOTK_TRACE=perf.
+static uint64_t spirv_hash(const GfxShader *cs) {
+    uint64_t ph = perf_ph_begin();   // a part of the replay (perf.c ph_frame)
     uint64_t h = gfx_shader_spirv_fnv(cs);
+    perf_ph_end(PERF_PH_SPIRV_HASH, ph);
+    return h;
+}
+
+static int game_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
+    uint64_t h = spirv_hash(cs);
     if (mvk_upscale_cs(h)) return 1;
     if (!info || !d) return 0;
     int ntex = 0, nimg = 0, fit = 1;
@@ -4622,7 +4632,7 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info,
         // seen (the first 48 distinct) so a run that never reaches the upscaler shows which dispatch it missed.
         static uint64_t seen[48];
         static int nseen;
-        uint64_t h = gfx_shader_spirv_fnv(cs);
+        uint64_t h = spirv_hash(cs);
         int i = 0;
         while (i < nseen && seen[i] != h) i++;
         if (i == nseen && nseen < 48) {

@@ -1078,7 +1078,10 @@ static Tex *entry_of(const tex_t *t) {
             tex_alias = cfg_bool("TOTK_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
-        if (!(e = create_tex(t, &k, tex_alias))) return NULL;
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+        e = create_tex(t, &k, tex_alias);
+        perf_ph_end(PERF_PH_IMAGE, ph);
+        if (!e) return NULL;
         perf_count(PERF_CNT_TEX_NEW);
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)

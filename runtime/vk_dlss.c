@@ -627,7 +627,9 @@ static int feature(VkCommandBuffer cb, uint64_t fence, uint32_t w, uint32_t h, u
     create_params(ow, oh, ow, oh, q);
     if (!inputs_images(cb, ow, oh)) return fail("its zero motion-vector and depth images could not be made");
     rec_drain();   // NGX records into cb on this thread: everything queued for the recorder first
+    uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
     NgxResult r = ngx_create(vk_ctx()->device, cb, NGX_FEATURE_SUPER_SAMPLING, params, &F.h);
+    perf_ph_end(PERF_PH_DLSS_CREATE, ph);
     if (NGX_FAILED(r) || !F.h) {
         char why[96];
         snprintf(why, sizeof why, "creating DLSS %ux%u -> %ux%u failed (%#x)", w, h, ow, oh, r);
@@ -772,7 +774,10 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     // Temporal when this frame's scene was noted at the input size: its depth and camera motion go to DLSS. Otherwise
     // the zero inputs and a new history, as a spatial upscaler.
     VkTemporalIn t;
-    if (!vk_temporal_inputs(cb, w, h, ow, oh, F.fresh, &t)) {
+    uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+    int inputs = vk_temporal_inputs(cb, w, h, ow, oh, F.fresh, &t);
+    perf_ph_end(PERF_PH_TEMPORAL, ph);
+    if (!inputs) {
         vk_defer_view(iv), vk_defer_view(ov);
         return fail("its zero motion-vector and depth images could not be made");
     }
@@ -798,7 +803,9 @@ int vk_dlss_record(VkCommandBuffer cb, uint64_t fence, const VkTexImage *in, con
     set_f(params, "DLSS.Pre.Exposure", 1.0f);
     set_f(params, "DLSS.Exposure.Scale", 1.0f);
     rec_drain();   // the game's images are in GENERAL (vk_texture.c); the caller's full barrier comes before this
+    ph = perf_ph_begin_cpu();
     NgxResult r = ngx_eval(cb, F.h, params, NULL);
+    perf_ph_end(PERF_PH_DLSS_EVAL, ph);
     vk_defer_view(iv), vk_defer_view(ov);
     if (NGX_FAILED(r)) {
         char why[64];

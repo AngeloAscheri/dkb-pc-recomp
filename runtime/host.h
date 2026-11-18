@@ -34,6 +34,25 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
+// TOTK_TRACE=perf: the replay of a slow frame by part (perf.c, "replay by part"). submit_record (vk_sync.c) brackets its
+// recording with perf_ph_replay_begin/end; inside, each part named here is timed on the recording thread, every
+// perf_begin/perf_end pair among them (the PERF_ kinds above keep their numbers), and each part's time is its own, the
+// named parts inside it taken out. The rest of the replay is printed as such. perf_ph_begin returns 0 on a thread that is
+// not recording or with the trace off, and perf_ph_end does nothing then; perf_ph_begin_cpu also takes the thread's CPU
+// time, for the parts where waiting and working are to be told apart.
+enum { PERF_PH_IMPORT = PERF_N, PERF_PH_MIRROR, PERF_PH_MIRROR_BEGIN, PERF_PH_MSYNC, PERF_PH_WW, PERF_PH_SHADER,
+       PERF_PH_IMAGE, PERF_PH_DLSS_CREATE, PERF_PH_DLSS_EVAL, PERF_PH_TEMPORAL, PERF_PH_SPIRV_HASH, PERF_PH_SLICE_START,
+       PERF_PH_SLICE_WAIT, PERF_PH_SUBMIT, PERF_PH_USNAP, PERF_PH_BUDGET, PERF_PH_N };
+int perf_ph_replay_begin(void);                 // returns what perf_ph_replay_end takes
+void perf_ph_replay_end(int prev);
+int perf_ph_worker_begin(void);                 // a slice worker records a slice: its parts go to a bank of their own
+void perf_ph_worker_end(int prev);
+uint64_t perf_ph_begin(void);
+uint64_t perf_ph_begin_cpu(void);
+void perf_ph_end(int part, uint64_t t0);
+// A pass the replay recorded unsliced because its targets had no history (vk_exec.c vk_exec_pass_end): its time,
+// with the parts inside it, for the same line.
+void perf_ph_unsliced(uint64_t ns, uint32_t draws);
 // Running totals after a replay: draws and dispatches recorded, descriptor pools taken and created (the per-draw cost
 // and pool line of TOTK_TRACE=perf).
 void perf_replay_totals(uint64_t draws, uint64_t pools_taken, uint64_t pools_created);

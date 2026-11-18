@@ -292,6 +292,7 @@ static volatile int64_t lz_n, lz_bytes, lz_ns, lz_max_bytes, lz_max_ns;
 // stays alive here. Returns whether r has a GPU buffer afterwards.
 static int lazy_import(PoolRec *r) {
     if (!__atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) return r->buf != VK_NULL_HANDLE;
+    uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
     uint64_t t0 = qpc();
     plat_mutex_lock(&lazy_lock);
     if (r->lazy) {
@@ -311,6 +312,7 @@ static int lazy_import(PoolRec *r) {
         if ((int64_t)r->size > lz_max_bytes) lz_max_bytes = (int64_t)r->size, lz_max_ns = (int64_t)ns;   // lazy_lock
     }
     plat_mutex_unlock(&lazy_lock);
+    perf_ph_end(PERF_PH_IMPORT, ph);
     return r->buf != VK_NULL_HANDLE;
 }
 
@@ -951,7 +953,9 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     if (c->has_memory_budget) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); NVIDIA asks the kernel
         vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+        perf_ph_end(PERF_PH_BUDGET, ph);
         for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
             if (p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 *used += b.heapUsage[h], *budget += b.heapBudget[h];
@@ -2513,6 +2517,7 @@ void vk_mem_use(VkMemSpan *sp) {
         // thread, and a part that ran while one was made is dropped (vk_mem_mirror_gen). The workers of sliced passes
         // make it under mirror_lock, and the first of them to get the lock does.
         if (vk_spec_helper()) { vk_spec_fail(VK_SPEC_MIRROR); return; }
+        uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
         uint64_t t0 = qpc();
         vk_texture_hold_barrier();   // the walk, with a pass end held back: its slices resolve the pool as it was
         int locked = mirror_lock_if_shared();
@@ -2522,17 +2527,26 @@ void vk_mem_use(VkMemSpan *sp) {
             if (big_mirror.pending && big_mirror.lo == r->lo) big_mirror.hold = t1 - t0;
         }
         mirror_unlock(locked);
+        perf_ph_end(PERF_PH_MIRROR, ph);
         state = ms_get(r);
     }
     if (state != MS_ON) return;
-    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) mirror_sync(r);
+    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) {
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+        mirror_sync(r);
+        perf_ph_end(PERF_PH_MSYNC, ph);
+    }
     sp->buffer = r->mbuf;
 }
 
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || ms_get(r) != MS_ON) return;
-    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) mirror_sync(r);
+    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) {
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+        mirror_sync(r);
+        perf_ph_end(PERF_PH_MSYNC, ph);
+    }
     sp->buffer = r->mbuf;
 }
 
@@ -2723,7 +2737,7 @@ static int presnap_wanted(const PoolRec *r, uint32_t prev) {
     return 0;
 }
 
-void vk_mem_mirror_begin(void) {
+static void mirror_begin(void) {
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
         if (!freeze_idle) return;
         gen_lock_x();
@@ -2768,6 +2782,13 @@ void vk_mem_mirror_begin(void) {
     mrep.subs++;
     mrep.presnap_queries += q;
     mrep.presnap_t += qpc() - t0;
+}
+
+// TOTK_TRACE=perf: a part of the replay (perf.c ph_frame).
+void vk_mem_mirror_begin(void) {
+    uint64_t ph = perf_ph_begin();
+    mirror_begin();
+    perf_ph_end(PERF_PH_MIRROR_BEGIN, ph);
 }
 
 // Whether copies are queued for the next prologue; vk_sync.c prologue skips its command buffer on 0. Read without
