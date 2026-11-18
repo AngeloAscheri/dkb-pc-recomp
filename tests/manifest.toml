@@ -561,6 +561,12 @@ area = "os"
 cmd = ["{python}", "tests/controller_hold_test.py", "--cc", "{cc}"]
 
 [[test]]
+name = "switch2-rumble"
+tier = 1
+area = "os"
+cmd = ["{python}", "tests/switch2_rumble_test.py", "--cc", "{cc}"]
+
+[[test]]
 name = "controller-devices"
 tier = 1
 area = "os"
