@@ -1394,13 +1394,20 @@ static void slot_mask_learn(DrawCtx *dc, uint64_t serial, int st, const GfxShade
     dc->slotm[slotm_idx(serial, st)] = (typeof(dc->slotm[0])){serial, st, gfx_shader_slot_mask(s)};
 }
 
-static int prefetching;   // vk_exec_draw_prefetch is looking up stages (the replay thread's copy only)
+// vk_exec_draw_prefetch is looking up stages: texture types come from vk_texture_peek_by_id_locked, and the replay's
+// counters leave its lookups out.
+static _Thread_local int prefetching;
 
 static uint8_t type_of_handle(const VkExec *ex, uint64_t h) {   // texture lock held
     view_t v;
     int hv;
-    const VkTexImage *img = !h ? NULL : prefetching ? vk_texture_peek_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv)
-                                                    : vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv);
+    if (h && prefetching) {
+        int target;
+        const VkTexImage *img = vk_texture_peek_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv, &target);
+        if (img) return (uint8_t)gfx_type_of(img, &v, hv);
+        return target < 0 ? 0 : (uint8_t)vk_pipeline_tex_type(hv && v.set_target ? v.target : target);
+    }
+    const VkTexImage *img = h ? vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv) : NULL;
     return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
 }
 
@@ -1434,7 +1441,7 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         int tmiss = c->tex[slot] != h || !c->ttok[slot] || !slot_still(ex, &c->tgen[slot], c->ttok[slot], h, gen);
         int imiss = c->img[slot] != hi || !c->itok[slot] || !slot_still(ex, &c->igen[slot], c->itok[slot], hi, gen);
         uint64_t tt = tmiss ? token_of(ex, h) : 0, it = imiss ? token_of(ex, hi) : 0;
-        if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, dc->BS.ac_miss++;
+        if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, dc->BS.ac_miss += !prefetching;
         if (tmiss) c->tt[slot] = type_of_handle(ex, h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
         if (imiss) c->it[slot] = type_of_handle(ex, hi), c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
         if (check && (type_of_handle(ex, h) != c->tt[slot] || type_of_handle(ex, hi) != c->it[slot]))   // TOTK_SHADER_MEMO=check
@@ -1540,11 +1547,11 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS :
              st == NVN_STAGE_GS ? GFX_STAGE_GS : st == NVN_STAGE_CS ? GFX_STAGE_CS : -1;
     if (gs < 0) return NULL;
-    uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); a translation inside counts apart
+    uint64_t ph = prefetching ? 0 : perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); a translation inside counts apart
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
-    perf_ph_end(PERF_PH_SHADER, ph);
+    if (!prefetching) perf_ph_end(PERF_PH_SHADER, ph);
     if (pending && *pending) return NULL;
     if (s) slot_mask_learn(dc, serial, st, s);
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
@@ -5253,9 +5260,7 @@ void vk_exec_draw_prefetch(VkExec *ex, uint32_t op, const void *payload) {
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
     s.y_flip = 1;
     s.prim_restart = (uint8_t)(restart != 0);
-    const VkPipeInfo *info;
-    int pending;
-    vk_pipeline_graphics_async(&s, &info, &pending, 0);
+    vk_pipeline_graphics_guess(&s);
 }
 #endif
 

@@ -2780,11 +2780,13 @@ static int merge_walk(VkExec *ex, const op_hdr **hp) {
 // draw had asked for. Each one-shot draw waits for its own (prepare_draw), so they were built one after the other while
 // the pool sat idle, 60 to 230 ms each: a 10 s frame. Before such a wait the next draws of the submission have their
 // pipelines queued, so the pool builds them while the replay waits. The walk follows jumps, calls and the
-// submission's later command buffers, and stops after LOOKAHEAD_DRAWS draws or LOOKAHEAD_OPS ops; it looks again once
+// submission's later command buffers, and stops after LOOKAHEAD_DRAWS draws, LOOKAHEAD_OPS ops or LOOKAHEAD_NS (the
+// replay waits meanwhile, and a stage not translated yet is read from the disk cache); it looks again once
 // the replay passed the draws it covered. A render target change sets the formats of the key from the textures and
 // views, as resolve_rt would derive them for a plain colour or depth target (la_set_rt). TOTK_LOOKAHEAD=0 turns it off.
 #define LOOKAHEAD_DRAWS 256
 #define LOOKAHEAD_OPS 16384
+#define LOOKAHEAD_NS 3000000
 static _Thread_local const op_hdr *walk_at;              // the op walk replays on the replay thread's context X
 static _Thread_local const op_hdr *walk_ret[CALL_DEPTH];  // where the calls walk is inside return to
 static _Thread_local int walk_depth;                     // walk_at's call depth
@@ -2819,6 +2821,7 @@ void vk_exec_lookahead(VkExec *ex) {
     uint32_t draws = 0;
     const op_hdr *h = nvn_op_next(walk_at);
     for (int n = 0; n < LOOKAHEAD_OPS && draws < LOOKAHEAD_DRAWS; n++) {
+        if (!(n & 15) && n && kern_now_ns() - t0 > LOOKAHEAD_NS) break;
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) break;
         const void *a = nvn_op_payload(h);
         switch (h->op) {
@@ -2843,10 +2846,13 @@ void vk_exec_lookahead(VkExec *ex) {
         h = nvn_op_next(h);
     }
     la_fence = ex->fence, la_until = draws_total + draws;
-    static int told;
-    if (told < 8 && draws) {
-        told++;
-        rt_log("vk_exec: one-shot lookahead: the pipelines of the next %u draws looked up in %.2f ms", draws, (kern_now_ns() - t0) / 1e6);
+    static uint32_t looks;
+    if (draws && (++looks <= 8 || !(looks & 63))) {   // the first ones, then every 64th
+        uint64_t queued, used;
+        vk_pipeline_guess_counts(&queued, &used);
+        rt_log("vk_exec: one-shot lookahead %u: the pipelines of the next %u draws looked up in %.2f ms; so far %llu "
+               "pipelines queued ahead, %llu of them asked for by a draw since", looks, draws,
+               (kern_now_ns() - t0) / 1e6, (unsigned long long)queued, (unsigned long long)used);
     }
 }
 

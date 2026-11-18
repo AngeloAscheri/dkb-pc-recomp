@@ -551,7 +551,7 @@ const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, 
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view);
-const VkTexImage *vk_texture_peek_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view);   // no side effect
+const VkTexImage *vk_texture_peek_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view, int *target);
 VkSampler vk_sampler_by_id_locked(const dpool_ref *pool, int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
@@ -859,6 +859,11 @@ VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
 // wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to
 // pipeline-keys.bin next to the pipeline cache and prebuilt at the next boot (TOTK_PIPE_PREBUILD=0: not).
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
+// vk_exec.c vk_exec_lookahead: s is a guess at a later draw's state. A missing pipeline is entered and queued as
+// vk_pipeline_graphics_async would with wait 0, but no stat counts it and its key reaches the key file only once a
+// draw asks for the pipeline. vk_pipeline_guess_counts: such keys queued, and those a draw asked for since.
+void vk_pipeline_graphics_guess(const VkPipeState *s);
+void vk_pipeline_guess_counts(uint64_t *queued, uint64_t *used);
 // rt_boot calls it unless --shot is given; TOTK_PIPE_SYNC=1 makes it a no-op. Probes never call it.
 void vk_pipeline_async_enable(void);
 int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics shaders are translated in the background too
