@@ -229,6 +229,11 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr));
 // Windows only: a read or write that faults on a reserved page inside [base, base + size) commits the 64 KiB chunk
 // around it and retries (the guest heap with TOTK_HEAP_LAZY). Lock-free in the handler; plat_mem_lazy_faults counts them.
 void plat_mem_lazy(uint64_t base, uint64_t size);
+// Windows only: what the platform knows about the commit state of the lazy range, without a system call. The end (at
+// most e) of the run of 64 KiB chunks from a that share a's state; *known is 1 when the run's chunks are known to be
+// wholly committed (by the fault handler or a plat_mem_lazy_mark), 0 when nothing is known about them.
+uint64_t plat_mem_lazy_run(uint64_t a, uint64_t e, int *known);
+void plat_mem_lazy_mark(uint64_t a, uint64_t e);   // the caller committed every whole 64 KiB chunk inside [a, e)
 uint64_t plat_mem_lazy_faults(void);
 uint32_t plat_mem_lazy_failure(uint64_t *addr);   // error and address of the last failed lazy commit, 0 when none
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
