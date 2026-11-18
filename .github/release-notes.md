@@ -14,6 +14,9 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - #406 Split the replay of a slow frame into its parts in the perf trace (@wrothgaril)
 - #407 Create the DLSS feature and the motion pass's pipeline ahead of the first upscale (@wrothgaril)
 - #408 Skip mem_touch's VirtualQuery for lazy-heap chunks known to be committed (@wrothgaril)
+- #377 Keep an opaque ASTC texture as BC1 instead of BC3 with `astc_bc1 = 1` (off by default) (@roverdrubber)
+- #413 Switch 2 controllers over Bluetooth LE (`switch2 = 1`, off by default), ported from mkw-recomp (@zigzagulouszagger)
+- #414 Start a new guest thread on its ideal core alone, as Horizon does (@wrothgaril)
 - HD rumble is off by default (`rumble_hd = auto` turns it on): three third-party Switch Pro pads broke with it (#363, #383).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
