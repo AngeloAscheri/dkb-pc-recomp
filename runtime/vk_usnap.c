@@ -347,7 +347,7 @@ static void summary(void) {
 static int drop_local;    // TOTK_USNAP_DROP_LOCAL, for this submission (wr_local)
 static void wr_take(void);
 
-void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+static void usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
     U.on = 0, U.fence = fence, U.cpu = NULL, gen_bump();
     wr_take();   // whatever the mode: an earlier submission may have noted writes in the threads' lists
@@ -424,6 +424,13 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     uint64_t t4 = kern_now_ns();
     U.t_copy += t4 - t3;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += t4 - t0;
+}
+
+// TOTK_TRACE=perf: a part of the replay (perf.c ph_frame).
+void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+    uint64_t ph = perf_ph_begin();
+    usnap_begin(handles, n, fence);
+    perf_ph_end(PERF_PH_USNAP, ph);
 }
 
 void vk_usnap_end(uint64_t fence) {

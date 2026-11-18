@@ -485,12 +485,14 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
 // residency work for it there (#397).
 VkResult vk_sync_queue_submit(const VkSubmitInfo2 *si, VkFence fence, uint64_t value) {
     static int32_t slow;
+    uint64_t ph = perf_ph_begin_cpu();   // a part submitted from inside the replay (split_impl), TOTK_TRACE=perf
     uint64_t t0 = kern_now_ns();
     vk_queue_lock();
     uint64_t t1 = kern_now_ns();
     VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, si, fence);
     uint64_t t2 = kern_now_ns();
     vk_queue_unlock();
+    perf_ph_end(PERF_PH_SUBMIT, ph);
     if (t2 - t1 > 10000000ull) {
         long n = plat_inc32(&slow);
         if (n <= 32 || n % 64 == 0)
@@ -694,6 +696,7 @@ static uint64_t submit_record(VkSyncRecordFn record, void *context, uint64_t sub
     vk_mem_protect_until(fence);
     CmdSlot *s = take_slot(c, fence);
     uint64_t t0 = perf_begin();
+    int ph = perf_ph_replay_begin();   // TOTK_TRACE=perf: the parts of the replay (perf.c ph_frame)
     part_begin(s->cb, fence);
     int recorded = record(s->cb, fence, submitted_ticks, context);
     held_none("the end of a submission");
@@ -702,6 +705,7 @@ static uint64_t submit_record(VkSyncRecordFn record, void *context, uint64_t sub
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
+    perf_ph_replay_end(ph);
     perf_replay(t0);
     if (rt_trace & RT_TRACE_PERF) {
         uint64_t created, taken;

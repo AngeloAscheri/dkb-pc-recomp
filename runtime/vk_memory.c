@@ -50,6 +50,7 @@ typedef struct PoolRec {
     uint64_t npages;
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
     volatile uint8_t lazy;                // POOL_IMPORT whose import is deferred to the first GPU use (TOTK_POOL_LAZY, lazy_import)
+    uint64_t init_frame;               // the present count at nvnMemoryPoolInitialize (mem_frame), for the import log
     // TOTK_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
@@ -142,6 +143,10 @@ static volatile uint64_t import_touch_ns, import_total_ns;   // mem_touch and al
 static PlatMutex lazy_lock = PLAT_MUTEX_INIT;   // one deferred import at a time (the driver serializes them anyway)
 static volatile int32_t n_lazy_imports;         // pools imported on their first GPU use instead of at nvnMemoryPoolInitialize
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
+static volatile uint64_t mem_frame;             // the frame count of the last present (vk_mem_census)
+// Imported memory released (destroy_rec: vkDestroyBuffer and vkFreeMemory of a host-pointer import): count and time in
+// all, and since the last frame line (lazy_frame_log).
+static volatile int64_t rel_n, rel_ns, rel_frame_n, rel_frame_ns;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     VkBufferUsageFlags u = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -165,11 +170,13 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
 // The phases of one import, in ns (import_pool fills it for its log line): mem_thaw, mem_touch, the host pointer query,
-// vkCreateBuffer, vkAllocateMemory (the driver pins the pages there) and vkBindBufferMemory.
-typedef struct { uint64_t thaw, touch, props, create, alloc, bind; } ImportTimes;
+// vkCreateBuffer, vkAllocateMemory (the driver pins the pages there) and vkBindBufferMemory; total is all of
+// import_pool, wait the time lazy_import waited for lazy_lock before it (filled by lazy_import).
+typedef struct { uint64_t thaw, touch, props, create, alloc, bind, total, wait; } ImportTimes;
 static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, ImportTimes *t);
-// where: when it runs, for the log line ("on first GPU use", "at initialize").
-static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, const char *where) {
+// where: when it runs, for the log line ("on first GPU use", "at initialize"). out, when not
+// NULL, gets the times of the phases.
+static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, const char *where, ImportTimes *out) {
     ImportTimes t = {0};
     uint64_t t0 = qpc();
     mem_thaw(addr, size);    // the import may need write access to the pages
@@ -178,7 +185,8 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size, const
     uint64_t t2 = qpc();
     int ok = import_pool_timed(c, r, addr, size, &t);
     uint64_t total = qpc() - t0;
-    t.thaw = t1 - t0, t.touch = t2 - t1;
+    t.thaw = t1 - t0, t.touch = t2 - t1, t.total = total;
+    if (out) *out = t;
     __atomic_add_fetch(&import_touch_ns, t2 - t1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&import_total_ns, total, __ATOMIC_RELAXED);
     // A slow vkAllocateMemory, or any import of 64 MiB or more (the terrain arena of a layer is 450 MiB, #397), gets a
@@ -262,6 +270,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size,
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
     uint64_t ta = qpc();
+    int op = plat_op_begin(PLAT_OP_IMPORT, r->import_lo, n);
     res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
     if (res != VK_SUCCESS && known && p_host_props) {
         r->mem = VK_NULL_HANDLE;
@@ -276,6 +285,7 @@ static int import_pool_timed(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size,
         }
     }
     if (res != VK_SUCCESS) r->mem = VK_NULL_HANDLE;
+    plat_op_end(op, 0);
     t->alloc = qpc() - ta;
     __atomic_add_fetch(&import_alloc_ns, t->alloc, __ATOMIC_RELAXED);
     uint64_t tb = qpc();
@@ -310,18 +320,84 @@ static int lazy_enabled(void) {
     return on;
 }
 
-// The deferred imports since the last present (lazy_frame_log): count, bytes, time with the wait for lazy_lock, and
-// the largest one. The first frame of a layer imports hundreds of pools on the replay thread.
-static volatile int64_t lz_n, lz_bytes, lz_ns, lz_max_bytes, lz_max_ns;
+// The deferred imports since the last present (lazy_frame_log): count, bytes, time with the wait for lazy_lock, the
+// largest one, and the time by phase in ImportTimes order (thaw, touch, host pointer query, vkCreateBuffer,
+// vkAllocateMemory, vkBindBufferMemory, the wait for lazy_lock). The first frame of a layer imports hundreds of pools on
+// the replay thread. The imports of pools under 1 MiB are counted apart (count, bytes, vkAllocateMemory time), so the
+// line tells a fixed cost per import from one per byte: the large imports pinned about 0.16 ms per MiB on NVIDIA
+// (72 to 693 MiB, 11 to 122 ms, the TOTK_POOL_EAGER runs of build/bench/pe4-on-*.log).
+static volatile int64_t lz_n, lz_bytes, lz_ns, lz_max_bytes, lz_max_ns, lz_phase[7], lz_small[3];
+
+static void lz_note(const ImportTimes *t, uint64_t size, uint64_t ns) {
+    plat_inc64(&lz_n);
+    plat_add64(&lz_bytes, (int64_t)size);
+    plat_add64(&lz_ns, (int64_t)ns);
+    const uint64_t ph[7] = {t->thaw, t->touch, t->props, t->create, t->alloc, t->bind, t->wait};
+    for (int i = 0; i < 7; i++) plat_add64(&lz_phase[i], (int64_t)ph[i]);
+    if (size < (1u << 20)) plat_inc64(&lz_small[0]), plat_add64(&lz_small[1], (int64_t)size), plat_add64(&lz_small[2], (int64_t)t->alloc);
+    if ((int64_t)size > lz_max_bytes) lz_max_bytes = (int64_t)size, lz_max_ns = (int64_t)ns;   // lazy_lock
+}
+
+// TOTK_POOL_IMPORT_LOG=N: the first N imports made on a pool's first GPU use get a line each
+// with the pool's address, size and flags, the frame of its initialize, the caller of vk_mem_resolve that needed it (an
+// exe offset for the link map), the time of each phase, and its neighbours in the pool index (the gap to each, and
+// whether that pool is imported, waiting for its first use or used). For deciding what an import ahead of the first use
+// could predict, and whether neighbouring pools could share one import. 0 (default) logs none.
+static int import_log_on(void) {
+    static int max = -1;
+    static volatile int32_t n;
+    if (max < 0) {
+        const char *e = cfg_get("TOTK_POOL_IMPORT_LOG");
+        max = e && *e ? atoi(e) : 0;
+        if (max < 0) max = 0;
+    }
+    return max > 0 && plat_inc32(&n) <= max;
+}
+
+// vk_mem_resolve's caller on this thread, for the import log (set on its locked path only).
+static _Thread_local uintptr_t resolve_ra;
+
+// Index entry at's neighbour on side dir (-1 below, +1 above) for the import log. pool_lock held.
+static void neighbour(int at, int dir, const PoolRec *r, char *buf, size_t n) {
+    int j = at + dir;
+    if (at < 0 || j < 0 || j >= pool_index.n) {
+        snprintf(buf, n, "none");
+        return;
+    }
+    const PoolRec *q = pool_index.e[j].buf;
+    long long gap = dir < 0 ? (long long)r->lo - (long long)(q->lo + q->size) : (long long)q->lo - (long long)(r->lo + r->size);
+    snprintf(buf, n, "%lld bytes away, %#x %#llx bytes, %s%s", gap, q->flags, (unsigned long long)q->size,
+             q->kind != POOL_IMPORT ? "not imported" : q->lazy ? "waiting" : q->buf ? "imported" : "without a buffer",
+             q->used ? ", used" : "");
+}
+
+static void import_log(const char *how, const PoolRec *r, int at, const ImportTimes *t, int ok) {
+    char below[96], above[96], via[48];
+    neighbour(at, -1, r, below, sizeof below);
+    neighbour(at, +1, r, above, sizeof above);
+    snprintf(via, sizeof via, "exe+%#llx", (unsigned long long)(resolve_ra ? resolve_ra - plat_exe_base() : 0));
+    rt_log("vk: import %s at frame %llu: pool %#llx+%#llx flags %#x, initialized at frame %llu, for %s: %.3f ms (lazy_lock "
+           "wait %.3f, thaw %.3f, touch %.3f, host pointer query %.3f, vkCreateBuffer %.3f, vkAllocateMemory %.3f, "
+           "vkBindBufferMemory %.3f)%s; below: %s; above: %s", how, (unsigned long long)mem_frame, (unsigned long long)r->lo,
+           (unsigned long long)r->size, r->flags, (unsigned long long)r->init_frame, via, (t->total + t->wait) / 1e6,
+           t->wait / 1e6, t->thaw / 1e6, t->touch / 1e6, t->props / 1e6, t->create / 1e6, t->alloc / 1e6, t->bind / 1e6,
+           ok ? "" : ", failed", below, above);
+}
 
 // The deferred import. The caller holds pool_lock, shared or exclusive: a finalize needs it exclusively, so the record
-// stays alive here. Returns whether r has a GPU buffer afterwards. where: for import_pool's line.
-static int lazy_import(PoolRec *r, const char *where) {
+// stays alive here. at: r's entry in pool_index, for the import log. Returns whether r has a GPU buffer afterwards.
+// where: for import_pool's line and the import log.
+static int lazy_import(PoolRec *r, int at, const char *where) {
     if (!__atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) return r->buf != VK_NULL_HANDLE;
+    uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
     uint64_t t0 = qpc();
     plat_mutex_lock(&lazy_lock);
     if (r->lazy) {
-        if (!import_pool(vk_ctx(), r, r->lo, r->size, where)) {
+        ImportTimes t = {0};
+        uint64_t t1 = qpc();
+        int ok = import_pool(vk_ctx(), r, r->lo, r->size, where, &t);
+        t.wait = t1 - t0;
+        if (!ok) {
             long n = plat_inc32(&n_import_failures);
             if (n <= 8) rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (unsigned long long)r->lo,
                                r->flags, (unsigned long long)r->size, n);
@@ -330,28 +406,41 @@ static int lazy_import(PoolRec *r, const char *where) {
             plat_inc32(&n_lazy_imports);
         }
         __atomic_store_n(&r->lazy, 0, __ATOMIC_RELEASE);
-        uint64_t ns = qpc() - t0;
-        plat_inc64(&lz_n);
-        plat_add64(&lz_bytes, (int64_t)r->size);
-        plat_add64(&lz_ns, (int64_t)ns);
-        if ((int64_t)r->size > lz_max_bytes) lz_max_bytes = (int64_t)r->size, lz_max_ns = (int64_t)ns;   // lazy_lock
+        lz_note(&t, r->size, qpc() - t0);
+        if (import_log_on()) import_log(where, r, at, &t, ok);
     }
     plat_mutex_unlock(&lazy_lock);
+    perf_ph_end(PERF_PH_IMPORT, ph);
     return r->buf != VK_NULL_HANDLE;
 }
 
-// Every present (vk_mem_census): a frame whose first-use imports took 10 ms or more gets a line (the first 64).
+// Every present (vk_mem_census): a frame whose first-use imports or releases of imported memory took 10 ms or more gets
+// a line (the first 128), with the first-use imports' time by phase, the mem_touch chunks the commit map answered and
+// those it queried (all callers of mem_touch, file reads included), and the releases.
 static void lazy_frame_log(uint64_t frame) {
-    if (!__atomic_load_n(&lz_n, __ATOMIC_RELAXED)) return;
+    static uint64_t touch_last[4];
+    uint64_t touch[4];
+    mem_touch_stats(touch);
+    int64_t known = (int64_t)(touch[1] - touch_last[1]), queried = (int64_t)(touch[2] - touch_last[2]);
+    memcpy(touch_last, touch, sizeof touch);
+    int64_t rn = plat_xchg64(&rel_frame_n, 0), rns = plat_xchg64(&rel_frame_ns, 0);
     // Not under lazy_lock, which an import holds for up to 100 ms: an import that ends meanwhile may land in either
     // frame's line, and its largest-pool figures in neither.
     int64_t n = plat_xchg64(&lz_n, 0), bytes = plat_xchg64(&lz_bytes, 0), ns = plat_xchg64(&lz_ns, 0);
     int64_t mb = plat_xchg64(&lz_max_bytes, 0), mn = plat_xchg64(&lz_max_ns, 0);
+    int64_t ph[7], sm[3];
+    for (int i = 0; i < 7; i++) ph[i] = plat_xchg64(&lz_phase[i], 0);
+    for (int i = 0; i < 3; i++) sm[i] = plat_xchg64(&lz_small[i], 0);
     static int lines;
-    if (ns < 10000000 || lines >= 64) return;
+    if ((ns < 10000000 && rns < 10000000) || lines >= 128) return;
     lines++;
     rt_log("vk: frame %llu: %lld pools (%.1f MiB) imported on their first GPU use took %.1f ms; the largest, %.1f MiB, "
-           "%.1f ms", (unsigned long long)frame, (long long)n, bytes / 1048576.0, ns / 1e6, mb / 1048576.0, mn / 1e6);
+           "%.1f ms; by phase: lazy_lock wait %.1f, thaw %.1f, touch %.1f (%lld chunks known committed, %lld queried), "
+           "host pointer query %.1f, vkCreateBuffer %.1f, vkAllocateMemory %.1f (%lld pools under 1 MiB, %.1f MiB, %.1f "
+           "ms of it), vkBindBufferMemory %.1f; imported memory released %lld times, %.1f ms", (unsigned long long)frame, (long long)n, bytes / 1048576.0, ns / 1e6,
+           mb / 1048576.0, mn / 1e6, ph[6] / 1e6, ph[0] / 1e6, ph[1] / 1e6, (long long)known, (long long)queried,
+           ph[2] / 1e6, ph[3] / 1e6, ph[4] / 1e6, (long long)sm[0], sm[1] / 1048576.0, sm[2] / 1e6, ph[5] / 1e6,
+           (long long)rn, rns / 1e6);
 }
 
 // Physical pool: device-local memory of the pool size that both buffers and optimal-tiling images can be bound to.
@@ -422,8 +511,15 @@ static PoolRec *phys_find(const pool_t *key) {
 static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
+    uint64_t t0 = r->mem ? qpc() : 0;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
-    if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+    if (r->mem) {   // a host-pointer import: the driver unpins the pages (rel_n)
+        int op = plat_op_begin(PLAT_OP_IMPORT_FREE, r->import_lo, r->import_hi - r->import_lo);
+        vkFreeMemory(c->device, r->mem, NULL);
+        plat_op_end(op, 0);
+        int64_t ns = (int64_t)(qpc() - t0);
+        plat_inc64(&rel_n), plat_add64(&rel_ns, ns), plat_inc64(&rel_frame_n), plat_add64(&rel_frame_ns, ns);
+    }
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
     free(r->pt);
     free(r->kept);
@@ -437,7 +533,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     free(r);
 }
 
-int vk_pool_init(pool_t *p) {
+static int pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
     // Reinitializing the same object retires its old backing before installing the new mapping. In particular,
@@ -457,6 +553,7 @@ int vk_pool_init(pool_t *p) {
     r->flags = p->flags;
     r->lo = (uintptr_t)p->mem;
     r->size = p->size;
+    r->init_frame = mem_frame;
     int ok;
     if (p->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) {
         r->kind = POOL_VIRT;
@@ -480,7 +577,7 @@ int vk_pool_init(pool_t *p) {
             r->staged = staged_min && p->size >= staged_min;
             ok = 1;
         } else {
-            ok = import_pool(c, r, (uintptr_t)p->mem, p->size, "at initialize");
+            ok = import_pool(c, r, (uintptr_t)p->mem, p->size, "at initialize", NULL);
         }
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
@@ -508,6 +605,13 @@ int vk_pool_init(pool_t *p) {
     return 1;
 }
 
+int vk_pool_init(pool_t *p) {
+    int op = plat_op_begin(PLAT_OP_POOL_INIT, (uintptr_t)p->mem, p->size);
+    int ok = pool_init(p);
+    plat_op_end(op, 0);
+    return ok;
+}
+
 // What the release of a used pool waits for before the guest gets its storage back. TOTK_POOL_FINI_WAIT=idle (the
 // default) is the whole graphics queue idle, with the queue lock held, which costs a driver round trip per pool even when
 // the GPU has nothing left: a level change frees many pools one after another (a 1.6 s frame in a TOTK_PROFILE_SLOW dump,
@@ -515,7 +619,7 @@ int vk_pool_init(pool_t *p) {
 // instead and does not enter the driver when that value is already done. It covers the work the game has synchronized
 // on, which is what a release is allowed to follow; it does not cover the parts that vk_sync_split already submitted
 // for the submission still being recorded (they signal only at its end), which the idle wait did.
-static void pool_fini_wait(VkCtx *c) {
+static void pool_fini_wait_(VkCtx *c) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_get("TOTK_POOL_FINI_WAIT");
@@ -533,6 +637,12 @@ static void pool_fini_wait(VkCtx *c) {
     vk_queue_unlock();
 }
 
+static void pool_fini_wait(VkCtx *c, const PoolRec *r) {
+    int op = plat_op_begin(PLAT_OP_POOL_WAIT, r->lo, r->size);
+    pool_fini_wait_(c);
+    plat_op_end(op, 0);
+}
+
 // Releases of used pools that waited over 10 ms are logged (the first 64 of them), with the running total of all waits.
 static volatile int32_t pf_slow;
 static volatile uint64_t pf_flush_ns, pf_wait_ns;
@@ -548,7 +658,7 @@ static void pool_fini_note(uint64_t size, uint64_t flush_ns, uint64_t wait_ns) {
 
 static void staged_released(const PoolRec *r, int imported, uint64_t ns);
 
-void vk_pool_fini(pool_t *p) {
+static void pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     uint64_t t_fini = qpc();
@@ -591,7 +701,7 @@ void vk_pool_fini(pool_t *p) {
         uint64_t t0 = qpc();
         vk_upload_flush(1);
         uint64_t t1 = qpc();
-        pool_fini_wait(c);
+        pool_fini_wait(c, r);
         pool_fini_note(r->size, t1 - t0, qpc() - t1);
     }
     vk_mem_collect();
@@ -600,6 +710,12 @@ void vk_pool_fini(pool_t *p) {
     // name them (the game frees a pool only once the GPU is done with it, but its CPU writes may still be queued).
     if (r->mbuf) mirror_retiring(r), vk_completion_add(vk_sync_issued() + 1, mirror_retire, r);
     else destroy_rec(c, r);
+}
+
+void vk_pool_fini(pool_t *p) {
+    int op = plat_op_begin(PLAT_OP_POOL_FINI, (uintptr_t)p->mem, p->size);
+    pool_fini(p);
+    plat_op_end(op, 0);
 }
 
 // Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c); apply them in order.
@@ -815,6 +931,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         }
         return 1;
     }
+    resolve_ra = (uintptr_t)__builtin_return_address(0);   // who needed a first-use import, for the import log
     return resolve_locked(addr, size, out);
 }
 
@@ -829,7 +946,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     // gives the span its mirror (vk_mem_use), so callers that only read the guest bytes, or ask whether an address
     // is backed, cost no import. staged_import imports it when the mirror path cannot serve.
     if (r && r->kind == POOL_IMPORT && !r->staged && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE))
-        lazy_import(r, "on first GPU use");
+        lazy_import(r, (int)(e - pool_index.e), "on first GPU use");
     int st = r && r->kind == POOL_IMPORT && staged_pending(r);
     VkBuffer ib = r && r->kind == POOL_IMPORT && !st ? r->buf : VK_NULL_HANDLE;   // staged_pending: no torn r->buf
     if (r && (r->kind == POOL_IMPORT ? ib != VK_NULL_HANDLE || st : r->kind == POOL_PHYS)) {
@@ -930,6 +1047,7 @@ void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
     static int report_every = -1;   // TOTK_MEM_REPORT, read on the first present
     if (report_every < 0) report_every = cfg_int("TOTK_MEM_REPORT");
+    __atomic_store_n(&mem_frame, frame, __ATOMIC_RELAXED);
     __atomic_store_n(&mem_probe_frame, frame, __ATOMIC_RELAXED);
     if (fetch_test) ft_frame(frame);   // TOTK_STAGED_FETCH_TEST
     lazy_frame_log(frame);
@@ -955,14 +1073,16 @@ void vk_mem_census(uint64_t frame) {
     Group g[64];
     int ng = 0;
     uint64_t total[4] = {0}, count[4] = {0}, used_n = 0, used_bytes = 0, prev_hi = 0, near_n = 0, gap_bytes = 0;
+    uint64_t adj_n = 0;
     pool_lock_shared();
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
         if (r->kind == POOL_IMPORT && r->used) {
             used_n++, used_bytes += r->size;
             // Neighbours: a used imported pool that starts within 1 MiB of the previous one's import end (the index is
-            // sorted by address), so one larger import could have covered both.
+            // sorted by address), so one larger import could have covered both; adj_n those with no gap at all.
             if (prev_hi && r->import_lo >= prev_hi && r->import_lo - prev_hi <= (1u << 20)) near_n++, gap_bytes += r->import_lo - prev_hi;
+            if (prev_hi && r->import_lo == prev_hi) adj_n++;
             if (r->import_hi) prev_hi = r->import_hi;
         }
         int j = 0;
@@ -983,8 +1103,16 @@ void vk_mem_census(uint64_t frame) {
            (unsigned long long)count[POOL_IMPORT], (unsigned long long)used_n, used_bytes / 1048576.0,
            __atomic_load_n(&import_alloc_ns, __ATOMIC_RELAXED) / 1e6, n_imports, n_lazy_imports);
     rt_log("mem: imports took %.0f ms in all, %.0f ms of it committing and touching the pages; %llu used pools start within "
-           "1 MiB of the previous one (%.1f MiB of gaps)", __atomic_load_n(&import_total_ns, __ATOMIC_RELAXED) / 1e6,
-           __atomic_load_n(&import_touch_ns, __ATOMIC_RELAXED) / 1e6, (unsigned long long)near_n, gap_bytes / 1048576.0);
+           "1 MiB of the previous one (%.1f MiB of gaps), %llu right after it", __atomic_load_n(&import_total_ns, __ATOMIC_RELAXED) / 1e6,
+           __atomic_load_n(&import_touch_ns, __ATOMIC_RELAXED) / 1e6, (unsigned long long)near_n, gap_bytes / 1048576.0,
+           (unsigned long long)adj_n);
+    uint64_t touch[4];
+    mem_touch_stats(touch);
+    rt_log("mem: mem_touch: %llu calls, %llu chunks of 64 KiB known committed, %llu queried, %llu found reserved by "
+           "TOTK_TOUCH_MAP=verify; imported memory released %lld times in %.0f ms",
+           (unsigned long long)touch[0], (unsigned long long)touch[1], (unsigned long long)touch[2],
+           (unsigned long long)touch[3], (long long)__atomic_load_n(&rel_n, __ATOMIC_RELAXED),
+           __atomic_load_n(&rel_ns, __ATOMIC_RELAXED) / 1e6);
     static const char *const kinds[] = {"", "import", "physical", "virtual"};
     for (int j = 0; j < ng; j++) {
         char f[160];
@@ -1004,6 +1132,15 @@ void vk_mem_census(uint64_t frame) {
     window_start = frame;
 }
 
+// TOTK_VRAM_LIMIT=<MiB> (test knob, unset = off): caps the device-local budget every VRAM consumer reads here (texture
+// pressure, headroom, the perf line), to see how the runtime behaves on a card with less video memory. The driver still
+// lets allocations go past it, so it shows the runtime's reaction, not the driver paging a real small card does.
+static void vram_limit(uint64_t *budget) {
+    static int64_t lim = -1;
+    if (lim < 0) { const char *s = cfg_get("TOTK_VRAM_LIMIT"); lim = s ? (int64_t)strtoull(s, NULL, 10) << 20 : 0; }
+    if (lim && *budget > (uint64_t)lim) *budget = (uint64_t)lim;
+}
+
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     VkCtx *c = vk_ctx();
     *used = *budget = 0, *exact = 0;
@@ -1012,11 +1149,14 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     if (c->has_memory_budget) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame); NVIDIA asks the kernel
         vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+        perf_ph_end(PERF_PH_BUDGET, ph);
         for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
             if (p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 *used += b.heapUsage[h], *budget += b.heapBudget[h];
         *exact = 1;
+        vram_limit(budget);
         return *budget != 0;
     }
     VmaBudget vb[VK_MAX_MEMORY_HEAPS];
@@ -1024,6 +1164,7 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
         if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
+    vram_limit(budget);
     return *budget != 0;
 }
 
@@ -1066,11 +1207,85 @@ static const char *const ww_who_name[WW_WHO_N] = {"texture check", "snapshot", "
 static uint64_t ww_cpu_ns, ww_who_ns[WW_WHO_N], ww_slow_ns, ww_slow_cpu, ww_slow_addr, ww_slow_size, ww_slow_pages;
 static int ww_slow_who;
 
+// TOTK_TRACE=perf: a query that took TOTK_WW_SLOW_MS (5 by default) or more gets a line with the operations other
+// threads were inside meanwhile (platform.h plat_op_overlap), the first 64 such queries. They are grouped by thread
+// and kind: count, the time of theirs inside the query's interval, the longest, the longest run a VirtualQuery
+// reported, and the range they covered; those still running are listed one by one with their nesting. gen_lock is held
+// (the line costs tens of microseconds, after a query that waited milliseconds).
+#define WW_OPS 4096
+typedef struct {
+    uint32_t tid;
+    int role, kind, n;
+    uint64_t in_ns, max_ns, max_run, lo, hi;
+} WwOpGroup;
+static PlatOp ww_ops[WW_OPS];
+static WwOpGroup ww_groups[64];
+
+static void ww_slow_report(uint64_t addr, uint64_t size, int who, uint64_t t0, uint64_t t1, uint64_t cpu, uint64_t pages) {
+    static uint64_t min_ns;
+    static int lines;
+    if (!min_ns) {
+        const char *e = cfg_get("TOTK_WW_SLOW_MS");
+        min_ns = (uint64_t)(e && atof(e) > 0 ? atof(e) * 1e6 : 5e6);
+    }
+    if (t1 - t0 < min_ns || lines >= 64) return;
+    lines++;
+    int lost, n = plat_op_overlap(t0, t1, plat_thread_id(), ww_ops, WW_OPS, &lost), ng = 0;
+    char run_line[1400];
+    size_t ro = 0;
+    run_line[0] = 0;
+    for (int i = 0; i < n; i++) {
+        const PlatOp *o = &ww_ops[i];
+        if (!o->done) {   // still running: one by one, nested ones after the outer ones of the same thread
+            if (ro < sizeof run_line - 160)
+                ro += (size_t)snprintf(run_line + ro, sizeof run_line - ro, "%s[%u %s] %s%s at %#llx+%#llx for %.2f ms",
+                                       ro ? "; " : "", o->tid, plat_op_role_name(o->role), o->depth ? "> " : "",
+                                       plat_op_name(o->kind), (unsigned long long)o->addr, (unsigned long long)o->size,
+                                       (o->t1 - o->t0) / 1e6);
+            continue;
+        }
+        int g = 0;
+        while (g < ng && !(ww_groups[g].tid == o->tid && ww_groups[g].kind == o->kind)) g++;
+        if (g == ng) {
+            if (ng == (int)(sizeof ww_groups / sizeof *ww_groups)) continue;
+            ww_groups[ng++] = (WwOpGroup){o->tid, o->role, o->kind, 0, 0, 0, 0, UINT64_MAX, 0};
+        }
+        WwOpGroup *G = &ww_groups[g];
+        uint64_t a = o->t0 > t0 ? o->t0 : t0, b = o->t1 < t1 ? o->t1 : t1, d = o->t1 - o->t0;
+        G->n++, G->in_ns += b - a;
+        if (d > G->max_ns) G->max_ns = d;
+        if (o->run > G->max_run) G->max_run = o->run;
+        if (o->addr < G->lo) G->lo = o->addr;
+        if (o->addr + o->size > G->hi) G->hi = o->addr + o->size;
+    }
+    for (int i = 1; i < ng; i++)   // the most time inside the query first
+        for (int j = i; j > 0 && ww_groups[j].in_ns > ww_groups[j - 1].in_ns; j--) {
+            WwOpGroup x = ww_groups[j];
+            ww_groups[j] = ww_groups[j - 1], ww_groups[j - 1] = x;
+        }
+    char line[2400];
+    size_t o = 0;
+    line[0] = 0;
+    for (int g = 0; g < ng && g < 16 && o < sizeof line - 200; g++) {
+        const WwOpGroup *G = &ww_groups[g];
+        char run[32] = "";
+        if (G->max_run) snprintf(run, sizeof run, ", run %.0f MiB", G->max_run / 1048576.0);
+        o += (size_t)snprintf(line + o, sizeof line - o, "%s[%u %s] %s %d (%.2f ms inside, longest %.2f ms%s, %#llx-%#llx)",
+                              o ? "; " : "", G->tid, plat_op_role_name(G->role), plat_op_name(G->kind), G->n,
+                              G->in_ns / 1e6, G->max_ns / 1e6, run, (unsigned long long)G->lo,
+                              (unsigned long long)G->hi);
+    }
+    rt_log("mem: slow write-watch query: %.3f ms (%.3f on the CPU) over %.1f MiB at %#llx, %llu pages, by %s; ended "
+           "operations of other threads inside it (%d groups%s): %s; still running: %s", (t1 - t0) / 1e6, cpu / 1e6,
+           size / 1048576.0, (unsigned long long)addr, (unsigned long long)pages, ww_who_name[who], ng,
+           lost ? ", the ring was overwritten since its start" : "", ng ? line : "none", ro ? run_line : "none");
+}
+
 static uint64_t ww_query(uint64_t addr, uint64_t size, int who) {
     int perf = (rt_trace & RT_TRACE_PERF) != 0;
     uint64_t c0 = perf ? plat_self_cpu_ns() : 0, t0 = qpc();
     uint64_t n = mem_written_pages(addr, size, gen_pages, sizeof gen_pages / sizeof *gen_pages);
-    uint64_t dt = qpc() - t0;
+    uint64_t t1 = qpc(), dt = t1 - t0;
     ww_ticks += dt, ww_calls++, ww_bytes += size;
     if (n && n != UINT64_MAX) ww_dirty_calls++, ww_dirty_ticks += dt, ww_pages += n;
     if (perf) {
@@ -1079,6 +1294,7 @@ static uint64_t ww_query(uint64_t addr, uint64_t size, int who) {
         if (dt > ww_slow_ns)
             ww_slow_ns = dt, ww_slow_cpu = cpu, ww_slow_addr = addr, ww_slow_size = size,
             ww_slow_pages = n == UINT64_MAX ? 0 : n, ww_slow_who = who;
+        ww_slow_report(addr, size, who, t0, t1, cpu, n == UINT64_MAX ? 0 : n);
     }
     return n;
 }
@@ -3558,7 +3774,7 @@ static void staged_import(VkMemSpan *sp, int why) {
     PoolRec *r = sp->pool;
     uint64_t t0 = qpc();
     pool_lock_shared();   // as resolve_locked: the record stays alive while lazy_import runs
-    int ok = lazy_import(r, "for a staged pool after all");
+    int ok = lazy_import(r, -1, "for a staged pool after all");
     plat_mutex_unlock_shared(&pool_lock);
     if (!ok)
         rt_fatal("mem: staged pool %#llx+%#llx has neither a mirror nor an import (%s)", (unsigned long long)r->lo,
@@ -4381,6 +4597,7 @@ void vk_mem_use(VkMemSpan *sp) {
             if (!sp->buffer) staged_import(sp, SI_HELPER);
             return;
         }
+        uint64_t ph = perf_ph_begin_cpu();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
         uint64_t t0 = qpc();
         vk_texture_hold_barrier();   // the walk, with a pass end held back: its slices resolve the pool as it was
         int locked = mirror_lock_if_shared();
@@ -4392,6 +4609,7 @@ void vk_mem_use(VkMemSpan *sp) {
             fill.hold = t1 - t0;
         }
         mirror_unlock(locked);
+        perf_ph_end(PERF_PH_MIRROR, ph);
         // Outside mirror_lock: other threads that reach the pool meanwhile bind the mirror at once, and the fill's
         // upload batches still precede every part that uses it (staged mirror, above).
         if (fill.pending) staged_fill(r, &fill);
@@ -4401,7 +4619,11 @@ void vk_mem_use(VkMemSpan *sp) {
         if (!sp->buffer) staged_import(sp, r->mrefused ? r->mrefused - 1 : SI_GONE);   // a staged pool that stays without one
         return;
     }
-    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) mirror_sync(r);
+    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) {
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+        mirror_sync(r);
+        perf_ph_end(PERF_PH_MSYNC, ph);
+    }
     sp->buffer = r->mbuf;
 }
 
@@ -4412,7 +4634,11 @@ void vk_mem_pick(VkMemSpan *sp) {
     // rather than import the pool (staged mirror, above).
     if (!sp->buffer) return vk_mem_use(sp);
     if (ms_get(r) != MS_ON) return;
-    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) mirror_sync(r);
+    if (__atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) {
+        uint64_t ph = perf_ph_begin();   // TOTK_TRACE=perf: a part of the replay (perf.c ph_frame)
+        mirror_sync(r);
+        perf_ph_end(PERF_PH_MSYNC, ph);
+    }
     sp->buffer = r->mbuf;
 }
 
@@ -4605,7 +4831,7 @@ static int presnap_wanted(const PoolRec *r, uint32_t prev) {
     return 0;
 }
 
-void vk_mem_mirror_begin(void) {
+static void mirror_begin(void) {
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
         if (!freeze_idle) return;
         gen_lock_x();
@@ -4665,6 +4891,13 @@ void vk_mem_mirror_begin(void) {
     mrep.subs++;
     mrep.presnap_queries += q;
     mrep.presnap_t += qpc() - t0;
+}
+
+// TOTK_TRACE=perf: a part of the replay (perf.c ph_frame).
+void vk_mem_mirror_begin(void) {
+    uint64_t ph = perf_ph_begin();
+    mirror_begin();
+    perf_ph_end(PERF_PH_MIRROR_BEGIN, ph);
 }
 
 // Whether copies are queued for the next prologue; vk_sync.c prologue skips its command buffer on 0. Read without
