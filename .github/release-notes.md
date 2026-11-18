@@ -10,6 +10,10 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - #400 Log where a large pool's first GPU use spends its time, and resume write-watch queries where a full answer stopped (@wrothgaril)
 - #409 Save TOTK_SHOTS and --shot pictures of an RGB10A2 (HDR) presented image (@wrothgaril)
 - #378 Lazy write-back of shader storage writes on Linux, off by default (@roverdrubber)
+- #405 Thaw a pool's whole frozen regions without VirtualQuery (@wrothgaril)
+- #406 Split the replay of a slow frame into its parts in the perf trace (@wrothgaril)
+- #407 Create the DLSS feature and the motion pass's pipeline ahead of the first upscale (@wrothgaril)
+- #408 Skip mem_touch's VirtualQuery for lazy-heap chunks known to be committed (@wrothgaril)
 - HD rumble is off by default (`rumble_hd = auto` turns it on): three third-party Switch Pro pads broke with it (#363, #383).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
