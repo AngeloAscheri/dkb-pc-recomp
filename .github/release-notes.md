@@ -8,6 +8,8 @@ Draft, not released. The 0.4.1 notes follow below, unchanged.
 - The draws of vertex stage 45e1a6f48cb7872e are skipped on NVIDIA, for the device loss at the Landfill Layer's first checkpoint on 3.2.0 (#304).
 - HD rumble sends neutral values while the motors are silent, so a frequency change at zero amplitude no longer floods the pad (#363).
 - A refused `output_res` now says which sizes work (#403).
+- The radial blur a smash starts ends above 60 fps with `realtime = 1` on 1.0.0 too, as #159 did for 3.2.0 (#389, #390).
+- The installer keeps the DLC of a container whose base package has title id 0, warns for any add-on it cannot place, and the game logs a missing add-on (#388, fix by @Ki1z).
 - #357 Slice passes whose draws sample an image through a depth twin (@GlebShekovtsov)
 - #360 Scripted game runs with a verdict: tools/scenario.py, save_warp.py and perf_check.py (@thatbananaman08)
 - #373 Skip the futex wake of a Linux condition variable signal when no thread waits (@roverdrubber)
