@@ -4567,6 +4567,32 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info,
     return vk_fsr3_wanted() ? vk_fsr3_record(ex->cb, ex->fence, s, t) : vk_dlss_record(ex->cb, ex->fence, s, t);
 }
 
+// Native anti-aliasing (dkb_wide.c dkb_native_aa) makes the game run its upscale step at full size so that DLSS,
+// FSR 3.1 or FSR 4 can take it as anti-aliasing. When none of them did (DLSS without NVIDIA's library or on another
+// GPU, FSR 4 without AMD's, or an upscaler that failed), the game's own shader must not run at that size: it samples
+// the part its constants still give for the smaller 3D of a scaled scene and stretches it over the picture, so the
+// scene came out zoomed toward its top left corner (issue #375). The 3D is already at the output size, so the dispatch
+// becomes a copy of its input into its output, the picture the game shows when it skips the step. 1 when it recorded
+// the copy.
+static int native_aa_copy(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
+    if (!dkb_native_aa_issued_by(d->caller) || !game_upscaler(ex, cs, info, d)) return 0;
+    uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
+    view_t vs, vd;
+    int hvs = 0, hvd = 0;
+    const VkTexImage *s = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
+    const VkTexImage *t = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
+    if (!s || !t || s->image == t->image || s->width != t->width || s->height != t->height || s->format != t->format)
+        return 0;
+    VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {s->width, s->height, 1}};
+    vkCmdCopyImage(ex->cb, s->image, VK_IMAGE_LAYOUT_GENERAL, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    static int told;
+    if (!told++)
+        rt_log("upscaler: native anti-aliasing has no upscaler to run it (%s): the game's full-size step is a copy of "
+               "the %ux%u 3D instead", cfg_value("TOTK_UPSCALER"), s->width, s->height);
+    return 1;
+}
+
 // Tells the HUD (resolution.c res_note_upscaler) the sizes of every dispatch of the game's upscaler, whatever replaces
 // it (blit, DLSS) or none: same slots as dlss_upscale, the input texture 0 and the output image 1.
 static void note_upscaler(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info, const p_dispatch *d) {
@@ -4621,6 +4647,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         dc->twin_dispatch = 0;
         dlss = 0;
     }
+    if (!blit && !dlss) blit = native_aa_copy(ex, cs, info, d);   // a transfer write, as the blit
     if (!blit && !dlss) vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     ex->recorded++;
     if (!blit && !dlss) vk_exec_note_dispatch(ex);   // only compute work since the barrier above
