@@ -272,9 +272,11 @@ centred 16:9 area with square pixels (the 1920x1080 UI canvas is not stretched t
 `dkbtall` (`recomp/patches-dkb*.txt`) calls `dkb_wide.c` `vert_plus` in the camera's projection update and reset,
 which widens the vertical field of view so that its tangent is divided by aspect / 16:9; the `dkbwide` UI sites divide
 the UI projection's y row by 16:9 / aspect instead of its x row. `dkb.log` says `ultrawide off, Vert+ (HUD in a
-centred 16:9 area)`. In play the 3D fills the whole screen; screens made only of UI (the title menu, loading tips)
-leave the bands above and below the 16:9 area in the game's clear colour (a light purple), because no layout overlay
-enlarges their backgrounds for a taller screen yet (`tools/dkb_wide_layout.py` does it for wider ones). Shapes
+centred 16:9 area)`. In play the 3D fills the whole screen. On screens made only of UI (the title menu, loading
+tips) the overlay `romfs-patches-<w>x<h>` fills the bands above and below the 16:9 area: `tools/dkb_wide_layout.py`
+extends the background panes downwards (flat colours and captures) or in both axes (art), and the setup makes it for
+1280x800, 1680x1050, 1920x1200 and 2560x1600. Without it those bands show the game's clear colour (a light purple).
+The edge HUD is for wider screens only. Shapes
 taller than 16:10 (4:3, 5:4) are not accepted.
 
 The original virtual-display functions return 2880x1620 (16:9); this remains the

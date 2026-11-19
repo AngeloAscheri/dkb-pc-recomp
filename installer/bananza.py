@@ -36,12 +36,15 @@ NUP_SELECT = ('latest', 'base')
 EXE = '.exe' if os.name == 'nt' else ''
 CHUNK = 8 << 20
 WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080', '5120x1440')
+# 16:10 screens: the UI keeps a centred 16:9 area and the overlay fills the bands above and below it; no edge HUD.
+TALL_SIZES = ('1280x800', '1680x1050', '1920x1200', '2560x1600')
 # The PlayStation prompt overlays and the face buttons each is made for (runtime/romfs.c ps_prompts_init): the two pad
 # layouts, and each with A and B on the other layout's buttons (bind_ lines that swap X and Y over the Xbox table, or A
 # and B over the Nintendo one; positions of A, B, X, Y in tools/dkb_ps_prompts.py).
 PS_FOLDERS = {'romfs-patches-ps': 'xbox', 'romfs-patches-ps-nintendo': 'nintendo', 'romfs-patches-ps-senw': 'senw',
               'romfs-patches-ps-eswn': 'eswn'}
-WIDE_FOLDERS = tuple(f'romfs-patches-{size}{suffix}' for size in WIDE_SIZES for suffix in ('', '-hud-edges'))
+WIDE_FOLDERS = (tuple(f'romfs-patches-{size}{suffix}' for size in WIDE_SIZES for suffix in ('', '-hud-edges')) +
+                tuple(f'romfs-patches-{size}' for size in TALL_SIZES))
 COMMIT_WARN_GIB = 24   # the game commits about 14 GB; README asks for 16 GB of RAM plus a large page file
 
 
@@ -868,7 +871,7 @@ class WideLayouts(Step):
     id = 'dkb_wide'
 
     def key(self, ctx):
-        return digest(ctx.keys['dkb_data'], ctx.info['game'], WIDE_SIZES,
+        return digest(ctx.keys['dkb_data'], ctx.info['game'], WIDE_SIZES, TALL_SIZES,
                       source_key(ctx.layout, 'tools/dkb_wide_layout.py', 'tools/ultrawide_layout.py'))
 
     def current(self, ctx, record):
@@ -890,7 +893,7 @@ class WideLayouts(Step):
             run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_wide_layout.py',
                                     '--version', ctx.info['game'],
                                     '--romfs', ctx.dest / 'romfs', '--out', staged,
-                                    '--installer-workspace', ctx.temp, '--presets', *WIDE_SIZES])
+                                    '--installer-workspace', ctx.temp, '--presets', *WIDE_SIZES, *TALL_SIZES])
         except InstallError as error:
             if error.id != 'dkb.tool_failed':   # path/ownership failures still stop setup
                 raise

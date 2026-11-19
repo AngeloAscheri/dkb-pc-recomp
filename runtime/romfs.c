@@ -545,7 +545,7 @@ static void overlay_init(void) {
     res_wanted(out);
     // Bananza's edge HUD is a complete overlay, selected at boot just like the
     // centered layout. Fall back to the centered overlay when it is not installed.
-    if (!patches && !rt_game_version && res_wants_wide_overlay(out) &&
+    if (!patches && !rt_game_version && dkb_wide_output(NULL) &&   // a taller display has no edge HUD
         !strcmp(cfg_value("TOTK_HUD_POSITION"), "edges")) {
         if (snprintf(def, sizeof def, "%s/romfs-patches-%ux%u-hud-edges/manifest.tsv", index_dir, out[0], out[1]) <
                 (int)sizeof def && plat_file_exists(def)) {
