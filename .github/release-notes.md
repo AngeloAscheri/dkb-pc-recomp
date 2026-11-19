@@ -19,6 +19,7 @@
 - The Bananza setup folds the shader cache (about 118,000 loose files on 3.2.0) into one `shader-cache.pack`, so deleting or copying an install no longer takes tens of minutes (#402)
 - `dkb.exe --set KEY=VALUE` sets a `dkb.ini` key for one run without changing the file, and `dkb.exe --help` lists the options, for frontends that start the game (#402).
 - #423 Let the Bananza setup fetch AMD FSR 4 from AMD's repository after you accept its license (off by default) (@GlebShekovtsov)
+- The Bananza setup can fetch NVIDIA's DLSS DLL from NVIDIA's repository after you accept its license (off by default)
 - #424 Take the staged mirror's bookkeeping off the replay thread and commit guest memory ahead of use in the background (@wrothgaril)
 - #429 Yield after each background commit slice, so a guest thread waiting for the memory lock gets in (@wrothgaril)
 - #430 A start-up screen with real progress in the game window, from its opening to the game's first picture (`splash = 0` turns it off) (@wrothgaril)

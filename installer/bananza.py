@@ -23,6 +23,7 @@ from pathlib import Path
 from . import layout as layouts
 from . import state as statefile
 from . import ini
+from . import dlss
 from . import fsr4
 from .events import LauncherReporter, Reporter
 from .runner import Context, InstallError, Step, run_steps
@@ -1043,6 +1044,47 @@ class Fsr4(Step):
         return {'files': True, 'tag': fsr4.TAG}
 
 
+class Dlss(Step):
+    """NVIDIA's nvngx_dlss.dll next to dkb.exe (installer/dlss.py), only when the user asked for it and accepted NVIDIA's
+    license of the pinned release: --dlss accept (the window asks first), recorded as state['dlss'] = that release so a
+    later setup keeps it. --dlss off stops fetching it; files already there stay. A failed download warns and setup
+    goes on; the next setup tries again. DLSS needs an NVIDIA RTX GPU; setup does not check for one."""
+    id = 'dkb_dlss'
+
+    def key(self, ctx):
+        return digest('dlss', ctx.state.get('dlss') or 'off')
+
+    def current(self, ctx, record):
+        if not ctx.state.get('dlss') or not fsr4_platform():
+            return True
+        try:   # sizes only here; verify hashes them
+            return record.get('files') is True and all(
+                (ctx.dest / name).stat().st_size == size for _, name, size, _ in (dlss.LICENSE, *dlss.FILES))
+        except OSError:
+            return False
+
+    def verify(self, ctx, record):
+        return not ctx.state.get('dlss') or not fsr4_platform() or dlss.installed(ctx.dest)
+
+    def run(self, ctx):
+        if not ctx.state.get('dlss'):
+            return {'files': False}
+        if not fsr4_platform():
+            ctx.reporter.log('dlss: DLSS is for Windows only here; nothing fetched')
+            return {'files': False}
+        for _, name, _, _ in (dlss.LICENSE, *dlss.FILES):
+            ensure_plain(ctx.dest / name)
+            ensure_plain(ctx.dest / (name + '.part'))
+        total = dlss.total_bytes()
+        ctx.reporter.progress(self.id, 'dkb_fetch', 0, total, 'bytes', force=True)
+        try:
+            dlss.fetch(ctx.dest, lambda done: ctx.reporter.progress(self.id, 'dkb_fetch', done, total, 'bytes'))
+        except dlss.FetchError as error:
+            ctx.reporter.warning('warn.dkb_dlss_failed', file=error.args[0], detail=error.args[1])
+            return {'files': False}   # not current: the next setup tries again
+        return {'files': True, 'tag': dlss.TAG}
+
+
 class Prepare(Step):
     id = 'dkb_verify'
 
@@ -1084,7 +1126,7 @@ class Cleanup(Step):
 
 
 def all_steps():
-    return [Check(), Data(), Translator(), Lift(), Compile(), Shaders(), WideLayouts(), PadPrompts(), Fsr4(), Prepare(),
+    return [Check(), Data(), Translator(), Lift(), Compile(), Shaders(), WideLayouts(), PadPrompts(), Fsr4(), Dlss(), Prepare(),
             Cleanup()]
 
 
@@ -1169,6 +1211,14 @@ def main(options):
         elif ctx.state.get('fsr4') not in (None, fsr4.TAG):
             ctx.state.pop('fsr4', None)   # accepted for another release: its license is to be accepted again
             rep.warning('warn.dkb_fsr4_new_release', release=fsr4.TAG)
+        choice = getattr(options, 'dlss', None)   # accept: the user accepted NVIDIA's license of dlss.TAG
+        if choice == 'accept':
+            ctx.state['dlss'] = dlss.TAG
+        elif choice == 'off':
+            ctx.state.pop('dlss', None)
+        elif ctx.state.get('dlss') not in (None, dlss.TAG):
+            ctx.state.pop('dlss', None)   # accepted for another release: its license is to be accepted again
+            rep.warning('warn.dkb_dlss_new_release', release=dlss.TAG)
         steps = all_steps()
         rep.emit('start', release=layout.release, mode=ctx.mode, dev=layout.dev, dest=str(dest), log=str(log),
                  game=info['game'], game_exe='dkb' + EXE, steps=[s.id for s in steps])

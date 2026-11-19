@@ -32,6 +32,7 @@ try:
 except ImportError:
     ImageGrab = None
 
+from . import dlss
 from . import fsr4
 from . import ini
 from . import layout as layouts
@@ -177,6 +178,8 @@ class App:
         self.vars['lang'] = tk.StringVar()
         self.fsr4_var = tk.BooleanVar(value=False)   # Bananza: AMD FSR 4 wanted
         self.fsr4_accepted = False                   # the license of fsr4.TAG was accepted in this window
+        self.dlss_var = tk.BooleanVar(value=False)   # Bananza: NVIDIA DLSS wanted
+        self.dlss_accepted = False                   # the license of dlss.TAG was accepted in this window
         self.in_place_var = tk.BooleanVar(value=False)   # Bananza: read the RomFS folder in place, no packed copy
         self.in_place_touched = False                    # ticked or cleared here: the install's record no longer sets it
         self.lang_code = default_game_language(ui_lang)
@@ -388,6 +391,9 @@ class App:
             self.fsr4_box = ttk.Checkbutton(f, variable=self.fsr4_var, command=self.toggle_fsr4)
             self.bind_text(self.fsr4_box, 'text', 'dkb.ui.fsr4')
             self.fsr4_box.pack(anchor='w', pady=(8, 0))
+            self.dlss_box = ttk.Checkbutton(f, variable=self.dlss_var, command=self.toggle_dlss)
+            self.bind_text(self.dlss_box, 'text', 'dkb.ui.dlss')
+            self.dlss_box.pack(anchor='w', pady=(8, 0))
         self.update_hint = ttk.Label(f, wraplength=620, justify='left')
         self.update_hint.pack(anchor='w', pady=(8, 0))
         self.form_error = ttk.Label(f, style='Err.TLabel', wraplength=620, justify='left')
@@ -737,7 +743,7 @@ class App:
         return Form(base=self.vars['base'].get(), update=self.vars['update'].get(), keys=self.vars['keys'].get(),
                     lang=self.selected_lang(), dest=self.vars['dest'].get(), game=self.game,
                     exefs=self.vars['exefs'].get(), romfs=self.vars['romfs'].get(), package=self.vars['package'].get(),
-                    nup=self.vars['nup'].get(), fsr4=self.fsr4_choice(), romfs_in_place=self.in_place_var.get())
+                    nup=self.vars['nup'].get(), fsr4=self.fsr4_choice(), dlss=self.dlss_choice(), romfs_in_place=self.in_place_var.get())
 
     # AMD FSR 4 (installer/fsr4.py). Ticking the box shows AMD's license of the pinned release, fetched from AMD's
     # repository; only "I accept" leaves it ticked. A folder whose setup recorded that release starts ticked.
@@ -752,21 +758,42 @@ class App:
             return 'accept' if self.fsr4_accepted else ''
         return 'off' if self.fsr4_recorded() else ''
 
+    def dlss_recorded(self):
+        state = Form(dest=self.vars['dest'].get(), game=self.game).installed_state()
+        return bool(state) and state.get('dlss') == dlss.TAG
+
+    def dlss_choice(self):   # as fsr4_choice, for NVIDIA DLSS
+        if self.game != 'bananza' or os.name != 'nt':
+            return ''
+        if self.dlss_var.get():
+            return 'accept' if self.dlss_accepted else ''
+        return 'off' if self.dlss_recorded() else ''
+
     def toggle_fsr4(self):
         if not self.fsr4_var.get() or self.fsr4_accepted or self.fsr4_recorded():
             return
         self.fsr4_var.set(False)   # ticked only by "I accept"
+        self.license_window(fsr4, 'fsr4', self.fsr4_var, 'fsr4_accepted')
+
+    def toggle_dlss(self):
+        if not self.dlss_var.get() or self.dlss_accepted or self.dlss_recorded():
+            return
+        self.dlss_var.set(False)
+        self.license_window(dlss, 'dlss', self.dlss_var, 'dlss_accepted')
+
+    def license_window(self, mod, key, var, accepted_attr):
+        """Shows the license of mod.TAG (mod.license_text) and ticks var, setting accepted_attr, only on "I accept"."""
         win = tk.Toplevel(self.root)
-        win.title(self.cat('dkb.ui.fsr4_title'))
+        win.title(self.cat(f'dkb.ui.{key}_title'))
         win.configure(bg=BARK)
         win.transient(self.root)
         win.grab_set()
         bar = ttk.Frame(win)
         bar.pack(side='bottom', fill='x', padx=12, pady=12)
-        accept = ttk.Button(bar, text=self.cat('dkb.ui.fsr4_accept'), style='Accent.TButton', state='disabled')
+        accept = ttk.Button(bar, text=self.cat(f'dkb.ui.{key}_accept'), style='Accent.TButton', state='disabled')
         accept.pack(side='right')
-        ttk.Button(bar, text=self.cat('dkb.ui.fsr4_decline'), command=win.destroy).pack(side='right', padx=(0, 8))
-        ttk.Label(win, text=self.cat('dkb.ui.fsr4_intro', release=fsr4.TAG), wraplength=640,
+        ttk.Button(bar, text=self.cat(f'dkb.ui.{key}_decline'), command=win.destroy).pack(side='right', padx=(0, 8))
+        ttk.Label(win, text=self.cat(f'dkb.ui.{key}_intro', release=mod.TAG), wraplength=640,
                   justify='left').pack(anchor='w', padx=12, pady=(12, 8))
         box = ttk.Frame(win)
         box.pack(fill='both', expand=True, padx=12)
@@ -776,14 +803,14 @@ class App:
         text.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
         text.pack(side='left', fill='both', expand=True)
-        text.insert('end', self.cat('dkb.ui.fsr4_loading'))
+        text.insert('end', self.cat(f'dkb.ui.{key}_loading'))
         text.configure(state='disabled')
         result = {}
 
         def fetch():   # a worker thread: Tk is touched only from show(), which waits for result
             try:
-                result['text'] = fsr4.license_text()
-            except fsr4.FetchError as error:
+                result['text'] = mod.license_text()
+            except mod.FetchError as error:
                 result['error'] = error.args[1]
             except Exception as error:   # anything else must not leave the window loading with Accept disabled
                 result['error'] = f'{type(error).__name__}: {error}'
@@ -800,12 +827,12 @@ class App:
                 text.insert('end', result['text'])
                 accept.configure(state='normal')
             else:
-                text.insert('end', self.cat('dkb.ui.fsr4_fetch_failed', detail=result['error'], url=fsr4.PAGE))
+                text.insert('end', self.cat(f'dkb.ui.{key}_fetch_failed', detail=result['error'], url=mod.PAGE))
             text.configure(state='disabled')
 
         def accepted():
-            self.fsr4_accepted = True
-            self.fsr4_var.set(True)
+            setattr(self, accepted_attr, True)
+            var.set(True)
             win.destroy()
 
         accept.configure(command=accepted)
@@ -817,6 +844,8 @@ class App:
         state = form.installed_state()
         if self.game == 'bananza' and not self.fsr4_accepted:
             self.fsr4_var.set(bool(state) and state.get('fsr4') == fsr4.TAG)
+        if self.game == 'bananza' and not self.dlss_accepted:
+            self.dlss_var.set(bool(state) and state.get('dlss') == dlss.TAG)
         if self.game == 'bananza' and not self.in_place_touched:
             self.in_place_var.set(bool(state) and bool(state.get('sources', {}).get('romfs_in_place')))
         if state is not None:
