@@ -536,6 +536,29 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(code, 0, events)
         self.assertEqual(self.calls, [])
 
+    def test_moved_source_folders_fall_back_to_the_install_folders_copy(self):
+        self.assertEqual(self.run_install()[0], 0)
+        shutil.move(self.romfs, self.root / 'moved romfs')
+        shutil.move(self.exefs, self.root / 'moved exefs')
+        # An explicit folder that is missing is still an error.
+        self.options.exefs, self.options.romfs = self.exefs, self.romfs
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        self.assertIn('dkb.need_folders', [e.get('id') for e in events if e['type'] == 'error'])
+        # Nothing given and the recorded folders gone: the copy in the install folder is verified where it is.
+        self.options.exefs = self.options.romfs = None
+        self.calls.clear()
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(b.statefile.load(self.dest, b.STATE)['sources']['romfs'], str(self.romfs.resolve()))
+        # A forced Data step checks the packed image and fails on a changed one.
+        with (self.dest / 'romfs' / 'romfs.bin').open('r+b') as image:
+            image.write(b'\xff')
+        self.options.verify = True
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+
     def test_concurrent_setup_lock_and_release(self):
         self.temp.mkdir()
         first = b.lock_temp(self.temp)

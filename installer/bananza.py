@@ -304,6 +304,7 @@ def preflight(layout, options, dest, temp, rep):
     select = getattr(options, 'nup_package', None) or (recorded.get('nup_package') if nup_arg else None) or 'latest'
     if select not in NUP_SELECT:
         raise InstallError('dkb.nup_invalid', path=str(nup_arg), detail=f'unknown package choice {select}')
+    dest_source = False
     if nup_arg:
         for p in (nup_arg, dest, temp):
             ensure_plain(p.absolute())
@@ -316,6 +317,17 @@ def preflight(layout, options, dest, temp, rep):
     else:
         exefs_arg = options.exefs or (Path(recorded['exefs']) if recorded.get('exefs') else None)
         romfs_arg = options.romfs or (Path(recorded['romfs']) if recorded.get('romfs') else None)
+        # The recorded dump folders were moved or deleted: the verified copy in the install folder (ExeFS files and
+        # the packed RomFS) is the source, used where it is. Only when nothing was given on the command line, the
+        # last run packed the RomFS (not a loose in-place install) and its Data step left a record to verify against.
+        dest_source = bool(
+            old and not options.exefs and not options.romfs and not recorded.get('romfs_in_place') and
+            'sha256' in old.get('steps', {}).get('dkb_data', {}) and
+            not (exefs_arg and romfs_arg and exefs_arg.is_dir() and romfs_arg.is_dir()) and
+            (dest / 'exefs').is_dir() and (dest / 'romfs' / 'romfs.bin').is_file() and
+            (dest / 'romfs' / 'index.json').is_file())
+        if dest_source:
+            exefs_arg, romfs_arg = dest / 'exefs', dest / 'romfs'
         if not exefs_arg or not romfs_arg:
             raise InstallError('dkb.need_folders')
         for p in (exefs_arg, romfs_arg, dest, temp):
@@ -324,7 +336,9 @@ def preflight(layout, options, dest, temp, rep):
         if not exefs.is_dir() or not romfs.is_dir():
             raise InstallError('dkb.need_folders')
         game = select_target(layout, exefs)
-        inputs, sources = (exefs, romfs), {'exefs': str(exefs), 'romfs': str(romfs)}
+        # The recorded sources stay as they were, so the Data step's key and a later run still work.
+        inputs = () if dest_source else (exefs, romfs)   # the install folder is the source: no overlap to reject
+        sources = dict(recorded) if dest_source else {'exefs': str(exefs), 'romfs': str(romfs)}
         # In place: the game reads the RomFS folder itself (romfs_dir, runtime/romfs.c loose mode) and no 9 GB image is
         # packed into the install. A resume without folders keeps the choice the last run recorded.
         if getattr(options, 'romfs_in_place', False) or (not options.romfs and recorded.get('romfs_in_place')):
@@ -379,7 +393,7 @@ def preflight(layout, options, dest, temp, rep):
         manifest = pack_manifest(romfs)
         files = None
         romfs_id = digest(manifest)
-        romfs_size = manifest['romfs_size']
+        romfs_size = 0 if dest_source else manifest['romfs_size']   # verified where it is: nothing is copied
     else:
         files = files if nup_arg else inventory(romfs, rep)
         romfs_id = digest(files)
@@ -427,7 +441,7 @@ def preflight(layout, options, dest, temp, rep):
             raise InstallError('dkb.dotnet_missing')
     return dict(old=old, game=game, sources=sources, hashes=hashes, files=files,
                 romfs_id=romfs_id, romfs_size=romfs_size, owner=owner, translator=translator, identity=identity,
-                dotnet=dotnet, packed=packed, in_place=in_place,
+                dotnet=dotnet, packed=packed, in_place=in_place, dest_source=dest_source,
                 pipeline=digest(*(sha256(Path(__file__).with_name(n)) for n in ('bananza.py', 'runner.py', 'state.py'))))
 
 
@@ -591,6 +605,10 @@ class Data(Step):
             parts += [sha256(ctx.layout.tools / 'extract_nup.py'), ctx.info['sources']['nup_package']]
             if ctx.info['sources']['nup'].lower().endswith('.nx'):
                 parts.append(sha256(ctx.layout.tools / 'extract_nx.py'))
+        if ctx.info['dest_source']:
+            # Sourced from the install folder itself: keep the key the copying run recorded, so the steps after this
+            # one are not rebuilt because the source moved.
+            return ctx.state['steps']['dkb_data']['key']
         return digest(*parts)
 
     def current(self, ctx, record):
@@ -614,6 +632,8 @@ class Data(Step):
             return False
 
     def run(self, ctx):
+        if ctx.info['dest_source']:
+            return self.verify_in_place(ctx)
         stage = ctx.temp / 'data'
         owned_dir(ctx, stage)
         sources = ctx.info['sources']
@@ -674,6 +694,18 @@ class Data(Step):
         return {'sha256': manifest['romfs_sha256'], 'size': image.stat().st_size, 'mtime_ns': image.stat().st_mtime_ns,
                 'index_sha256': sha256(ctx.dest / 'romfs' / 'index.json')}
 
+
+    def verify_in_place(self, ctx):
+        """The ExeFS files against the expected hashes and the packed RomFS against the digest the copying run
+        recorded; nothing is copied, onto itself least of all."""
+        expected_exefs(ctx.layout, ctx.dest / 'exefs', ctx.info['game'])
+        romfs = ctx.dest / 'romfs'
+        recorded = ctx.state['steps']['dkb_data']['sha256']
+        if pack_manifest(romfs)['romfs_sha256'] != recorded:
+            raise InstallError('dkb.input_changed', path=str(romfs))
+        image = romfs / 'romfs.bin'
+        return {'sha256': recorded, 'size': image.stat().st_size, 'mtime_ns': image.stat().st_mtime_ns,
+                'index_sha256': sha256(romfs / 'index.json')}
 
     def in_place(self, ctx, stage, romfs):
         """index.json of the folder as dkb_pack_romfs.py would pack it (the offsets only size the index), with each
