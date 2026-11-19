@@ -917,18 +917,25 @@ static int heap_lazy(void) {
 }
 
 // Commits the reserved pages of [s, e) (64 KiB aligned, inside the heap) after asking the system for their state.
-static void touch_query(uint64_t s, uint64_t e) {
+// A commit that fails stops the game when the caller needs the pages (must: a kernel or driver access follows), and
+// returns 0 with the rest of the range left as it was when it does not (the background commits of cl_thread, which
+// only save later write-watch queries: such a range stays reserved, and the caller must not mark it committed).
+static int touch_query(uint64_t s, uint64_t e, int must) {
     int op = plat_op_begin(PLAT_OP_TOUCH, s, e - s);
     frz_lock_take();   // freeze_locked refuses regions with holes, so a commit here never lands in a frozen one
     for (uint64_t x = s, y; x < e; x = y) {
         int st = plat_mem_state(x, e, &y);
         if (st == PLAT_MEM_RESERVED && !plat_mem_commit(x, y - x)) {
             plat_mutex_unlock(&frz_lock);
-            rt_fatal("memory: lazy heap commit %#llx+%#llx failed", (unsigned long long)x, (unsigned long long)(y - x));
+            if (must)
+                rt_fatal("memory: lazy heap commit %#llx+%#llx failed", (unsigned long long)x, (unsigned long long)(y - x));
+            plat_op_end(op, 0);
+            return 0;
         }
     }
     plat_mutex_unlock(&frz_lock);
     plat_op_end(op, 0);
+    return 1;
 }
 
 // TOTK_TOUCH_MAP: 1 (default) lets mem_touch skip the chunks the platform's commit map knows to be committed
@@ -971,13 +978,20 @@ void mem_touch(uint64_t a, uint64_t n) {
     mem_touch_keep(a, n);
 }
 
-void mem_touch_keep(uint64_t a, uint64_t n) {
-    if (!n || !heap_lazy()) return;
+static int touch_range(uint64_t a, uint64_t n, int must);
+
+void mem_touch_keep(uint64_t a, uint64_t n) { touch_range(a, n, 1); }
+
+// mem_touch_keep's work. must 0 is for cl_thread, which holds `lock` (so heap_size cannot change under it) and may
+// fail: it returns 0 at the first commit that fails, with that chunk and the ones after it neither committed nor
+// marked in the commit map.
+static int touch_range(uint64_t a, uint64_t n, int must) {
+    if (!n || !heap_lazy()) return 1;
     uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
     uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
     if (s < lo) s = lo;
     if (e > hi) e = hi;
-    if (s >= e) return;
+    if (s >= e) return 1;
     plat_inc64(&touch_n[0]);
 #ifdef _WIN32
     int map = touch_map();
@@ -1001,16 +1015,17 @@ void mem_touch_keep(uint64_t a, uint64_t n) {
                     if (plat_inc64(&touch_n[3]) <= 16)
                         rt_log("mem: mem_touch: the commit map holds %#llx+%#llx, which is reserved", (unsigned long long)u,
                                (unsigned long long)(v - u));
-                    touch_query(u, v);
+                    if (!touch_query(u, v, must)) return 0;
                 }
             continue;
         }
         plat_add64(&touch_n[2], chunks);
-        touch_query(x, y);
+        if (!touch_query(x, y, must)) return 0;
 #ifdef _WIN32
         if (map) plat_mem_lazy_mark(x, y);
 #endif
     }
+    return 1;
 }
 
 // ---- lazy-heap commits in the background (mem_commit_later)
@@ -1025,6 +1040,14 @@ void mem_touch_keep(uint64_t a, uint64_t n) {
 // and is not a write for the write watch. The commit charge comes back to what the imports had; the pages stay out of
 // the working set until something touches them. The queue keeps the ranges in the order they came, so every due range
 // is at its head; one that finds the queue full is left for the fault handler, as without this.
+// The commit comes long after the request, so the heap may have shrunk in between (mem_set_heap_size decommits the
+// range it gives back and takes it out of the commit map). Each slice is therefore committed under `lock`, the lock
+// that SetHeapSize holds from its check to the new heap_size: touch_range clamps to the heap_size it reads under it, so
+// a slice either ends before the shrink (which then decommits it) or sees the smaller heap and commits nothing beyond
+// it. Without that, a commit could land in the range after the decommit and be marked in the commit map, and a later
+// mem_touch would skip pages the next shrink-and-grow left reserved. The order is `lock`, then frz_lock (touch_query),
+// as in mem_set_heap_size; CL.lock is never held with either. A commit that fails (the commit limit) ends the range:
+// nothing needs these pages committed, and the fault handler or a mem_touch commits them when something does.
 #define CL_DELAY_MS 2000u
 #define CL_SLICE (2ull << 20)
 #define CL_MAX 4096   // a layer's first frame makes a few hundred staged mirrors, a reload up to about 1,400
@@ -1039,6 +1062,7 @@ static struct {
 } CL = {.lock = PLAT_MUTEX_INIT, .cv = PLAT_COND_INIT};
 // Since the last mem_commit_later_stats: ranges taken, bytes looked at, time spent (ns); ranges dropped (queue full).
 static volatile int64_t cl_ranges, cl_bytes, cl_ns, cl_dropped;
+static volatile int64_t cl_failed;   // ranges ended early by a commit that failed, since the start
 
 static void cl_thread(void *arg) {
     (void)arg;
@@ -1054,7 +1078,17 @@ static void cl_thread(void *arg) {
         CL.head = (CL.head + 1) % CL_MAX, CL.n--;
         plat_mutex_unlock(&CL.lock);
         uint64_t t0 = plat_now_ns();
-        for (uint64_t x = a; x < a + n; x += CL_SLICE) mem_touch_keep(x, a + n - x < CL_SLICE ? a + n - x : CL_SLICE);
+        for (uint64_t x = a; x < a + n; x += CL_SLICE) {
+            plat_mutex_lock(&lock);
+            int ok = touch_range(x, a + n - x < CL_SLICE ? a + n - x : CL_SLICE, 0);
+            plat_mutex_unlock(&lock);
+            if (!ok) {
+                if (plat_inc64(&cl_failed) <= 4)
+                    rt_log("mem: a background commit failed at %#llx: the rest of %#llx+%#llx stays reserved",
+                           (unsigned long long)x, (unsigned long long)a, (unsigned long long)n);
+                break;
+            }
+        }
         plat_inc64(&cl_ranges);
         plat_add64(&cl_bytes, (int64_t)n);
         plat_add64(&cl_ns, (int64_t)(plat_now_ns() - t0));
