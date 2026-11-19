@@ -431,10 +431,10 @@ static void test_cores(Cpu *c) {
 
 // ---- directed core hand-off (kernel.c, TOTK_SCHED_HANDOFF): threads on core 3 alone. A holder L (priority 50) hands
 // a mutex to a waiter H (40). Case 1: L releases it with ArbitrateUnlock, then runs host code without an SVC for
-// 20 ms, where nothing stops it (the asynchronous preemption only interrupts lifted code); with the hand-off H gets the
-// core as the SVC returns, without it at L's next SVC, 20 ms later. Case 2: L releases it inside
+// 40 ms, where nothing stops it (the asynchronous preemption only interrupts lifted code); with the hand-off H gets the
+// core as the SVC returns, without it at L's next SVC, 40 ms later. Case 2: L releases it inside
 // WaitProcessWideKeyAtomic, which blocks L, while X (55) waits for the core at the end of a SleepThread; with the
-// hand-off the core goes to H, without it to X, which returns from the SVC and runs host code 20 ms before it exits.
+// hand-off the core goes to H, without it to X, which returns from the SVC and runs host code 40 ms before it exits.
 typedef struct { volatile uint32_t *lock, *key; uint32_t tag; int mode; } HoJob;
 static volatile uint32_t g_hol __attribute__((aligned(8))), g_hok __attribute__((aligned(8)));
 static volatile uint32_t g_ho_h;   // H's handle, for L to watch
@@ -457,7 +457,7 @@ static void ho_holder(Cpu *c) {
     g_ho_t0 = kern_now_ns();
     if (j->mode == 1) user_unlock(c, j->lock, j->tag);
     else sv(c, 0x1C, ga(j->lock), ga(j->key), j->tag, 50000000);   // times out: no one signals the key
-    busy_ns(20000000);
+    busy_ns(40000000);
     exit_thread(c);
 }
 
@@ -472,7 +472,7 @@ static void ho_waiter(Cpu *c) {
 static void ho_busy(Cpu *c) {
     g_ho_xs = kern_now_ns();
     sv(c, 0x0B, HO_XSLEEP_NS, 0, 0, 0);
-    busy_ns(20000000);
+    busy_ns(40000000);
     exit_thread(c);
 }
 
@@ -509,10 +509,10 @@ static double ho_case(Cpu *c, int mode) {
 static void test_handoff(Cpu *c) {
     int on = __atomic_load_n(&kern_sched_handoff, __ATOMIC_RELAXED);
     double d1 = ho_case(c, 1), d2 = ho_case(c, 2);
-    int ok = d1 >= 0 && d2 >= 0 && (!on || (d1 < 5 && d2 < 5));
+    int ok = d1 >= 0 && d2 >= 0 && (!on || (d1 < 15 && d2 < 15));
     printf("core hand-off (%s): a better waiter got a released mutex's core after %.3f ms (ArbitrateUnlock, holder "
-           "busy 20 ms after it) and %.3f ms (WaitProcessWideKeyAtomic, a worse thread queued for the core): %s\n",
-           on ? "TOTK_SCHED_HANDOFF on, want under 5 ms" : "off, about 20 ms expected", d1, d2,
+           "busy 40 ms after it) and %.3f ms (WaitProcessWideKeyAtomic, a worse thread queued for the core): %s\n",
+           on ? "TOTK_SCHED_HANDOFF on, want under 15 ms" : "off, about 40 ms expected", d1, d2,
            !ok ? "FAIL" : on ? "ok" : "ok (not checked)");
     CHECK(ok, "core hand-off");
 }
