@@ -366,6 +366,9 @@ uint64_t dkb_wide_heap_extra_kib(void);                    // Bananza: what the 
 int dkb_native_aa(void);                                   // Bananza: the game's upscale step runs at full size now
 int dkb_native_aa_issued_by(uint64_t caller);              // ... and a dispatch issued at that guest address is it
 void dkb_native_aa_live(void);                             // re-read the Upscaler setting (frame_step_present)
+// The 3D scene ratio TOTK_DLSS_MODE names (dlaa 1.0, quality 1.5, balanced 1.724, performance 2.0, ultra_performance
+// 3.0); 0 for auto or a word that is none of them.
+float dkb_dlss_mode_ratio(const char *mode);
 int dkb_ui_overlay(void);                                  // wider than 16:9, or taller with Vert+
 int dkb_wide_output(unsigned out[2]);                      // active mode; optional output gets its size or the stock size
 void dkb_wide_upscale_output(unsigned out[2]);             // Bananza: the size the game's upscaler writes

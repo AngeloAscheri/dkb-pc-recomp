@@ -181,6 +181,52 @@ static int create_instance(void) {
     return 1;
 }
 
+static int name_has(const char *s, const char *sub) {
+    for (size_t n = strlen(sub); *s; s++)
+        if (!strncasecmp(s, sub, n)) return 1;
+    return 0;
+}
+
+int vk_hw_probe(unsigned *vram_mib, int *integrated, int *nvidia) {
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1};
+    VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    VkInstance inst;
+    uint32_t n = 0;
+    *vram_mib = 0, *integrated = 0, *nvidia = 0;
+    if (vkCreateInstance(&ci, NULL, &inst) != VK_SUCCESS) return 0;
+    VkPhysicalDevice pd[16];
+    vkEnumeratePhysicalDevices(inst, &n, NULL);
+    if (n > 16) n = 16;
+    vkEnumeratePhysicalDevices(inst, &n, pd);
+    const char *e = cfg_get("TOTK_GPU_INDEX");
+    int want = e && *e ? atoi(e) : -1, best = -1, best_score = -1;
+    const char *name = cfg_get("TOTK_GPU_NAME");
+    for (uint32_t i = 0; i < n; i++) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(pd[i], &p);
+        if (name && *name && !name_has(p.deviceName, name)) continue;
+        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
+                  : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+        if (score > best_score) best_score = score, best = (int)i;
+    }
+    if (best >= 0) {
+        VkPhysicalDeviceProperties p;
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceProperties(pd[best], &p);
+        vkGetPhysicalDeviceMemoryProperties(pd[best], &mp);
+        VkDeviceSize heap = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+            if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > heap)
+                heap = mp.memoryHeaps[i].size;
+        *vram_mib = (unsigned)(heap >> 20);
+        *integrated = p.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        *nvidia = p.vendorID == 0x10DE;
+    }
+    vkDestroyInstance(inst, NULL);
+    return best >= 0;
+}
+
 static const char *const k_required_ext[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
@@ -209,12 +255,6 @@ static uint32_t find_gfx_family(VkPhysicalDevice pd, const VkQueueFamilyProperti
             gfx_window_vk_presentable(g_vk.instance, pd, i))
             return i;
     return UINT32_MAX;
-}
-
-static int name_has(const char *s, const char *sub) {
-    for (size_t n = strlen(sub); *s; s++)
-        if (!strncasecmp(s, sub, n)) return 1;
-    return 0;
 }
 
 // First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue; TOTK_GPU_INDEX (index) or

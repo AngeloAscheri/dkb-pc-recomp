@@ -333,6 +333,32 @@ sets that scale to 1.0 (set `render3d`), so the scene is the render resolution d
 keeps the upscaler: `scene_res = 1.5` at 3840x2160 draws the scene at 2560x1440 and DLSS outputs 3840x2160
 (`dlss: Quality 2560x1440 -> 3840x2160`), where `auto` outputs 2560x1440.
 
+`dlss_mode` (`DKB_DLSS_MODE`, `auto|dlaa|quality|balanced|performance|ultra_performance`, read at start, F1 "Upscaler
+quality mode") names the 3D scene ratio for `upscaler = dlss`, `fsr3` or `fsr4`, as `scene_res` would: dlaa 1.0, quality
+1.5, balanced 1.724, performance 2.0, ultra_performance 3.0 (`vk_dlss.c` `quality` then names the same DLSS mode). It applies
+only while `scene_res` is `auto`: a `scene_res` the player set wins. `dlss_preset` stays `auto|k|m` (the NGX headers
+used here define the render presets K, L and M only). `dkb.log` says `Bananza resolution: dlss_mode = ...`.
+
+`preset` (`DKB_PRESET`, `custom|recommended|1|2|3|4|5`, read at start, F1 "Performance preset") is a defaults table
+layered like the Steam Deck profile (`cfg.c` `PRESETS`): below the environment and `dkb.ini`, above the built-in
+defaults, so an option the player set by hand wins. `custom` (the default) changes nothing; the Steam Deck profile
+keeps its own table and ignores the preset. `recommended` takes the lowest of three levels, from the largest
+device-local Vulkan heap (under 4.8 GiB 1, 6.7 GiB 2, 9.7 GiB 3, 11.5 GiB 4, else 5), the RAM (under 10.7 GiB 1, 22.5 GiB 4,
+else 5) and the logical processors the process may use (4 or fewer 2, under 8 3, under 12 4, else 5), at most 2 on an
+integrated GPU; `dkb.log` says `[host] preset: recommended -> N (VRAM ..., RAM ..., ... logical ...)`.
+
+On Bananza `output_res` is the game's virtual display (built-in 2880x1620); under `scene_res = auto` the game draws the
+3D smaller and upscales it (at the built-in output on update 3.2.0, `dkb.log` says `dlss: Quality 1280x720 -> 1920x1080`).
+DLSS is picked only on an NVIDIA GPU with `nvngx_dlss.dll` next to `dkb.exe`, FSR 3.1 otherwise.
+
+| Level | Output | Scene | Upscaler | ASTC to BC3 | Frame limit | Frame generation | Aimed at |
+| - | - | - | - | - | - | - | - |
+| 1 Minimum | 1280x720 | auto | fsr | on | 30 | off | 4 GB VRAM, 8 GB RAM, 4 logical processors |
+| 2 Low | 1920x1080 | auto | fsr | on | 60 | off | 4-6 GB VRAM, 16 GB RAM |
+| 3 Medium | built-in (2880x1620) | auto | DLSS or FSR 3.1 | off | 60 | off | 8 GB VRAM, 16 GB RAM, 6+ logical |
+| 4 High | 2560x1440 | full | DLSS or FSR 3.1 | off | 60 | off | 10-12 GB VRAM, 8+ logical |
+| 5 Ultra | 3840x2160 | auto | DLSS or FSR 3.1 | off | display | auto | 12 GB+ VRAM, 32 GB RAM, 12+ logical |
+
 Native anti-aliasing (update 3.2.0): `scene_res = full` with `upscaler = fsr3`, `fsr4` or `dlss` runs that upscaler at
 100% (input and output the same size), as FSR 3.1, FSR 4 and DLSS in DLAA mode, which anti-alias the 3D scene alone.
 At a full-size 3D the game skips the dispatch of its upscale step (its upscaler level, in the settings at +0x10, is 0
