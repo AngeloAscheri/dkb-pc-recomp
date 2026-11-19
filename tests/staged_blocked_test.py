@@ -8,7 +8,8 @@ staged_upload built one sorted union of the pools' own lists and the lists of ev
 pieces by binary search in each list and st_cut cuts the range against them. tests/staged_blocked.c runs the
 production lookup, cut, sort (st_sort_job) and own-list code from runtime/vk_memory.c, pasted in below, against the old
 union kept in the fixture, and requires the same blocked bytes, copied pieces and byte counts for every upload range
-of every case. A mismatch prints the seed and a shrunk counterexample.
+of every case. The check TOTK_STAGED_BLK_CHECK makes in a game run (st_chk_union, st_chk_range) runs on the same ranges
+and must flag none. A mismatch prints the seed and a shrunk counterexample.
 """
 import argparse
 import os
@@ -69,6 +70,10 @@ def main():
         definition(src, 'static void st_job_blocked('),
         definition(src, 'static void st_blocked('),
         definition(src, 'static void st_cut('),
+        line(src, '#define MRANGE_LESS('), line(src, 'MSORT_DEFINE(sort_ranges,'),
+        # TOTK_STAGED_BLK_CHECK: the union and the comparison as the game runs them
+        src[src.index('// ---- TOTK_STAGED_BLK_CHECK=1'):src.index('static void st_chk_log(')],
+        definition(src, 'static void st_chk_log('),
     ])
     fixture = args.out / 'staged_blocked.c'
     fixture.write_text((ROOT / 'tests/staged_blocked.c').read_text(encoding='utf-8')

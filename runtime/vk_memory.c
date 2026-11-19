@@ -112,6 +112,7 @@ static int staged_fault = 1;             // TOTK_STAGED_WB (mirror_mode): 1 faul
 static int staged_fetch(uint64_t page, int write, uint64_t rip, int kernel);
 static void staged_forget(PoolRec *r);   // vk_pool_fini: a staged pool's owned pages open without a fetch
 static int fetch_test;                   // TOTK_STAGED_FETCH_TEST (fetch exerciser below)
+static int blk_check;                    // TOTK_STAGED_BLK_CHECK (st_chk_union below)
 static void ft_frame(uint64_t frame);
 static void staged_frame_log(uint64_t frame);   // vk_mem_census: what the staged pools did in the frame
 // A staged pool that has not been imported: lazy stays 1 until staged_import imports it after all, and lazy_import
@@ -2473,6 +2474,11 @@ static void mirror_mode(int discrete, uint32_t vendor) {
             if (fetch_test)
                 rt_log("mem: staged fetch test: %d GPU-owned pages a frame are touched and their fetches checked against "
                        "a reference copy (TOTK_STAGED_FETCH_TEST)", fetch_test);
+            const char *bc = cfg_get("TOTK_STAGED_BLK_CHECK");
+            blk_check = bc && *bc && strcmp(bc, "0");
+            if (blk_check)
+                rt_log("mem: staged blocked check: every staged upload range is also cut against the union of the "
+                       "blocked lists, as before ce4178e, and the two answers compared (TOTK_STAGED_BLK_CHECK)");
         }
     }
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
@@ -4160,6 +4166,118 @@ static void st_cut(PoolRec *r, uint64_t a, uint64_t b, const struct KeptRange *b
     if (a < b) range_add(cut, ncut, ccut, r, a, b - a), *total += b - a;
 }
 
+// ---- TOTK_STAGED_BLK_CHECK=1 (off by default): st_blocked and st_cut against the union they replaced
+// Before ce4178e every prologue built one union of the blocked ranges (st_blk_update) and staged_upload cut each upload
+// range against it. With the check on, staged_upload builds that union again from the lists st_blocked reads, under
+// the locks it holds for them (st_lock; own_lock with TOTK_STAGED_WB=fault; the jobs' owned lists already waited for
+// with st_sorted_wait), cuts every upload range against it as the old loop did, and compares the blocked bytes, the
+// copied pieces and the byte counts with those of st_blocked and st_cut. tests/staged_blocked_test.py compares the same
+// on random lists; this compares them on the game's. Replay thread only (staged_upload), the counters aside.
+static MRange *chk_blk;                 // the union: sorted by pool and offset, what overlaps or touches joined
+static int nchk_blk, cchk_blk;
+static volatile int64_t chk_uploads, chk_ranges, chk_bad;   // since the start
+
+static void st_chk_union(uint64_t fence) {
+    static MRange *sbuf;
+    static size_t scap;
+    nchk_blk = 0;
+    for (const StJob *j = st_jobs; j; j = j->next) {
+        if (!j->ended || j->fence >= fence) continue;
+        for (int i = 0; i < j->n; i++) range_add(&chk_blk, &nchk_blk, &cchk_blk, j->w[i].r, j->w[i].off, j->w[i].size);
+        for (int i = 0; i < j->no; i++) range_add(&chk_blk, &nchk_blk, &cchk_blk, j->o[i].r, j->o[i].off, j->o[i].size);
+    }
+    if (staged_fault)   // the pools on st_own, as st_blk_update took them
+        for (int i = 0; i < nst_own; i++)
+            for (int k = 0; k < st_own[i]->nown; k++)
+                range_add(&chk_blk, &nchk_blk, &cchk_blk, st_own[i], st_own[i]->own[k].lo,
+                          st_own[i]->own[k].hi - st_own[i]->own[k].lo);
+    sort_ranges(chk_blk, (size_t)nchk_blk, &sbuf, &scap);
+    int o = 0;
+    for (int i = 0; i < nchk_blk; i++) {
+        if (o && chk_blk[o - 1].r == chk_blk[i].r && chk_blk[i].off <= chk_blk[o - 1].off + chk_blk[o - 1].size) {
+            uint64_t end = chk_blk[i].off + chk_blk[i].size;
+            if (end > chk_blk[o - 1].off + chk_blk[o - 1].size) chk_blk[o - 1].size = end - chk_blk[o - 1].off;
+        } else chk_blk[o++] = chk_blk[i];
+    }
+    nchk_blk = o;
+    plat_inc64(&chk_uploads);
+}
+
+// A piece list of the check: x[0..n), grown as needed. With join (blocked bytes, the old loop's pieces) empty pieces
+// are left out and touching ones joined, as the old range_add joined them; without (st_cut's pieces, joined by
+// range_add already) every piece is kept, so an empty one shows as a mismatch.
+typedef struct { struct KeptRange *x; int n, c; } ChkList;
+static void chk_add(ChkList *l, uint64_t lo, uint64_t hi, int join) {
+    if (join && lo >= hi) return;
+    if (join && l->n && l->x[l->n - 1].hi >= lo) {
+        if (hi > l->x[l->n - 1].hi) l->x[l->n - 1].hi = hi;
+        return;
+    }
+    if (l->n == l->c) grow((void **)&l->x, &l->c, sizeof *l->x);
+    l->x[l->n++] = (struct KeptRange){lo, hi};
+}
+
+static int chk_same(const ChkList *p, const ChkList *q) {
+    return p->n == q->n && !memcmp(p->x, q->x, (size_t)p->n * sizeof *p->x);
+}
+
+static void chk_fmt(char *buf, size_t cap, const ChkList *l) {   // the count and the first 16 pieces
+    size_t o = (size_t)snprintf(buf, cap, "%d", l->n);
+    for (int k = 0; k < l->n && k < 16 && o < cap; k++)
+        o += (size_t)snprintf(buf + o, cap - o, " [%#llx, %#llx)", (unsigned long long)l->x[k].lo,
+                              (unsigned long long)l->x[k].hi);
+    if (l->n > 16 && o < cap) snprintf(buf + o, cap - o, " ...");
+}
+
+// Upload range [a, b) of r, blk[0..nblk) st_blocked's pieces of it: compared with the union of st_chk_union.
+static void st_chk_range(PoolRec *r, uint64_t a, uint64_t b, uint64_t fence, const struct KeptRange *blk, int nblk) {
+    static ChkList lb, ub, lc, uc;   // blocked bytes and copied pieces: the lookup's, the union's
+    static MRange *cut;
+    static int ncut, ccut;
+    lb.n = ub.n = lc.n = uc.n = 0;
+    for (int k = 0; k < nblk; k++) chk_add(&lb, blk[k].lo, blk[k].hi, 1);   // sorted by lo: joined, they are disjoint
+    uint64_t lt = 0, ls = 0, ut = 0, us = 0;
+    ncut = 0;
+    st_cut(r, a, b, blk, nblk, &cut, &ncut, &ccut, &lt, &ls);
+    for (int k = 0; k < ncut; k++) chk_add(&lc, cut[k].off, cut[k].off + cut[k].size, 0);
+    int lo = 0, hi = nchk_blk;   // the first range of the union for r that ends above a
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if ((uintptr_t)chk_blk[mid].r < (uintptr_t)r || (chk_blk[mid].r == r && chk_blk[mid].off + chk_blk[mid].size <= a))
+            lo = mid + 1;
+        else hi = mid;
+    }
+    uint64_t x = a;   // the old cut loop of staged_upload; its range_add joined touching pieces
+    for (int k = lo; k < nchk_blk && chk_blk[k].r == r && chk_blk[k].off < b; k++) {
+        uint64_t ka = chk_blk[k].off, kb = ka + chk_blk[k].size;
+        chk_add(&ub, ka > a ? ka : a, kb < b ? kb : b, 1);
+        if (x >= b) continue;
+        if (ka > x) chk_add(&uc, x, ka, 1), ut += ka - x;
+        uint64_t e = kb < b ? kb : b;
+        if (e > x) us += e - (ka > x ? ka : x), x = e;
+    }
+    if (x < b) chk_add(&uc, x, b, 1), ut += b - x;
+    plat_inc64(&chk_ranges);
+    if (chk_same(&lb, &ub) && chk_same(&lc, &uc) && lt == ut && ls == us) return;
+    int64_t bad = plat_inc64(&chk_bad);
+    if (bad > 16) return;
+    char s[4][800];   // the lists' first 16 pieces each, two lists a line (rt_log's line holds 2 KiB)
+    chk_fmt(s[0], sizeof s[0], &lb), chk_fmt(s[1], sizeof s[1], &ub), chk_fmt(s[2], sizeof s[2], &lc);
+    chk_fmt(s[3], sizeof s[3], &uc);
+    rt_log("mem: staged blocked check: mismatch %lld (the first 16 are logged): pool at %#llx (mirror of %#llx bytes), "
+           "prologue fence %llu, upload range [%#llx, %#llx): bytes copied/left out, lookup %llu/%llu, union %llu/%llu",
+           (long long)bad, (unsigned long long)r->lo, (unsigned long long)(r->import_hi - r->import_lo),
+           (unsigned long long)fence, (unsigned long long)a, (unsigned long long)b, (unsigned long long)lt,
+           (unsigned long long)ls, (unsigned long long)ut, (unsigned long long)us);
+    rt_log("mem: staged blocked check: mismatch %lld, blocked bytes: lookup %s; union %s", (long long)bad, s[0], s[1]);
+    rt_log("mem: staged blocked check: mismatch %lld, copied pieces: lookup %s; union %s", (long long)bad, s[2], s[3]);
+}
+
+static void st_chk_log(const char *when) {
+    rt_log("mem: staged blocked check %s: uploads checked %lld, upload ranges %lld, mismatches %lld (TOTK_STAGED_BLK_CHECK)",
+           when, (long long)chk_uploads, (long long)chk_ranges, (long long)chk_bad);
+}
+
 // staged_upload: a piece of staging is full (used bytes) and the copies out of it are recorded; freed at the fence.
 static void staged_piece_done(VkBuffer sb, VmaAllocation sa, uint64_t used, uint64_t fence) {
     vmaFlushAllocation(vk_ctx()->vma, sa, 0, used);
@@ -4222,6 +4340,7 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
     for (const StJob *j = st_jobs; j; j = j->next)
         if (j->ended && j->fence < fence) st_sorted_wait(j, 0);
     if (staged_fault) plat_mutex_lock(&own_lock);   // the own lists stay as they are while they are read
+    if (blk_check) st_chk_union(fence);   // TOTK_STAGED_BLK_CHECK
     uint64_t tb = qpc();
     ncut = 0;
     uint64_t total = 0, skipped = 0;
@@ -4236,6 +4355,7 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
             if (a >= b) continue;
             st_blocked(r, a, b, fence, &blk, &nblk, &cblk);
             mrep.st_blk_n++, mrep.st_blk_ranges += (uint64_t)nblk;
+            if (blk_check) st_chk_range(r, a, b, fence, blk, nblk);
             st_cut(r, a, b, blk, nblk, &cut, &ncut, &ccut, &total, &skipped);
         }
     }
@@ -4534,6 +4654,7 @@ static void staged_shutdown(VkCtx *c) {
     for (int k = 0; k < ST_OBUF; k++) free(st_obuf[k]), st_obuf[k] = NULL;
     st_cur = NULL;
     plat_mutex_unlock(&st_lock);
+    if (blk_check) st_chk_log("at exit");
 }
 
 // Replay thread: the pool's mirror on its first buffer use. A staged pool's mirror is not filled here: for a large one
@@ -5667,6 +5788,11 @@ static void mirror_log(uint64_t frame) {
                own_drop_bytes / M);
         mem_probe_log(frame, 0);
         if (staged_fault) own_log(frame, f), ft_log(frame);
+        if (blk_check) {
+            char when[48];
+            snprintf(when, sizeof when, "frame %llu: so far", (unsigned long long)frame);
+            st_chk_log(when);
+        }
     }
 
 }

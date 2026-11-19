@@ -7,7 +7,9 @@
 // then sorted by the production st_sort_job, as the sort thread does), and the fence of the prologue. For every query
 // range [a, b) of a pool, the lookup's blocked bytes and the pieces st_cut gives to the upload must equal those of the
 // old union: one sorted, merged list of every ended job's ranges before the fence and of every pool on st_own, and the
-// old cut loop over it. On a mismatch the case is shrunk to a minimal one and printed with its seed.
+// old cut loop over it. The comparison of TOTK_STAGED_BLK_CHECK (st_chk_union, st_chk_range) runs on every query as well
+// and must flag exactly the queries where the two disagree. On a mismatch the case is shrunk to a minimal one and
+// printed with its seed.
 //
 // Usage: staged_blocked [cases] [first seed]
 #include <stdarg.h>
@@ -33,6 +35,17 @@ static void rt_fatal(const char *fmt, ...) {
     exit(2);
 }
 static uint64_t qpc(void) { return 0; }
+static int show_log;   // print_case: the lines TOTK_STAGED_BLK_CHECK logs
+static void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rt_log(const char *fmt, ...) {
+    if (!show_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    printf("  log: ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+}
 
 /* PRODUCTION_TYPES */
 
@@ -211,7 +224,9 @@ typedef struct {
     uint64_t total[2], skipped[2];
 } Answer;
 
-// Runs query qi of the installed case (ref_build done): 1 when the lookup and the union agree.
+// Runs query qi of the installed case (ref_build and st_chk_union done): 1 when the lookup and the union agree and
+// TOTK_STAGED_BLK_CHECK's comparison says so too; last_same and last_flagged hold the two verdicts.
+static int last_same, last_flagged;
 static int query(const Case *c, int qi, Answer *an, int count) {
     static struct KeptRange *blk;
     static int nblk, cblk;
@@ -239,6 +254,9 @@ static int query(const Case *c, int qi, Answer *an, int count) {
                !memcmp(an->c[0], an->c[1], (size_t)an->nc[0] * sizeof(Piece));
     for (int k = 0; k < ncut; k++)   // the cut pieces lie in [a, b) and are not empty
         if (cut[k].r != r || !cut[k].size || cut[k].off < q->lo || cut[k].off + cut[k].size > q->hi) same = 0;
+    int64_t bad0 = chk_bad;
+    st_chk_range(r, q->lo, q->hi, c->fence, blk, nblk);
+    last_same = same, last_flagged = chk_bad != bad0;
     if (count) {
         uint64_t a = q->lo, b = q->hi;
         int ai = 0, ae = 0, bi = 0, be = 0;
@@ -272,7 +290,7 @@ static int query(const Case *c, int qi, Answer *an, int count) {
         }
         if (lists > 1) cov[CV_SEVERAL_LISTS]++;
     }
-    return same;
+    return same && !last_flagged;
 }
 
 // Runs every query of a case: the index of the first that disagrees, or -1.
@@ -280,6 +298,7 @@ static int run_case(const Case *c, int count) {
     static Answer an;
     install(c);
     ref_build(c->fence);
+    st_chk_union(c->fence);
     if (count) {
         for (int k = 0; k < nref; k++) {
             uint64_t x = ref[k].off, y = x + ref[k].size;
@@ -547,7 +566,10 @@ static void print_case(const Case *c) {
     }
     install(c);
     ref_build(c->fence);
+    chk_bad = 0, show_log = 1;
+    st_chk_union(c->fence);
     query(c, 0, &an, 0);
+    show_log = 0;
     uninstall(c);
     printf("  upload range: pool %d [%#llx, %#llx)\n", c->q[0].p, (unsigned long long)c->q[0].lo,
            (unsigned long long)c->q[0].hi);
@@ -557,6 +579,8 @@ static void print_case(const Case *c) {
     print_pieces("copied, old union ", an.c[1], an.nc[1]);
     printf("    copied/left out bytes: lookup %llu/%llu, old union %llu/%llu\n", (unsigned long long)an.total[0],
            (unsigned long long)an.skipped[0], (unsigned long long)an.total[1], (unsigned long long)an.skipped[1]);
+    printf("  the fixture's comparison: %s; TOTK_STAGED_BLK_CHECK's: %s\n", last_same ? "same" : "different",
+           last_flagged ? "flagged (log lines above)" : "not flagged");
 }
 
 int main(int argc, char **argv) {
@@ -582,7 +606,12 @@ int main(int argc, char **argv) {
         printf("  %-48s %llu\n", cv_name[k], (unsigned long long)cov[k]);
         if (!cov[k]) missing++;
     }
-    printf("staged-blocked: %ld cases from seed %llu, %llu upload ranges, 0 mismatches%s\n", cases,
-           (unsigned long long)seed0, (unsigned long long)queries, missing ? ", but a coverage count is 0" : "");
-    return missing ? 1 : 0;
+    int knob = chk_ranges != (int64_t)queries || chk_uploads != cases || chk_bad;
+    show_log = 1;
+    st_chk_log("at exit");   // the line TOTK_STAGED_BLK_CHECK ends a game run with
+    show_log = 0;
+    printf("staged-blocked: %ld cases from seed %llu, %llu upload ranges, 0 mismatches%s%s\n", cases,
+           (unsigned long long)seed0, (unsigned long long)queries, missing ? ", but a coverage count is 0" : "",
+           knob ? ", but TOTK_STAGED_BLK_CHECK's counts are off" : "");
+    return missing || knob ? 1 : 0;
 }
