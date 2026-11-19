@@ -148,7 +148,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_UPSCALER_GAME] = "Game's own", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_UPSCALER_FSR3] = "AMD FSR 3.1", [UI_MENU_UPSCALER_FSR4] = "AMD FSR 4",
     [UI_MENU_PRESET] = "Performance preset",
-    [UI_MENU_PRESET_DESC] = "Sets the render resolution, upscaler, frame rate limit, texture compression and frame generation "
+    [UI_MENU_PRESET_DESC] = "Sets the render resolution, upscaler, texture compression and frame generation "
                             "for a class of PC. Recommended picks the level from your GPU memory, RAM and processor count. "
                             "Options you set by hand override the preset. Applies at the next start.",
     [UI_MENU_PRESET_CUSTOM] = "Custom", [UI_MENU_PRESET_RECOMMENDED] = "Recommended", [UI_MENU_PRESET_MINIMUM] = "1 Minimum",
@@ -571,7 +571,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                               "применяется при следующем запуске. Как готовая картинка потом подгоняется под окно, определяет "
                               "фильтр масштабирования под окно.",
     [UI_MENU_PRESET] = "Набор настроек производительности",
-    [UI_MENU_PRESET_DESC] = "Задаёт разрешение рендеринга, апскейлер, лимит кадров, сжатие текстур и генерацию кадров для "
+    [UI_MENU_PRESET_DESC] = "Задаёт разрешение рендеринга, апскейлер, сжатие текстур и генерацию кадров для "
                             "класса ПК. «Рекомендуемый» выбирает уровень по видеопамяти, ОЗУ и числу процессоров. "
                             "Параметры, заданные вручную, важнее набора. Действует после перезапуска.",
     [UI_MENU_PRESET_CUSTOM] = "Свои настройки", [UI_MENU_PRESET_RECOMMENDED] = "Рекомендуемый",

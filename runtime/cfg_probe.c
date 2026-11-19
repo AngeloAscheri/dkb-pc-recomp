@@ -506,7 +506,7 @@ int probe_cfg(void) {
     CHECK(cfg_get("TOTK_OUTPUT_RES") == NULL, "preset custom changes no default");
     plat_setenv("TOTK_PRESET", "1");
     cfg_preset_resolve();
-    CHECK(EQ(cfg_get("TOTK_OUTPUT_RES"), "1280x720") && EQ(cfg_get("TOTK_FPS_LIMIT"), "30") &&
+    CHECK(EQ(cfg_get("TOTK_OUTPUT_RES"), "1280x720") && cfg_get("TOTK_FPS_LIMIT") == NULL &&
               EQ(cfg_get("TOTK_UPSCALER"), "fsr") && EQ(cfg_get("TOTK_ASTC_BC"), "1") && EQ(cfg_get("TOTK_FRAME_GEN"), "off"),
           "preset 1 sets its keys");
     plat_setenv("TOTK_PRESET", "3");
@@ -516,7 +516,7 @@ int probe_cfg(void) {
           "preset 3: the built-in output, a temporal upscaler, no BC3");
     plat_setenv("TOTK_PRESET", "5");
     cfg_preset_resolve();
-    CHECK(EQ(cfg_get("TOTK_OUTPUT_RES"), "3840x2160") && EQ(cfg_get("TOTK_SCENE_RES"), "auto") && EQ(cfg_get("TOTK_FPS_LIMIT"), "display") &&
+    CHECK(EQ(cfg_get("TOTK_OUTPUT_RES"), "3840x2160") && EQ(cfg_get("TOTK_SCENE_RES"), "auto") &&
               EQ(cfg_get("TOTK_FRAME_GEN"), "auto"),
           "preset 5: 4K output from a 1440p scene, frame generation");
     plat_setenv("TOTK_PRESET", "4");

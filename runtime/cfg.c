@@ -352,7 +352,8 @@ int vk_driver_env_apply(void) { return 0; }
 // totk.ini, above the built-in table), so every key the player sets wins. preset = custom (the default) changes
 // nothing; 1..5 is Minimum, Low, Medium, High, Ultra; recommended picks the level the machine fits (cfg_preset_score).
 // A NULL cell leaves the key at the built-in default. On Bananza OUTPUT_RES is the game's virtual display (built-in
-// 2880x1620); the game draws its 3D smaller and upscales it unless SCENE_RES = full (level 4: DLAA with DLSS).
+// 2880x1620); the game draws its 3D smaller and upscales it unless SCENE_RES = full (level 4: DLAA with DLSS). No
+// frame limit here: below or above 60 it needs the experimental real-time step (frame_rate.c frame_limit_live).
 // "dlss|fsr3" is DLSS on an NVIDIA GPU with nvngx_dlss.dll next to dkb.exe, FSR 3.1
 // otherwise (cfg_preset_resolve). Not applied on the Steam Deck profile, which has its own table.
 static const struct { const char *key, *level[5]; } PRESETS[] = {
@@ -360,7 +361,6 @@ static const struct { const char *key, *level[5]; } PRESETS[] = {
     {"SCENE_RES", {"auto", "auto", "auto", "full", "auto"}},
     {"UPSCALER", {"fsr", "fsr", "dlss|fsr3", "dlss|fsr3", "dlss|fsr3"}},
     {"ASTC_BC", {"1", "1", "0", "0", "0"}},
-    {"FPS_LIMIT", {"30", "60", "60", "60", "display"}},
     {"FRAME_GEN", {"off", "off", "off", "off", "auto"}},
 };
 static int preset = -1;   // 0 none, 1..5; -1 until cfg_preset_resolve

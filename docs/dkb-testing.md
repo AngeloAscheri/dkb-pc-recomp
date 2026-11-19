@@ -351,13 +351,13 @@ On Bananza `output_res` is the game's virtual display (built-in 2880x1620); unde
 3D smaller and upscales it (at the built-in output on update 3.2.0, `dkb.log` says `dlss: Quality 1280x720 -> 1920x1080`).
 DLSS is picked only on an NVIDIA GPU with `nvngx_dlss.dll` next to `dkb.exe`, FSR 3.1 otherwise.
 
-| Level | Output | Scene | Upscaler | ASTC to BC3 | Frame limit | Frame generation | Aimed at |
-| - | - | - | - | - | - | - | - |
-| 1 Minimum | 1280x720 | auto | fsr | on | 30 | off | 4 GB VRAM, 8 GB RAM, 4 logical processors |
-| 2 Low | 1920x1080 | auto | fsr | on | 60 | off | 4-6 GB VRAM, 16 GB RAM |
-| 3 Medium | built-in (2880x1620) | auto | DLSS or FSR 3.1 | off | 60 | off | 8 GB VRAM, 16 GB RAM, 6+ logical |
-| 4 High | 2560x1440 | full | DLSS or FSR 3.1 | off | 60 | off | 10-12 GB VRAM, 8+ logical |
-| 5 Ultra | 3840x2160 | auto | DLSS or FSR 3.1 | off | display | auto | 12 GB+ VRAM, 32 GB RAM, 12+ logical |
+| Level | Output | Scene | Upscaler | ASTC to BC3 | Frame generation | Aimed at |
+| - | - | - | - | - | - | - |
+| 1 Minimum | 1280x720 | auto | fsr | on | off | 4 GB VRAM, 8 GB RAM, 4 logical processors |
+| 2 Low | 1920x1080 | auto | fsr | on | off | 4-6 GB VRAM, 16 GB RAM |
+| 3 Medium | built-in (2880x1620) | auto | DLSS or FSR 3.1 | off | off | 8 GB VRAM, 16 GB RAM, 6+ logical |
+| 4 High | 2560x1440 | full | DLSS or FSR 3.1 | off | off | 10-12 GB VRAM, 8+ logical |
+| 5 Ultra | 3840x2160 | auto | DLSS or FSR 3.1 | off | auto | 12 GB+ VRAM, 32 GB RAM, 12+ logical |
 
 Native anti-aliasing (update 3.2.0): `scene_res = full` with `upscaler = fsr3`, `fsr4` or `dlss` runs that upscaler at
 100% (input and output the same size), as FSR 3.1, FSR 4 and DLSS in DLAA mode, which anti-alias the 3D scene alone.
