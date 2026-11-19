@@ -766,7 +766,8 @@ class Shaders(Step):
     """Translate every shader stage in the game's files into the shader cache, so no draw waits for a first translation.
 
     tools/dkb_shader_census.py lists the stages (RomFS) into seed-nvn2.bin and dkb.exe --translate-shaders lowers and
-    translates them. The cache belongs to the player and survives later steps; the 187 MiB pack is removed again."""
+    translates them. The cache belongs to the player and survives later steps (the verify step folds it into
+    shader-cache.pack); the 187 MiB seed pack is removed again."""
     id = 'dkb_shaders'
 
     def key(self, ctx):
@@ -953,6 +954,16 @@ class Prepare(Step):
             ensure_plain(ctx.dest / name)
         ini.write(ctx.dest, ctx.state['lang'], ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini')
         run_tool(ctx, self.id, [ctx.dest / ('dkb' + EXE), '--selftest'])
+        # One shader-cache.pack instead of four loose files per shader (about 118,000 files on 3.2.0, which take half an
+        # hour to delete on Windows). The runtime reads the pack first and the loose files after it (gfx_shader.c, cache
+        # pack). Only a speed-up for copying and deleting, so a failure here is a warning.
+        try:
+            run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'pack_shader_cache.py', ctx.dest / 'shader-cache'],
+                     name=f'{self.id}-pack')
+        except InstallError as error:
+            if error.id != 'dkb.tool_failed':
+                raise
+            ctx.reporter.warning('warn.dkb_pack_failed', code=error.params.get('code'), log=str(error.params.get('log')))
         return {'selftest': True}
 
 

@@ -7,6 +7,7 @@
 - #420 DKB-Launcher.exe: a small Windows launcher that installs the build tools from the latest release (@wrothgaril)
 - #422 Stamp release files with the commit time (@GlebShekovtsov)
 - #425 Name the disk that is short of space in the Bananza installer (@cybersecurityhandle)
+- The Bananza setup folds the shader cache (about 118,000 loose files on 3.2.0) into one `shader-cache.pack`, so deleting or copying an install no longer takes tens of minutes (#402)
 - #423 Let the Bananza setup fetch AMD FSR 4 from AMD's repository after you accept its license (off by default) (@GlebShekovtsov)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 

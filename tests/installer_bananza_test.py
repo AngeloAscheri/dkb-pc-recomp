@@ -487,6 +487,19 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(self.run_install()[0], 0)
         self.assertEqual(self.calls, [], 'a retry must not run the crashing library build again')
 
+    def test_shader_cache_is_packed(self):
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertTrue(any(str(c[-2]).endswith('pack_shader_cache.py') for _, c in self.calls), self.calls)
+
+    def test_a_pack_failure_only_warns(self):
+        def crash(ctx, step, command):
+            if str(command[-2]).endswith('pack_shader_cache.py'):
+                raise b.InstallError('dkb.tool_failed', step=step, code=1, log='pack.log')
+        code, events = self.run_install(crash)
+        self.assertEqual(code, 0, events)
+        self.assertIn('warn.dkb_pack_failed', [e.get('id') for e in events if e['type'] == 'warning'])
+
     def test_library_warm_path_rejection_fails_the_step(self):
         def reject(ctx, step, command):
             if str(command[-1]) == '--warm-shaders':
@@ -676,7 +689,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         (self.romfs/'other.bin').write_bytes(b'a changed source')
         self.calls.clear()
         self.assertEqual(self.run_install()[0], 0)
-        self.assertEqual([step for step, _ in self.calls], ['dkb_data','lift','compile','dkb_shaders','dkb_shaders','dkb_shaders','dkb_wide','dkb_prompts','dkb_prompts','dkb_verify'])
+        self.assertEqual([step for step, _ in self.calls], ['dkb_data','lift','compile','dkb_shaders','dkb_shaders','dkb_shaders','dkb_wide','dkb_prompts','dkb_prompts','dkb_verify','dkb_verify'])
 
     def test_source_mutation_during_pack_is_not_installed(self):
         def mutate(ctx, step, command):
@@ -731,7 +744,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         code, events = self.run_install()
         self.assertEqual(code, 0, events)
         self.assertEqual([step for step, _ in self.calls],
-                         ['compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+                         ['compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify', 'dkb_verify'])
         self.assertEqual(generated.stat().st_mtime_ns, timestamp)
 
     def update_fixture(self):
@@ -792,7 +805,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.calls.clear()
         self.assertEqual(self.run_install()[0], 0)
         self.assertEqual([step for step, _ in self.calls],
-                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify', 'dkb_verify'])
 
     def test_corrupt_generated_output_is_regenerated_when_rebuilding(self):
         self.update_fixture()   # only the update keeps generated code and objects
@@ -803,7 +816,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.calls.clear()
         self.assertEqual(self.run_install()[0], 0)
         self.assertEqual([step for step, _ in self.calls],
-                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify', 'dkb_verify'])
 
     def test_already_packed_input_is_verified_and_copied(self):
         packed = self.root / 'packed input'

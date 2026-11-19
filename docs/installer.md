@@ -95,7 +95,7 @@ The Bananza steps are:
    executable, runtime libraries and RomFS index into place. The default worker limit is six; `--jobs` changes it.
 6. Translate the game's shaders: `tools/dkb_shader_census.py` writes the list of shader stages in the packed RomFS into
    `seed-nvn2.bin`, `dkb.exe --translate-shaders` lowers and translates them into the shader cache beside the executable
-   (a few minutes, about 3 GB), and the pack is deleted. Without this step the first visit to each area waits for its
+   (a few minutes, about 3 GB), and the pack is deleted. Last, `tools/pack_shader_cache.py` folds the cache's loose files (four per shader, about 118,000 on 3.2.0) into `shader-cache/shader-cache.pack`, so the folder copies and deletes in seconds instead of half an hour on Windows; a failure there is a warning. Without this step the first visit to each area waits for its
    shaders. Then `dkb.exe --warm-shaders` builds the driver's pipeline libraries; if that fails or the driver crashes
    (seen in `nvgpucomp64.dll` on NVIDIA 621.01) the installer warns and goes on, records `libraries: false` and does not
    retry, since the libraries only speed up the first draws. A translation failure fails the step.
