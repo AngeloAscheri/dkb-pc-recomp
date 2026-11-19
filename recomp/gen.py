@@ -402,18 +402,23 @@ class Emitter:
             if fp.used:
                 out.append('    ' + fp.decl())
 
-        jbs = [entry + 4 * i for i, ins in enumerate(insns) if ins.kind == 'bl' and ins.target in self.setjmp_stubs]
+        # A stub that is not a function start goes the normal way (rt_dispatch): the setjmp lowering calls it directly.
+        sj = {t for t in self.setjmp_stubs if t in starts}
+        jbs = [entry + 4 * i for i, ins in enumerate(insns) if ins.kind == 'bl' and ins.target in sj]
+        if jbs and all_labels:
+            # fb_<entry> re-enters through a musttail call, which replaces the frame that holds the jmp_bufs.
+            raise ValueError(f'{entry:#x}: setjmp call at {jbs[0]:#x} in a function with an unresolved computed br')
         if jbs:
             out.append('    ' + ' '.join(f'jmp_buf jb_{a:x};' for a in jbs))
             self.uses_setjmp = True
             self.stats['setjmp_sites'] += len(jbs)
 
         def call(t, a):
-            if t in self.setjmp_stubs:   # the guest setjmp still runs, so env holds what it stores there
+            if t in sj:   # the guest setjmp still runs, so env holds what it stores there
                 jb = f'jb_{a:x}'
                 refs.add(t)
                 return (f'c->x[30] = {hx(a + 4)}; {spill}rt_setjmp_arm(c, {jb}); '
-                        f'if (!setjmp({jb})) {fname(t)}(c);{reload}')
+                        f'if (!RT_SETJMP({jb})) {fname(t)}(c);{reload}')
             if t in starts:
                 refs.add(t)
                 return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
@@ -536,7 +541,9 @@ def chunk_text(name, number, emitter, fns):
     if emitter.uses_patches:
         protos += 'extern uint8_t rt_patch_on[];\n'
     if emitter.uses_setjmp:
-        protos += '#include <setjmp.h>\nvoid rt_setjmp_arm(Cpu *c, void *jb);\n'
+        # _setjmp on POSIX: no signal mask to save, and the runtime's longjmp is _longjmp (runtime/hostfn.c).
+        protos += ('#include <setjmp.h>\nvoid rt_setjmp_arm(Cpu *c, void *jb);\n'
+                   '#ifdef _WIN32\n#define RT_SETJMP setjmp\n#else\n#define RT_SETJMP _setjmp\n#endif\n')
     if emitter.uses_guards:
         protos += ('int rt_guard_ptr(uint64_t p);\nint rt_guard_vcall(uint64_t obj);\n'
                    'int rt_guard_edge(uint64_t node);\n')
