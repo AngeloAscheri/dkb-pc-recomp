@@ -3,6 +3,7 @@
 - Thai: `lang = th` plays update 3.2.0 in Thai (#180, thanks @RavenChz for testing the mod route). Guest `setjmp`/`longjmp` now work, which the Thai text layout needs.
 - Setup option "Use the RomFS where it is" (`--romfs-in-place`, #305): the game reads your extracted `romfs` folder through `romfs_dir` instead of a ~9 GB copy; same load times and fps as the packed image in our tests. Keep the folder where it is afterwards.
 - PlayStation button prompts follow your `bind_` lines, not only `pad_layout` (#416; re-run the setup to rebuild the prompts).
+- With `realtime = 1`, the frame rate is held to 120 fps at most (`realtime_max_fps`, 0 removes the ceiling), because steps shorter than 1/120 s crash the record merge job in the EmeraldRush challenge levels (#411, #421; thanks @NoireOvO for the runs that narrowed it down).
 - 16:10 screens (1280x800, 1920x1200, 2560x1600): the view grows taller and the HUD stays whole in a centred 16:9 area (#249). Tested on 3.2.0.
 - Local co-op: a second gamepad plays Pauline (Pause > Co-op mode > Share controllers, #240). `coop = 0` turns it off. Tested with a simulated second pad only; reports with two real pads are welcome.
 - Recording a draw costs about 14% less: unchanged index and vertex buffers and dynamic states are no longer bound again, and uniform buffers are found faster. On 6 logical processors frames over 50 ms in the heaviest scene tested fell from about 22 to 15 a minute (`TOTK_DYN_KEEP=0` brings back the old dynamic-state path).
