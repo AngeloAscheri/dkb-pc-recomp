@@ -190,7 +190,10 @@ def tool_layout(layout, options):
         ninja = layout.ninja if layout.ninja.is_file() else Path(shutil.which('ninja') or ninja)
     dll_dir = options.dll_dir
     if dll_dir is None:
-        dll_dir = deps / 'bin' if deps and (deps / 'bin' / 'SDL3.dll').is_file() else package / 'bin'
+        # A tool package without the runtime DLLs (#433: a folder picked in the setup's tool package field) falls back
+        # to the setup's own bin, which every release carries.
+        tries = ([deps / 'bin'] if deps else []) + [package / 'bin', layout.root / 'bin']
+        dll_dir = next((d for d in tries if (d / 'SDL3.dll').is_file()), package / 'bin')
     dlls = tuple(sorted(dll_dir.glob('*.dll'))) if os.name == 'nt' else layout.dlls
     return replace(layout, llvm=llvm, deps=deps.resolve() if deps else None, ninja=ninja.resolve(), dlls=dlls)
 
