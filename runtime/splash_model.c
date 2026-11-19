@@ -85,9 +85,14 @@ static void with_groups(char *out, size_t n, uint64_t v) {
     out[o] = 0;
 }
 
+// At most 99 minutes: a rate barely above zero gives an estimate far past what an int holds, and converting that is
+// undefined; a start that long has nothing better to say than that number
+static const double LEFT_MAX_S = 99 * 60.0;
+
 static void left_text(char *out, size_t n, double secs) {
     out[0] = 0;
-    if (secs < 20) return;   // a step this close to its end needs no clock
+    if (!(secs >= 20)) return;   // a step this close to its end needs no clock (nor does a NaN)
+    secs = fmin(secs, LEFT_MAX_S);
     // under a minute in tens of seconds, rounded up; then whole minutes, up from a fifth of one past the last
     if (secs < 60) snprintf(out, n, menu_text(UI_MENU_SPLASH_LEFT_SECONDS), 10 * (int)ceil(secs / 10));
     else snprintf(out, n, menu_text(UI_MENU_SPLASH_LEFT_MINUTES), (int)ceil(secs / 60 - 0.2));
@@ -210,6 +215,17 @@ int splash_selftest(void) {
     EXPECT(strstr(s, "50") != NULL || strstr(s, "50 ") != NULL, "41 s rounded up to 50 s");
     left_text(s, sizeof s, 150);
     EXPECT(strstr(s, "3") != NULL, "150 s as 3 min");
+    left_text(s, sizeof s, 1e300);   // the estimate of a rate barely above zero
+    EXPECT(strstr(s, "99") != NULL, "a huge estimate held at 99 min");
+    left_text(s, sizeof s, INFINITY);
+    EXPECT(strstr(s, "99") != NULL, "an infinite estimate held at 99 min");
+    left_text(s, sizeof s, NAN);
+    EXPECT(!s[0], "a clock for a NaN estimate");
+    // and through the estimate itself: one item in a long while of a huge total
+    splash_eta_reset(&e, BOOT_STEP_SHADERS);
+    for (int i = 0; i <= 40; i++) left = splash_eta_note(&e, i * 0.25, 0, i == 40 ? 2000000000ull : 1999999999ull, 4000000000ull);
+    left_text(s, sizeof s, left);
+    EXPECT(left > LEFT_MAX_S && strstr(s, "99") != NULL, "the text of a tiny rate's estimate");
     with_groups(s, sizeof s, 1234567);
     EXPECT(strlen(s) > 7 && s[0] == '1' && s[strlen(s) - 1] == '7', "digit groups");
     // the view: no numbers in a step without a count, nor in the first moments of a counted one
