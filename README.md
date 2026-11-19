@@ -159,6 +159,15 @@ crash. Follow the
 The executable is made from the game's own code, so it cannot be shared. Everyone builds it from their own dump; the
 installer does this for you ([docs/installer.md](docs/installer.md)).
 
+**How do I install and update on Windows?** From the first release that carries it, download `DKB-Launcher.exe` once,
+put it in a folder of its own and start it. It downloads the build tools (checked by SHA-256) into `DKB-Recomp` beside
+itself, asks for your dump and the install folder, and builds the game. After that it opens on Play, looks for a new
+release at each start, shows what is new and updates with one click: the new tools are downloaded and checked, the old
+version stays until the new one has started, and only the steps whose inputs changed run again; saves (`profile/`)
+and `dkb.ini` are kept. A tick box on that screen (or `DKB_NO_UPDATE_CHECK=1`) turns the check off; the only request
+is to GitHub's release API. The setup zip keeps working as before ([docs/installer.md](docs/installer.md), "Launcher
+and updates").
+
 **Which version of the game?** Base 1.0.0 and update 3.2.0 (title version 458752, the newest). The installer takes either a `.nup` file (the container Eglantine and Eden load; with the 3.2.0 update inside it builds 3.2.0) or ExeFS and RomFS folders. Other updates are refused by their hashes. The 3.2.0 build installs and boots, and holds 60 fps for 150 s at the start on an RTX 5060 Ti, but nobody has played it yet. Add-on content (DLC) has a reader (an `aoc-<n>` folder beside the executable, [docs/dkb-testing.md](docs/dkb-testing.md)) checked against synthetic packs and a real one, but it has not been tried in the game.
 
 **Linux?** Preview. The release page carries `DKB-Setup-<version>-linux-x86_64.tar.gz`: the sources and a setup script, not a

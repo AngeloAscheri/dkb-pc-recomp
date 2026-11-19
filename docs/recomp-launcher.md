@@ -2,7 +2,9 @@
 
 RecompLauncher is a third-party launcher (elripalda/RecompLauncher) that lists recompiled games, downloads their
 releases and runs them. It lists DKB Recomp since [#213](https://github.com/Lucas-blip-png/dkb-pc-recomp/pull/213).
-It supports the Linux and macOS packages. The Windows installer is separate ([installer.md](installer.md)).
+It supports the Linux and macOS packages. The Windows installer is separate ([installer.md](installer.md)), and so is
+the project's own Windows launcher, `DKB-Launcher.exe`, which installs and updates the tools from GitHub releases
+([installer.md](installer.md), "Launcher and updates").
 
 ## How it sets the game up
 
