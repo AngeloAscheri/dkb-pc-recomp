@@ -15,7 +15,8 @@
 // the GPU (shaders/splash_check.comp reads every texel). The first frame with anything in it ends the screen: the
 // present thread asks the screen's thread to stop, waits for its last present, and shows that frame. A frame that
 // cannot be checked ends the screen at once, and so does a minute of black frames, so the screen never hides the game
-// for long. The window closed meanwhile ends it too.
+// for long. The window closed meanwhile ends it too. Once it has stopped, the screen's thread drains the queue
+// (drain_queue) and then frees its images; no wait for the GPU here gives up on a timeout (fence_wait).
 //
 // Three scenes: splash = 1 (the default) a canyon at sunrise (shaders/splash_canyon.comp), splash = 2 a cavern deep
 // under the ground (shaders/splash_under.comp), splash = 3 the dawn over a jungle ridge (shaders/splash_jungle.comp).
@@ -100,6 +101,72 @@ typedef struct {
     float bar[4], mark[3];
 } Renderer;
 
+// ---- waits that do not give up
+// What a fence guards is reset, written again or destroyed once its wait returns, so the wait never ends on a timeout:
+// a heavy first submission on a weak GPU can take longer than any fixed time, and a command buffer, view or buffer
+// freed while the GPU still uses it is undefined behaviour (a device loss at best). The wait goes on in steps of a
+// second; the first few such waits are logged, not every frame of a slow GPU. A lost device ends the process with the
+// fault report, as vk_memory.c upload_wait_locked does, instead of returning as if the work were done. A GPU that stops
+// without reporting a loss keeps this thread waiting; vk_sync.c completion_main's hang check (TOTK_GPU_HANG_S) ends the
+// process once the game's own submissions stall behind the same queue.
+static void fence_wait(VkDevice dev, VkFence f, const char *what) {
+    enum { TOLD_MAX = 4 };
+    static volatile int32_t told;   // waits past a second logged so far
+    int tell = 0;
+    for (int s = 0;; s++) {
+        VkResult r = vkWaitForFences(dev, 1, &f, VK_TRUE, 1000000000ull);
+        if (r == VK_SUCCESS) {
+            if (tell) rt_log("splash: %s finished after about %d s", what, s + 1);
+            return;
+        }
+        if (r != VK_TIMEOUT) {
+            vk_device_fault_report(r);
+            rt_fatal("splash: the wait for %s failed (%d)", what, (int)r);
+        }
+        if (!s && (tell = plat_inc32(&told)) <= TOLD_MAX)
+            rt_log("splash: %s has not finished after a second; waiting for it%s", what,
+                   tell == TOLD_MAX ? " (the last such line)" : "");
+        if (tell > TOLD_MAX) tell = 0;
+    }
+}
+
+static void wait_pending(Renderer *r) {
+    if (!r->pending) return;
+    fence_wait(r->dev, r->fence, "a submission of the start-up screen");
+    vkResetFences(r->dev, 1, &r->fence);
+    r->pending = 0;
+}
+
+// Every submission made to the queue so far has finished, the blits of the presents that read the screen's frame among
+// them: the fence of an empty submission signals once all the work submitted to the queue before it has completed
+// (Vulkan, vkQueueSubmit: "If submitCount is zero but fence is not VK_NULL_HANDLE, the fence will still be submitted to
+// the queue and will become signaled when all work previously submitted to the queue has completed"). vkQueueWaitIdle
+// does the same but holds the queue lock, and with it every other thread's submissions, for the whole wait; here the
+// lock covers the submission only, and the wait is fence_wait's. Should the empty submission fail without a lost
+// device, the queue is waited for idle under its lock instead.
+static void drain_queue(Renderer *r) {
+    wait_pending(r);
+    VkQueue q = vk_ctx()->gfx_queue;
+    vk_queue_lock();
+    VkResult res = vkQueueSubmit(q, 0, NULL, r->fence);
+    vk_queue_unlock();
+    if (res == VK_SUCCESS) {
+        r->pending = 1;
+        wait_pending(r);
+        return;
+    }
+    vk_device_fault_report(res);
+    if (res != VK_ERROR_DEVICE_LOST) {
+        vk_queue_lock();
+        res = vkQueueWaitIdle(q);
+        vk_queue_unlock();
+    }
+    if (res != VK_SUCCESS) {
+        vk_device_fault_report(res);
+        rt_fatal("splash: the wait for the queue's work before the start-up screen's images go failed (%d)", (int)res);
+    }
+}
+
 static void renderer_free_images(Renderer *r) {
     VkCtx *c = vk_ctx();
     if (r->frame_v) vkDestroyImageView(r->dev, r->frame_v, NULL);
@@ -109,10 +176,12 @@ static void renderer_free_images(Renderer *r) {
     r->frame_v = r->back_v = VK_NULL_HANDLE, r->frame = r->back = VK_NULL_HANDLE, r->w = r->h = 0;
 }
 
+// The caller has drained the queue when a present may still read the frame (screen_main); the renderer's own
+// submission is waited for here
 static void renderer_free(Renderer *r) {
     VkCtx *c = vk_ctx();
     if (!c || !r->dev) return;
-    if (r->pending) vkWaitForFences(r->dev, 1, &r->fence, VK_TRUE, 2000000000ull), r->pending = 0;
+    wait_pending(r);
     renderer_free_images(r);
     if (r->params) vmaDestroyBuffer(c->vma, r->params, r->params_a);
     if (r->atlas) vmaDestroyBuffer(c->vma, r->atlas, r->atlas_a);
@@ -213,20 +282,10 @@ static VkImage image2d(uint32_t w, uint32_t h, VkImageUsageFlags usage, VmaAlloc
     return img;
 }
 
-static void wait_pending(Renderer *r) {
-    if (!r->pending) return;
-    vkWaitForFences(r->dev, 1, &r->fence, VK_TRUE, 2000000000ull);
-    vkResetFences(r->dev, 1, &r->fence);
-    r->pending = 0;
-}
-
 static int ensure_images(Renderer *r, uint32_t w, uint32_t h) {
     if (r->frame && r->w == w && r->h == h) return 1;
     // a new size: the last present may still read the old frame
-    wait_pending(r);
-    vk_queue_lock();
-    vkQueueWaitIdle(vk_ctx()->gfx_queue);
-    vk_queue_unlock();
+    drain_queue(r);
     renderer_free_images(r);
     VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (!(r->frame = image2d(w, h, u, &r->frame_a, &r->frame_v)) || !(r->back = image2d(w, h, u, &r->back_a, &r->back_v))) {
@@ -419,7 +478,7 @@ static int render(Renderer *r, const SplashView *v, double secs, uint32_t w, uin
         vk_queue_lock();
         VkResult res = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, r->fence);
         vk_queue_unlock();
-        if (res != VK_SUCCESS) return 0;
+        if (res != VK_SUCCESS) return vk_device_fault_report(res), 0;
         r->pending = 1;
         wait_pending(r);
         r->back_dawn = dawn;
@@ -439,7 +498,7 @@ static int render(Renderer *r, const SplashView *v, double secs, uint32_t w, uin
     vk_queue_lock();
     VkResult res = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, r->fence);
     vk_queue_unlock();
-    if (res != VK_SUCCESS) return 0;
+    if (res != VK_SUCCESS) return vk_device_fault_report(res), 0;
     r->pending = 1;
     return 1;
 }
@@ -520,6 +579,8 @@ static void screen_main(void *arg) {
             shot_path = shot;
             next_shot = secs + 2.0;
         }
+        // the end may have come while the frame was drawn: the game's first picture is not followed by the screen
+        if (plat_cas32(&g_state, 0, 0) != ST_UP) break;
         vk_present_splash(r.frame, (int)w, (int)h, shot_path);
         frames++;
         // 60 frames a second up to 2.6 million pixels, 30 above: the GPU is free, but a laptop need not run hot
@@ -533,15 +594,12 @@ static void screen_main(void *arg) {
     plat_event_set(&g_test_done);
     rt_log("splash: the start-up screen ends after %.1f s and %d frames", up, frames);
     if (gfx_window_exiting()) return;   // the device goes with the process
-    // The last frame's present may still be on the queue: each present waits for the fence of the present two before
-    // it, so once the game has presented three frames, nothing reads the screen's images
-    uint64_t f0 = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    for (int i = 0; i < 300 && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < f0 + 3; i++) plat_sleep_ms(10);
-    if (__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < f0 + 3) {
-        vk_queue_lock();
-        vkQueueWaitIdle(vk_ctx()->gfx_queue);
-        vk_queue_unlock();
-    }
+    // The last frame's present may still be on the queue, its blit reading the frame image. The game's frame count says
+    // nothing about that: the replay thread counts a frame before the present thread presents it, and frames that never
+    // reach a present (a minimised window) or reach it later (frame generation's display thread) count too. So the
+    // queue is drained once, which takes the queue lock for one submission only: the present thread takes it under its
+    // present lock (vk_present.c flip_locked), and this thread holds neither here.
+    drain_queue(&r);
     renderer_free(&r);
 }
 
@@ -624,6 +682,7 @@ static int check_init(void) {
     return K.ok = 1;
 }
 
+// frame_lit waits for each check before it returns, so nothing of the check is on the queue here
 static void check_free(void) {
     VkCtx *c = vk_ctx();
     if (!K.dev || !c) return;
@@ -685,11 +744,14 @@ static int frame_lit(VkImage image, VkFormat fmt, int w, int h) {
     VkResult r = vkQueueSubmit2(vk_ctx()->gfx_queue, 1, &si, K.fence);
     vk_queue_unlock();
     int lit = -1;
-    if (r == VK_SUCCESS && vkWaitForFences(K.dev, 1, &K.fence, VK_TRUE, 1000000000ull) == VK_SUCCESS) {
+    if (r == VK_SUCCESS) {   // the view, the command buffer and the fence are free again only once the check is done
+        fence_wait(K.dev, K.fence, "the check of a game frame");
         vmaInvalidateAllocation(vk_ctx()->vma, K.res_a, 0, 64);
         lit = *K.res_p != 0;
+        vkResetFences(K.dev, 1, &K.fence);
+    } else {
+        vk_device_fault_report(r);   // nothing was submitted: the fence stays unsignalled
     }
-    vkResetFences(K.dev, 1, &K.fence);
     vkDestroyImageView(K.dev, view, NULL);
     return lit;
 }
@@ -729,6 +791,9 @@ int vk_splash_hold(VkImage image, VkFormat fmt, int w, int h) {
     double held_s = (double)(now - first_ns) / 1e9;
     if (lit == 0 && held_s < 60) return 1;
     plat_xchg32(&g_state, ST_ENDING);
+    // A screen that has not stopped within 2 s (its thread waiting for a slow frame) is left to stop by itself: this
+    // thread frees none of its objects, and it checks the state again before each present, so at most a present it had
+    // already begun follows the game's frame; it frees its objects itself once the queue is drained
     int ended = plat_event_wait_ns(&g_done, 2000000000ull);
     rt_log("splash: %s at frame %llu, %.0f ms after the process started (%.1f s of black frames held)%s",
            lit > 0 ? "the game's first picture" : lit < 0 ? "a game frame that cannot be checked" : "a minute of black frames",
@@ -763,6 +828,7 @@ static int save_frame(Renderer *r, const char *path) {
     VkResult res = vkQueueSubmit2(c->gfx_queue, 1, &si, r->fence);
     vk_queue_unlock();
     int ok = res == VK_SUCCESS;
+    if (!ok) vk_device_fault_report(res);
     if (ok) r->pending = 1, wait_pending(r);
     if (ok) {
         vmaInvalidateAllocation(c->vma, a, 0, VK_WHOLE_SIZE);
