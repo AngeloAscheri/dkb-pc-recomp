@@ -300,6 +300,10 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c));           // start the guest ma
 int kern_core_away(void);                                  // give the virtual core up around a blocking host wait
 void kern_core_back(int *away);
 void kern_checkpoint(void);                                // preemption point, at every SVC and indirect call
+// TOTK_SCHED_HANDOFF (kernel.c, "directed core hand-off"): rt_svc calls kern_svc_return after each SVC while it is
+// nonzero. Off unless set; with "ab" the present switches it with the A/B blocks.
+extern int kern_sched_handoff;
+void kern_svc_return(void);
 // A preempt request is pending for the thread (Cpu.thread): its RtThread starts with the flag (kernel.c).
 static inline int kern_preempt_pending(const void *thread) { return __atomic_load_n((const int *)thread, __ATOMIC_RELAXED); }
 // Set once before guest threads start (TOTK_CORE_DIAG, TOTK_ASYNC_PREEMPT): host calls (hostfn.c) and SVCs (svc.c) count their depth in
@@ -310,7 +314,11 @@ void kern_host_left(void *thread);                         // back at depth 0 wi
 int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)
-void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present
+// perf_present, every present: closes the frame's core wait counters (kernel.c); log bit 0 logs this frame, bit 1 the
+// window since the previous bit-1 call.
+void kern_core_waits_frame(uint64_t frame, uint64_t interval_ns, int log);
+void kern_core_waits_exit(void);                           // the run's core wait counters (TOTK_TRACE=perf, at exit)
+void kern_sched_report(uint64_t frame);                   // TOTK_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
 struct IpcSession;
