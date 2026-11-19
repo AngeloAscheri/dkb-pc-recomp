@@ -14,6 +14,7 @@
 - #422 Stamp release files with the commit time (@GlebShekovtsov)
 - #425 Name the disk that is short of space in the Bananza installer (@cybersecurityhandle)
 - The Bananza setup folds the shader cache (about 118,000 loose files on 3.2.0) into one `shader-cache.pack`, so deleting or copying an install no longer takes tens of minutes (#402)
+- `dkb.exe --set KEY=VALUE` sets a `dkb.ini` key for one run without changing the file, and `dkb.exe --help` lists the options, for frontends that start the game (#402).
 - #423 Let the Bananza setup fetch AMD FSR 4 from AMD's repository after you accept its license (off by default) (@GlebShekovtsov)
 - #424 Take the staged mirror's bookkeeping off the replay thread and commit guest memory ahead of use in the background (@wrothgaril)
 - #429 Yield after each background commit slice, so a guest thread waiting for the memory lock gets in (@wrothgaril)
