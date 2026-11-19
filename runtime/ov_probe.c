@@ -259,7 +259,7 @@ static void probe_oe(void) {
         set_env("TOTK_LANG", cases[i].lang);
         set_env("TOTK_LOCALE", cases[i].locale);
         const char *got = lang();
-        const char *want = !strcmp(cases[i].want, "th") && !strcmp(rt_game_target, "dkb100") ? "en-US" : cases[i].want;
+        const char *want = !strcmp(cases[i].want, "th") && strcmp(rt_game_target, "dkb458752") ? "en-US" : cases[i].want;
         if (strcmp(got, want)) {
             bad++;
             printf("  FAIL: language for TOTK_LANG=%s TOTK_LOCALE=%s is %s, not %s\n", cases[i].lang ? cases[i].lang : "",

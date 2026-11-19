@@ -120,12 +120,13 @@ static const char *configured_language(void) {
     return switch_language(tag);
 }
 
-// Thai (Mals/THth, Font/Font_THth) came with update 3.2.0; the base game has neither, so it gets English.
+// Thai (Mals/THth, Font/Font_THth) came with Bananza update 3.2.0; the base game and TotK have neither, so they get
+// English.
 const char *ov_language(void) {
     const char *code = configured_language();
-    if (!strcmp(code, "th") && !strcmp(rt_game_target, "dkb100")) {
+    if (!strcmp(code, "th") && strcmp(rt_game_target, "dkb458752")) {
         static int told;
-        if (!told++) rt_log("oe: Thai needs update 3.2.0; the base game runs in en-US");
+        if (!told++) rt_log("oe: Thai needs Bananza update 3.2.0; %s runs in en-US", rt_game_target);
         return "en-US";
     }
     return code;
