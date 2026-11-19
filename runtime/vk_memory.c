@@ -4147,6 +4147,19 @@ static void st_blocked(PoolRec *r, uint64_t a, uint64_t b, uint64_t fence, struc
     sort_kept(*out, (size_t)*nout, &sbuf, &scap);
 }
 
+// staged_upload: the pieces of [a, b) of pool r that are not in blk[0..nblk) (st_blocked's pieces: sorted by offset,
+// clipped to [a, b), possibly overlapping) are added to *cut; the bytes added go to *total, the bytes left out to
+// *skipped. A function of its own so that tests/staged_blocked_test.py runs it.
+static void st_cut(PoolRec *r, uint64_t a, uint64_t b, const struct KeptRange *blk, int nblk, MRange **cut, int *ncut,
+                   int *ccut, uint64_t *total, uint64_t *skipped) {
+    for (int k = 0; a < b && k < nblk; k++) {
+        if (blk[k].hi <= a) continue;   // inside a piece cut out already (pieces of two lists may overlap)
+        if (blk[k].lo > a) range_add(cut, ncut, ccut, r, a, blk[k].lo - a), *total += blk[k].lo - a;
+        *skipped += blk[k].hi - (blk[k].lo > a ? blk[k].lo : a), a = blk[k].hi;
+    }
+    if (a < b) range_add(cut, ncut, ccut, r, a, b - a), *total += b - a;
+}
+
 // staged_upload: a piece of staging is full (used bytes) and the copies out of it are recorded; freed at the fence.
 static void staged_piece_done(VkBuffer sb, VmaAllocation sa, uint64_t used, uint64_t fence) {
     vmaFlushAllocation(vk_ctx()->vma, sa, 0, used);
@@ -4223,12 +4236,7 @@ static int staged_upload(VkCommandBuffer cb, uint64_t fence) {
             if (a >= b) continue;
             st_blocked(r, a, b, fence, &blk, &nblk, &cblk);
             mrep.st_blk_n++, mrep.st_blk_ranges += (uint64_t)nblk;
-            for (int k = 0; a < b && k < nblk; k++) {
-                if (blk[k].hi <= a) continue;   // inside a piece cut out already (pieces of two lists may overlap)
-                if (blk[k].lo > a) range_add(&cut, &ncut, &ccut, r, a, blk[k].lo - a), total += blk[k].lo - a;
-                skipped += blk[k].hi - (blk[k].lo > a ? blk[k].lo : a), a = blk[k].hi;
-            }
-            if (a < b) range_add(&cut, &ncut, &ccut, r, a, b - a), total += b - a;
+            st_cut(r, a, b, blk, nblk, &cut, &ncut, &ccut, &total, &skipped);
         }
     }
     mrep.st_blk_t += qpc() - tb;
