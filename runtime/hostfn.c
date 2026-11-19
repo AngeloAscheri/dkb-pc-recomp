@@ -5,11 +5,13 @@
 // Every registered function dispatches through hostfn_entry, which counts the call, traces the first one
 // (TOTK_TRACE=host) and tail-calls the real function. The registry is fixed by hostfn_seal, which builds the dispatch
 // table; guest threads start after that, so lookups need no lock.
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
+#include "platform/platform.h"
 
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
@@ -238,3 +240,60 @@ uint64_t rt_original(Cpu *c) {
     c->pc = pc;
     return c->x[0];
 }
+
+// ---- setjmp and longjmp
+// The lifted guest longjmp ends in `br x30` to the instruction after its setjmp call, the middle of a function, which
+// rt_dispatch cannot enter, and the host frames of everything called since would stay on the stack. recomp/gen.py
+// lifts a call to the setjmp import as rt_setjmp_arm, then the host setjmp on jb in the calling function's frame, then
+// the guest setjmp, which fills env. The longjmp import becomes ov_longjmp: it loads the guest registers from env and
+// longjmps to jb, and the calling function reloads its registers and goes on after the call.
+// Update 3.2.0 lays out Thai text with them (main imports setjmp and longjmp; 1.0.0's main does not); the SDK's
+// libpng has them for its errors.
+// env as the SDK's setjmp fills it (1.0.0 and 3.2.0): x19-x30 at 0, sp at 0x68, d8-d15 at 0x70.
+enum { ENV_X30 = 0x58, ENV_SP = 0x68, ENV_D8 = 0x70 };
+
+// The armed setjmps, by Cpu and the sp and return address the guest setjmp stores, so a longjmp finds its setjmp
+// through a copy of env as well. Not thread-local: a guest fiber may resume on another host thread. An entry outlives
+// its frame until a setjmp with the same key replaces it; a longjmp to a setjmp whose function returned is undefined
+// in C too.
+// ponytail: one lock and a scan of 64 entries per setjmp; per-Cpu lists if setjmp ever shows up in a profile.
+#define JMP_SLOTS 64
+static struct { Cpu *c; uint64_t sp, lr; void *jb; } jmps[JMP_SLOTS];
+static unsigned jmp_next;
+static PlatMutex jmp_lock = PLAT_MUTEX_INIT;
+
+void rt_setjmp_arm(Cpu *c, void *jb) {
+    uint64_t sp = c->sp, lr = c->x[30];
+    plat_mutex_lock(&jmp_lock);
+    int k = -1;
+    for (int i = 0; i < JMP_SLOTS && k < 0; i++)
+        if (jmps[i].c == c && jmps[i].sp == sp && jmps[i].lr == lr) k = i;
+    if (k < 0) k = (int)(jmp_next++ % JMP_SLOTS);
+    jmps[k].c = c;
+    jmps[k].sp = sp;
+    jmps[k].lr = lr;
+    jmps[k].jb = jb;
+    plat_mutex_unlock(&jmp_lock);
+}
+
+static void ov_longjmp(Cpu *c) {
+    uint64_t env = c->x[0], sp = LD64(env + ENV_SP), lr = LD64(env + ENV_X30);
+    uint32_t val = (uint32_t)c->x[1];
+    void *jb = NULL;
+    plat_mutex_lock(&jmp_lock);
+    for (int i = 0; i < JMP_SLOTS && !jb; i++)
+        if (jmps[i].c == c && jmps[i].sp == sp && jmps[i].lr == lr) jb = jmps[i].jb;
+    plat_mutex_unlock(&jmp_lock);
+    if (!jb) {
+        char at[96];
+        rt_fatal("longjmp to env %#llx (sp %#llx, setjmp return %s): no setjmp armed there on this thread",
+                 (unsigned long long)env, (unsigned long long)sp, rt_guest_name(lr, at, sizeof at));
+    }
+    for (int i = 0; i < 12; i++) c->x[19 + i] = LD64(env + 8 * i);
+    c->sp = sp;
+    for (int i = 0; i < 8; i++) c->v[8 + i] = LD64(env + ENV_D8 + 8 * i);   // LDP Dn clears the upper half
+    c->x[0] = val ? val : 1;
+    longjmp(*(jmp_buf *)jb, 1);
+}
+HOST_OVERRIDE("longjmp", ov_longjmp);
+HOST_OVERRIDE("_longjmp", ov_longjmp);

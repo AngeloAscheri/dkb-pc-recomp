@@ -50,6 +50,12 @@ from module import Module  # noqa: E402
 
 TERMINATORS = ('b', 'br', 'ret', 'trap')
 MUSTTAIL = '__attribute__((musttail)) return'
+# Imports that return twice. A call to one gets a host setjmp in the calling function's frame, armed by rt_setjmp_arm
+# (runtime/hostfn.c): the runtime's longjmp (HOST_OVERRIDE there) restores the guest registers and longjmps to it, so
+# execution goes on after the call with the host frames above it unwound. The lifted guest longjmp would `br x30`
+# into the middle of the caller instead, which rt_dispatch cannot enter. The CRT's setjmp: __builtin_setjmp restores
+# no callee-saved register on Win64 (runtime/kernel.c, exit_now).
+SETJMP = frozenset({'setjmp', '_setjmp', '__setjmp'})
 
 # Estimated bytes of C per instruction, by class, for chunking (estimate_sizes()).
 # Least squares over every function of main, subsdk0 and sdk (1.2.1) gives 62 / 75 / 48 bytes per instruction, 38
@@ -218,6 +224,8 @@ class Emitter:
         self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.uses_patches = False
         self.uses_guards = False
+        self.uses_setjmp = False
+        self.setjmp_stubs = mod.import_stubs(SETJMP)   # PLT stubs of setjmp
         self.stats = Counter()
         self.unsupported = Counter()
 
@@ -394,7 +402,18 @@ class Emitter:
             if fp.used:
                 out.append('    ' + fp.decl())
 
+        jbs = [entry + 4 * i for i, ins in enumerate(insns) if ins.kind == 'bl' and ins.target in self.setjmp_stubs]
+        if jbs:
+            out.append('    ' + ' '.join(f'jmp_buf jb_{a:x};' for a in jbs))
+            self.uses_setjmp = True
+            self.stats['setjmp_sites'] += len(jbs)
+
         def call(t, a):
+            if t in self.setjmp_stubs:   # the guest setjmp still runs, so env holds what it stores there
+                jb = f'jb_{a:x}'
+                refs.add(t)
+                return (f'c->x[30] = {hx(a + 4)}; {spill}rt_setjmp_arm(c, {jb}); '
+                        f'if (!setjmp({jb})) {fname(t)}(c);{reload}')
             if t in starts:
                 refs.add(t)
                 return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
@@ -507,7 +526,7 @@ class Emitter:
 def chunk_text(name, number, emitter, fns):
     """C text of one chunk. fns: [(entry, end)]."""
     body, refs = [], set()
-    emitter.uses_patches = emitter.uses_guards = False
+    emitter.uses_patches = emitter.uses_guards = emitter.uses_setjmp = False
     for entry, end in fns:
         lines, r = emitter.function(entry, end)
         body.append('\n'.join(lines))
@@ -516,6 +535,8 @@ def chunk_text(name, number, emitter, fns):
     protos = ''.join(f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs))
     if emitter.uses_patches:
         protos += 'extern uint8_t rt_patch_on[];\n'
+    if emitter.uses_setjmp:
+        protos += '#include <setjmp.h>\nvoid rt_setjmp_arm(Cpu *c, void *jb);\n'
     if emitter.uses_guards:
         protos += ('int rt_guard_ptr(uint64_t p);\nint rt_guard_vcall(uint64_t obj);\n'
                    'int rt_guard_edge(uint64_t node);\n')
