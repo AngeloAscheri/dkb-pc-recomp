@@ -233,6 +233,12 @@ area = "gfx"
 cmd = ["{python}", "tests/vk_memory_inspect_test.py", "--cc", "{cc}", "--deps", "{deps}"]
 
 [[test]]
+name = "staged-blocked"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/staged_blocked_test.py", "--cc", "{cc}", "--out", "{out}"]
+
+[[test]]
 name = "rec-capture-alone"
 tier = 1
 area = "gfx"
