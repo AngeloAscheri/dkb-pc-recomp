@@ -111,6 +111,15 @@ needs AMD's library, which this project does not ship:
 - Windows: take `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from the FidelityFX SDK v2.4.0 release
   (`Kits/FidelityFX/signedbin` in <https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>) and put both in one folder.
   The loader lists the upscalers the GPU can run (FSR 4 is for Radeon GPUs the loader lists a 4.x upscaler for, RDNA 4 at least).
+  The Bananza setup can fetch them: tick "Download AMD FSR 4 from AMD" (or run `python -m installer ... --fsr4 accept`).
+  The window first shows AMD's license of that SDK release, fetched from AMD's repository, and fetches nothing unless the
+  user accepts it. The step (`installer/fsr4.py`, `dkb_fsr4`) then downloads both libraries from the repository at the tag,
+  checks each against its pinned size and SHA-256, and puts them next to `dkb.exe` with the license
+  (`AMD-FidelityFX-SDK-license.md`). The release and the hashes are pinned because the terms have changed between releases:
+  v2.1.0 to v2.3.0 left the signedbin libraries under AMD's binary-only license, v2.4.0 lists them among the MIT files. A
+  newer release takes new hashes there and a new acceptance. A later setup keeps them; `--fsr4 off` (untick) stops
+  fetching them and leaves the files. A failed download warns, and setup goes on with FSR 3.1. `upscaler = fsr4` stays the
+  user's choice either way.
 - Linux: AMD publishes no Linux library; a Vulkan FSR 4 build that exports the same entry points (`ffxCreateContext`,
   `ffxDestroyContext`, `ffxQuery`, `ffxDispatch`), such as fsr4-vk, is named `amd_fidelityfx_upscaler_vk.so` and put in
   one folder. Set `upscaler = fsr4` in `totk.ini` before the start: such a library records with descriptor buffers, so the

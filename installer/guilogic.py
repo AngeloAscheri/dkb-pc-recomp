@@ -26,7 +26,8 @@ from .events import render
 TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'ru')
 STEP_ORDER = ('check', 'extract', 'lift', 'compile', 'prepare', 'cleanup')
-DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_wide', 'dkb_prompts', 'dkb_verify', 'cleanup')
+DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_wide', 'dkb_prompts',
+                  'dkb_fsr4', 'dkb_verify', 'cleanup')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
 LANG_RU = 0x19   # primary language id of Russian in a Windows LANGID
@@ -125,6 +126,7 @@ class Form:
     romfs: str = ''
     package: str = ''
     nup: str = ''
+    fsr4: str = ''   # Bananza: 'accept' (the user accepted AMD's license in the window), 'off', or '' to keep the record
 
     def installed_state(self):
         """The recorded state of the install folder (totk-install.json), or None. Never raises."""
@@ -194,6 +196,8 @@ class Form:
             cmd += ['--temp', str(temp)]
         if verify:
             cmd.append('--verify')
+        if self.game == 'bananza' and self.fsr4:
+            cmd += ['--fsr4', self.fsr4]
         if self.game == 'bananza':
             for flag, value in (tools or {}).items():
                 if value is not None:

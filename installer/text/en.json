@@ -290,5 +290,16 @@
  "phase.dkb_shaders.dkb_run": "Translating the shader stages found in the game files",
  "phase.dkb_verify.dkb_run": "Running the installed program's self-checks",
  "phase.dkb_wide.dkb_run": "Preparing centered and edge HUD layouts for each ultrawide resolution",
- "phase.dkb_prompts.dkb_run": "Drawing the PlayStation symbols into the game's button font"
+ "phase.dkb_prompts.dkb_run": "Drawing the PlayStation symbols into the game's button font",
+ "step.dkb_fsr4": "AMD FSR 4 (optional download from AMD)",
+ "phase.dkb_fsr4.dkb_fetch": "Downloading AMD FSR 4 from AMD's FidelityFX SDK repository",
+ "warn.dkb_fsr4_failed": "AMD FSR 4 could not be downloaded ({file}: {detail}); setup will continue and the game uses FSR 3.1. Rerun setup to try again.",
+ "warn.dkb_fsr4_new_release": "This setup fetches AMD FSR 4 from FidelityFX SDK {release}, whose license you have not accepted yet: tick AMD FSR 4 again to read and accept it.",
+ "dkb.ui.fsr4": "Download AMD FSR 4 from AMD (about 35 MB, for the fsr4 upscaler on Radeon RX 6000 and newer)",
+ "dkb.ui.fsr4_title": "AMD FidelityFX SDK license",
+ "dkb.ui.fsr4_intro": "AMD FSR 4 comes only as AMD's signed libraries, which this project does not ship. Setup downloads amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll of FidelityFX SDK {release} from AMD's repository on GitHub, checks them against known hashes, and puts them next to dkb.exe with this license. Read AMD's license below; the download happens only if you accept it.",
+ "dkb.ui.fsr4_loading": "Fetching the license from AMD's repository...",
+ "dkb.ui.fsr4_fetch_failed": "AMD's license could not be fetched ({detail}). Check the connection and try again; you can read it at {url}.",
+ "dkb.ui.fsr4_accept": "I accept",
+ "dkb.ui.fsr4_decline": "Decline"
 }
