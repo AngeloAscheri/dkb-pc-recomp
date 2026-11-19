@@ -1,5 +1,6 @@
 ## Draft: next release (since 0.4.2)
 
+- Thai: `lang = th` plays update 3.2.0 in Thai (#180, thanks @RavenChz for testing the mod route). Guest `setjmp`/`longjmp` now work, which the Thai text layout needs.
 - 16:10 screens (1280x800, 1920x1200, 2560x1600): the view grows taller and the HUD stays whole in a centred 16:9 area (#249). Tested on 3.2.0.
 - Local co-op: a second gamepad plays Pauline (Pause > Co-op mode > Share controllers, #240). `coop = 0` turns it off. Tested with a simulated second pad only; reports with two real pads are welcome.
 - Recording a draw costs about 14% less: unchanged index and vertex buffers and dynamic states are no longer bound again, and uniform buffers are found faster. On 6 logical processors frames over 50 ms in the heaviest scene tested fell from about 22 to 15 a minute (`TOTK_DYN_KEEP=0` brings back the old dynamic-state path).
@@ -12,6 +13,7 @@
 - #423 Let the Bananza setup fetch AMD FSR 4 from AMD's repository after you accept its license (off by default) (@GlebShekovtsov)
 - #424 Take the staged mirror's bookkeeping off the replay thread and commit guest memory ahead of use in the background (@wrothgaril)
 - #429 Yield after each background commit slice, so a guest thread waiting for the memory lock gets in (@wrothgaril)
+- #430 A start-up screen with real progress in the game window, from its opening to the game's first picture (`splash = 0` turns it off) (@wrothgaril)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 
 New files in the package table of that release:
