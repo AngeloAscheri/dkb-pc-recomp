@@ -59,9 +59,29 @@ def get_language(text):
     return None
 
 
-def write(dest, lang, example=None, name='totk.ini', fallback=None):
-    """Write dest/<name> with lang; an existing file keeps its other lines. Without that file, an existing
-    dest/<fallback> (the older name) is the starting text. Returns the path."""
+def set_value(text, key, value, section):
+    """text with the active `key = value` line rewritten, or added to [section]; value None removes active lines."""
+    active = re.compile(r'^\s*(?:totk_)?' + re.escape(key) + r'\s*=', re.IGNORECASE)
+    lines = [line for line in text.splitlines() if value is not None or not active.match(line)]
+    if value is not None:
+        at = next((i for i, line in enumerate(lines) if active.match(line)), None)
+        if at is not None:
+            lines[at] = f'{key} = {value}'
+        else:
+            at = next((i for i, line in enumerate(lines)
+                       if SECTION.match(line) and SECTION.match(line).group(1).strip().lower() == section), None)
+            if at is None:
+                if lines and lines[-1].strip():
+                    lines.append('')
+                lines.append(f'[{section}]')
+                at = len(lines) - 1
+            lines.insert(at + 1, f'{key} = {value}')
+    return '\n'.join(lines) + '\n'
+
+
+def write(dest, lang, example=None, name='totk.ini', fallback=None, change=None):
+    """Write dest/<name> with lang (or, given change, with change(text) instead); an existing file keeps its other
+    lines. Without that file, an existing dest/<fallback> (the older name) is the starting text. Returns the path."""
     path = Path(dest) / name
     old = Path(dest) / fallback if fallback else None
     if path.is_file() or (old and old.is_file()):
@@ -70,7 +90,7 @@ def write(dest, lang, example=None, name='totk.ini', fallback=None):
         text = Path(example).read_text(encoding='utf-8')
     else:
         text = ''
-    new = set_language(text, lang)
+    new = change(text) if change else set_language(text, lang)
     if path.is_file() and new == text:
         return path
     tmp = path.with_name(name + '.tmp')

@@ -62,6 +62,12 @@ python -m installer --game bananza --nup "<dump>/game.nup" --dest "<install fold
 python -m installer --game bananza --exefs "<dump>/base/exefs" --romfs "<dump>/base/romfs" --dest "<install folder>" --package "<tools>" --jobs 6
 ```
 
+`--romfs-in-place` (the window's "Use the RomFS where it is") skips the 9 GB packed copy: the install gets only
+`romfs/index.json`, and `romfs_dir` in `dkb.ini` points the game at the extracted RomFS folder, which it reads file by
+file (runtime/romfs.c, loose mode). The folder must then stay where it is; if it moves, the game stops at start or at
+the first missing file and names the path. It needs a folder of loose files, not a `.nup` or a packed image. A resume
+without folders keeps the choice; giving the folders again without the option packs the copy and removes the key.
+
 The shader translator is reused when its `.id` matches the current translator sources. Pass `--translator
 <path>/totk_xlate.exe` to choose a prebuilt translator, keeping `totk_xlate.id` beside it. Otherwise the installer
 builds it with `tools/build_xlate.py` in its owned temporary folder. That path needs the .NET 10 SDK and, on Windows,

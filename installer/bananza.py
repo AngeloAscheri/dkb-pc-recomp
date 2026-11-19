@@ -316,6 +316,13 @@ def preflight(layout, options, dest, temp, rep):
             raise InstallError('dkb.need_folders')
         game = select_target(layout, exefs)
         inputs, sources = (exefs, romfs), {'exefs': str(exefs), 'romfs': str(romfs)}
+        # In place: the game reads the RomFS folder itself (romfs_dir, runtime/romfs.c loose mode) and no 9 GB image is
+        # packed into the install. A resume without folders keeps the choice the last run recorded.
+        if getattr(options, 'romfs_in_place', False) or (not options.romfs and recorded.get('romfs_in_place')):
+            sources['romfs_in_place'] = True
+    in_place = bool(sources.get('romfs_in_place'))
+    if getattr(options, 'romfs_in_place', False) and not in_place:
+        raise InstallError('dkb.in_place_folder', path=str(nup_arg))
     if old is not None and old['game'] != game:
         raise InstallError('dkb.dest_unrelated', path=str(dest))
     if dest.exists() and not dest.is_dir():
@@ -355,6 +362,8 @@ def preflight(layout, options, dest, temp, rep):
         rep.progress('check', 'dkb_base')
         hashes = expected_exefs(layout, exefs, game)
         packed = (romfs / 'index.json').is_file() and (romfs / 'romfs.bin').is_file()
+    if packed and in_place:
+        raise InstallError('dkb.in_place_folder', path=str(romfs))
     if packed:
         ensure_plain(romfs / 'index.json')
         ensure_plain(romfs / 'romfs.bin')
@@ -365,7 +374,7 @@ def preflight(layout, options, dest, temp, rep):
     else:
         files = files if nup_arg else inventory(romfs, rep)
         romfs_id = digest(files)
-        romfs_size = sum(e['size'] + 15 for e in files)
+        romfs_size = 0 if in_place else sum(e['size'] + 15 for e in files)   # in place: nothing copied or packed
     missing = [p for p in (layout.clang, layout.ninja, layout.recomp / 'gen.py',
                            layout.recomp / f'patches-{game}.txt', layout.tools / 'dkb_pack_romfs.py',
                            *([layout.tools / 'extract_nup.py'] if nup_arg else []),
@@ -404,7 +413,7 @@ def preflight(layout, options, dest, temp, rep):
             raise InstallError('dkb.dotnet_missing')
     return dict(old=old, game=game, sources=sources, hashes=hashes, files=files,
                 romfs_id=romfs_id, romfs_size=romfs_size, owner=owner, translator=translator, identity=identity,
-                dotnet=dotnet, packed=packed,
+                dotnet=dotnet, packed=packed, in_place=in_place,
                 pipeline=digest(*(sha256(Path(__file__).with_name(n)) for n in ('bananza.py', 'runner.py', 'state.py'))))
 
 
@@ -562,6 +571,8 @@ class Data(Step):
     def key(self, ctx):
         parts = [ctx.info['hashes'], ctx.info['romfs_id'], ctx.info['pipeline'],
                  sha256(ctx.layout.tools / 'dkb_pack_romfs.py')]
+        if ctx.info['in_place']:
+            parts.append(['romfs_in_place', ctx.info['sources']['romfs']])
         if 'nup' in ctx.info['sources']:   # folder installs keep the key they had before .nup input existed
             parts += [sha256(ctx.layout.tools / 'extract_nup.py'), ctx.info['sources']['nup_package']]
             if ctx.info['sources']['nup'].lower().endswith('.nx'):
@@ -571,6 +582,9 @@ class Data(Step):
     def current(self, ctx, record):
         try:
             expected_exefs(ctx.layout, ctx.dest / 'exefs', ctx.info['game'])
+            if 'loose' in record:
+                return (Path(record['loose']).is_dir() and
+                        sha256(ctx.dest / 'romfs' / 'index.json') == record['index_sha256'])
             image = ctx.dest / 'romfs' / 'romfs.bin'
             return (image.stat().st_size == record['size'] and image.stat().st_mtime_ns == record['mtime_ns'] and
                     sha256(ctx.dest / 'romfs' / 'index.json') == record['index_sha256'])
@@ -578,6 +592,8 @@ class Data(Step):
             return False
 
     def verify(self, ctx, record):
+        if 'loose' in record:
+            return self.current(ctx, record)
         try:
             return pack_manifest(ctx.dest / 'romfs')['romfs_sha256'] == record['sha256']
         except InstallError:
@@ -599,6 +615,9 @@ class Data(Step):
                 copy_file(exefs / name, stage / 'exefs' / name)
             romfs = Path(sources['romfs'])
         expected_exefs(ctx.layout, stage / 'exefs', ctx.info['game'])
+        if ctx.info['in_place']:
+            return self.in_place(ctx, stage, romfs)
+        set_romfs_dir(ctx, None)
         if ctx.info['packed']:
             for name in ('romfs.bin', 'index.json'):
                 copy_file(romfs / name, stage / 'romfs' / name)
@@ -640,6 +659,37 @@ class Data(Step):
         image = ctx.dest / 'romfs' / 'romfs.bin'
         return {'sha256': manifest['romfs_sha256'], 'size': image.stat().st_size, 'mtime_ns': image.stat().st_mtime_ns,
                 'index_sha256': sha256(ctx.dest / 'romfs' / 'index.json')}
+
+
+    def in_place(self, ctx, stage, romfs):
+        """index.json of the folder as dkb_pack_romfs.py would pack it (the offsets only size the index), with each
+        file's SHA-256 from preflight, and romfs_dir in dkb.ini; the installed romfs.bin, if any, is removed."""
+        entries, off = [], 0
+        for e in ctx.info['files']:
+            off += -off % 16
+            entries.append({'path': e['path'], 'offset': off, 'size': e['size'], 'sha256': e['sha256']})
+            off += e['size']
+        manifest = {'status': 'pass', 'source': 'loose RomFS folder read in place; each file hashed by the setup',
+                    'loose': str(romfs), 'romfs_size': off, 'romfs_sha256': ctx.info['romfs_id'], 'files': entries}
+        (stage / 'romfs').mkdir(parents=True, exist_ok=True)
+        (stage / 'romfs' / 'index.json').write_text(json.dumps(manifest), encoding='utf-8')
+        for name in ctx.info['hashes']:
+            copy_file(stage / 'exefs' / name, ctx.dest / 'exefs' / name)
+        copy_file(stage / 'romfs' / 'index.json', ctx.dest / 'romfs' / 'index.json')
+        ensure_plain(ctx.dest / 'romfs' / 'romfs.bin')
+        (ctx.dest / 'romfs' / 'romfs.bin').unlink(missing_ok=True)
+        set_romfs_dir(ctx, str(romfs))
+        return {'loose': str(romfs), 'index_sha256': sha256(ctx.dest / 'romfs' / 'index.json')}
+
+
+def set_romfs_dir(ctx, folder):
+    """romfs_dir in dkb.ini: the folder the game reads in place, or None to remove the key (the packed image)."""
+    for name in ('dkb.ini', 'dkb.ini.tmp', 'totk.ini'):
+        ensure_plain(ctx.dest / name)
+    if folder or (ctx.dest / 'dkb.ini').is_file() or (ctx.dest / 'totk.ini').is_file():
+        ctx.dest.mkdir(parents=True, exist_ok=True)
+        ini.write(ctx.dest, None, ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini',
+                  change=lambda text: ini.set_value(text, 'romfs_dir', folder, 'files'))
 
 
 class Translator(Step):

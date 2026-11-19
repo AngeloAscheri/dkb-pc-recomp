@@ -352,6 +352,9 @@
 # Folder with RomFS mod files that replace or add game files (docs/dkb-testing.md, "Mods"). Default: the mods folder next
 # to dkb.exe; 0 turns mods off.
 # romfs_mods =
+# The extracted RomFS folder the game reads in place of romfs/romfs.bin. The setup writes it when "Use the RomFS where it
+# is" is ticked (--romfs-in-place); the folder must then stay where it is. Default: unset, the packed romfs.bin.
+# romfs_dir =
 
 [diagnostics]
 # Experimental Switch 2 reads of up to 4 KiB without waiting; requires replay_async = 1. Opt-in only: its background

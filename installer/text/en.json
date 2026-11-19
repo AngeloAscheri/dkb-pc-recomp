@@ -255,6 +255,8 @@
  "dkb.temp_unsafe_path": "The work folder {path} has characters (such as parentheses) that the shader translator build cannot pass to the linker. Move the release folder, or pass --temp with a path made of letters, digits, spaces, dots, dashes and underscores.",
  "dkb.romfs_empty": "No RomFS files were found in {path}.",
  "dkb.romfs_image": "The folder {path} holds a RomFS image, not extracted RomFS files. Select the .nup package instead, or extract the RomFS as a folder.",
+ "dkb.in_place_folder": "Using the RomFS where it is needs an extracted RomFS folder of loose files; {path} is a .nup or a packed RomFS image. Leave the option off, or choose the extracted folder.",
+ "dkb.ui.romfs_in_place": "Use the RomFS where it is (no 9 GB copy in the install folder; the RomFS folder must then stay where it is)",
  "dkb.input_changed": "The source changed while setup was reading it: {path}. Close programs modifying the dump and try again.",
  "dkb.pack_invalid": "The packed RomFS failed its integrity check in {path}: {detail}.",
  "dkb.tools_missing": "Required build tools or sources are missing: {paths}.",

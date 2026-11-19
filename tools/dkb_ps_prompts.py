@@ -29,6 +29,8 @@ import re
 import struct
 from pathlib import Path
 
+import romfs_index
+
 try:
     from compression import zstd as _zstd
 
@@ -664,7 +666,7 @@ def generate(romfs, out, layout):
     files = index['files']
     lines = ['# path\tsize\tsha256\toriginal_sha256 (tools/dkb_ps_prompts.py --layout ' + layout + ')']
     outputs, made = [], {}
-    with (romfs / 'romfs.bin').open('rb') as image:
+    with romfs_index.open_image(romfs, index) as image:
         def read(row):
             image.seek(row['offset'])
             raw = image.read(row['size'])
