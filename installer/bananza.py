@@ -36,8 +36,11 @@ NUP_SELECT = ('latest', 'base')
 EXE = '.exe' if os.name == 'nt' else ''
 CHUNK = 8 << 20
 WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080', '5120x1440')
-# The PlayStation prompt overlays and the pad layout each is made for (runtime/romfs.c ps_prompts_init).
-PS_FOLDERS = {'romfs-patches-ps': 'xbox', 'romfs-patches-ps-nintendo': 'nintendo'}
+# The PlayStation prompt overlays and the face buttons each is made for (runtime/romfs.c ps_prompts_init): the two pad
+# layouts, and each with A and B on the other layout's buttons (bind_ lines that swap X and Y over the Xbox table, or A
+# and B over the Nintendo one; positions of A, B, X, Y in tools/dkb_ps_prompts.py).
+PS_FOLDERS = {'romfs-patches-ps': 'xbox', 'romfs-patches-ps-nintendo': 'nintendo', 'romfs-patches-ps-senw': 'senw',
+              'romfs-patches-ps-eswn': 'eswn'}
 WIDE_FOLDERS = tuple(f'romfs-patches-{size}{suffix}' for size in WIDE_SIZES for suffix in ('', '-hud-edges'))
 COMMIT_WARN_GIB = 24   # the game commits about 14 GB; README asks for 16 GB of RAM plus a large page file
 
@@ -901,7 +904,7 @@ class WideLayouts(Step):
 
 
 class PadPrompts(Step):
-    """The PlayStation button prompts (tools/dkb_ps_prompts.py): one overlay per pad layout, from the user's font."""
+    """The PlayStation button prompts (tools/dkb_ps_prompts.py): one overlay per face-button layout, from the user's font."""
     id = 'dkb_prompts'
 
     def key(self, ctx):

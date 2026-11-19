@@ -33,6 +33,7 @@
 #include "fs.h"
 #include "host.h"
 #include "input.h"
+#include "input_map.h"
 #include "mods_scan.h"
 #include "romfs_config.h"
 #include "romfs_path.h"
@@ -465,9 +466,12 @@ int romfs_xbox_prompts_active(void) { return xbox_prompts_active; }
 // Bananza's PlayStation button prompts (tools/dkb_ps_prompts.py): the button font of each Font archive with a cross,
 // circle, square and triangle, L1 to R2, Options and Create. pad_prompts = auto (default) takes them when a DualShock or
 // DualSense pad is connected at start, playstation always, switch never. The game reads its fonts once at boot, so a
-// pad connected later changes them at the next start. Which face button each symbol goes on follows pad_layout:
-// romfs-patches-ps for auto and xbox (Switch A on the bottom button, the cross), romfs-patches-ps-nintendo for
-// nintendo and xbox_prompts (Switch A on the right one, the circle). They replace only the Font archives, so they load
+// pad connected later changes them at the next start. Each face-button glyph must name the button that does it, which
+// pad_layout and the bind_ lines decide (input_map_face_spec_cfg gives A, B, X, Y as positions): romfs-patches-ps for
+// the Xbox table (auto and xbox: Switch A on the bottom button, the cross), romfs-patches-ps-nintendo for the Nintendo
+// one (nintendo and xbox_prompts: Switch A on the right one, the circle), romfs-patches-ps-<positions> for bind_ lines
+// that move the face buttons (the setup makes senw and eswn, either table with one pair swapped). Without that folder
+// the layout's own folder loads and the log says so. They replace only the Font archives, so they load
 // next to the other overlays (the wide layouts replace Layout archives); when a mod already replaces one of their
 // Font archives, the prompts are skipped and the mod's file stays (ps_prompts_init).
 static int ps_prompts_active;
@@ -478,9 +482,20 @@ static void ps_prompts_init(void) {
     int always = !strcasecmp(want, "playstation");
     if (!always && strcasecmp(want, "auto")) return;
     const char *layout = cfg_value("TOTK_PAD_LAYOUT");
-    int nintendo = !strcasecmp(layout, "nintendo") || !strcasecmp(layout, "xbox_prompts");
-    char dir[2100], manifest[2200];
-    if (snprintf(dir, sizeof dir, "%s/romfs-patches-ps%s", index_dir, nintendo ? "-nintendo" : "") >= (int)sizeof dir) return;
+    int nintendo = input_pad_layout_pick(layout, 0) == PAD_LAYOUT_NINTENDO;   // auto: a Sony pad has no A on the right
+    char spec[5], dir[2100], manifest[2200];
+    input_map_face_spec_cfg(nintendo ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX, spec);
+    char want_dir[16];   // the folder suffix for these bindings; '?' (a face button on none) keeps the layout's
+    snprintf(want_dir, sizeof want_dir, "-%s", spec);
+    const char *home = nintendo ? "-nintendo" : "";
+    const char *suffix = !strcmp(spec, "sewn") ? "" : !strcmp(spec, "esnw") ? "-nintendo" : strchr(spec, '?') ? home : want_dir;
+    int missing = 0;   // the bindings' own folder is not there: the layout's loads instead
+    if (suffix == want_dir) {
+        if (snprintf(manifest, sizeof manifest, "%s/romfs-patches-ps%s/manifest.tsv", index_dir, suffix) >= (int)sizeof manifest)
+            return;
+        if ((missing = !plat_file_exists(manifest))) suffix = home;
+    }
+    if (snprintf(dir, sizeof dir, "%s/romfs-patches-ps%s", index_dir, suffix) >= (int)sizeof dir) return;
     snprintf(manifest, sizeof manifest, "%s/manifest.tsv", dir);
     if (!plat_file_exists(manifest)) {
         if (!always) return;   // auto: nothing to apply, so skip the pad probe's wait
@@ -489,6 +504,10 @@ static void ps_prompts_init(void) {
         return;
     }
     if (!always && !input_sony_pad_present()) return;
+    if (missing)
+        rt_log("RomFS overlay: the bind_ lines put Switch A, B, X, Y on the %s face buttons (s/e/w/n), but "
+               "there is no romfs-patches-ps%s (the setup makes senw and eswn: run it again if it is older); the prompts "
+               "name the pad_layout's buttons", spec, want_dir);
     size_t before = noverlay;
     ps_prompts_active = overlay_load(dir, 1) && noverlay > before;
     for (size_t k = before; ps_prompts_active && k < noverlay; k++)
@@ -506,8 +525,8 @@ static void ps_prompts_init(void) {
             }
     rt_log("RomFS overlay: %s", ps_prompts_active ? "PlayStation button prompts" : "PlayStation prompts failed their check; Switch prompts stay");
     if (ps_prompts_active)
-        rt_log("RomFS overlay: PlayStation prompts for pad_layout = %s: Switch A is the %s", layout,
-               nintendo ? "circle (right button)" : "cross (bottom button)");
+        rt_log("RomFS overlay: PlayStation prompts for pad_layout = %s: Switch A, B, X, Y on the %s buttons (%s)", layout,
+               spec, dir + strlen(index_dir) + 1);
 }
 
 static void overlay_init(void) {
