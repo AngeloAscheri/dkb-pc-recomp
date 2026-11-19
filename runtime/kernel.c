@@ -278,6 +278,24 @@ static void wake_sync_waiters(void) {
     }
 }
 
+// TOTK_MUTEX_SPIN=<microseconds> (off unless set): a thread about to sleep in a guest mutex or condition variable wait,
+// or in a wait for a virtual core, first polls for that long without the kernel lock, pausing the host core between
+// reads. A hand-off that comes within it (a mutex convoy passes the mutex every few microseconds) then costs no host
+// sleep and wake-up: a condition variable wake-up costs 3-4 us on Windows (--probe-kernel), twice per pass of a convoy
+// (the mutex to its waiter, the core back to the thread that gave it up). Then the thread sleeps as before.
+static uint64_t g_mspin_ns;
+
+// Holding G on entry and return, not meanwhile: polls *p until it is nonzero (woke) or not negative (!woke), or until end.
+static void mspin(const int *p, int woke, uint64_t end) {
+    unlock();
+    for (;;) {
+        int v = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+        if ((woke ? v != 0 : v >= 0) || kern_now_ns() >= end) break;
+        plat_pause();
+    }
+    lock();
+}
+
 // SleepConditionVariableSRW counts milliseconds: round up (late is legal, early is not) and re-check the deadline
 // against the performance counter, because the wait may also end early.
 static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
@@ -294,6 +312,8 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     uint64_t now = kern_now_ns();
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
+    if (g_mspin_ns && (kind == W_LOCK || kind == W_CONDVAR))
+        mspin(&t->woke, 1, now + (forever || deadline - now > g_mspin_ns ? g_mspin_ns : deadline - now));
     while (!t->woke) {
         if (forever) {
             plat_cond_wait(&t->cv, &G);
@@ -344,6 +364,12 @@ static int cores_enabled(void) {
         if (g_ho_mode)
             rt_log("kernel: directed core hand-off at SVC return %s (TOTK_SCHED_HANDOFF)",
                    g_ho_mode == 2 ? "in the B blocks of TOTK_AB" : "on");
+        const char *e = cfg_get("TOTK_MUTEX_SPIN");
+        long us = e && *e ? atol(e) : 0;
+        g_mspin_ns = us > 0 ? (uint64_t)(us > 1000 ? 1000 : us) * 1000 : 0;
+        if (g_mspin_ns)
+            rt_log("kernel: mutex, condition variable and core waits poll %llu us before they sleep (TOTK_MUTEX_SPIN)",
+                   (unsigned long long)(g_mspin_ns / 1000));
     }
     return g_cores_on;
 }
@@ -1424,6 +1450,8 @@ static void core_take(RtThread *t) {
         while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) plat_pause();
         lock();
         if (t->cur_core >= 0) g_ap_spin_ok++;
+    } else if (g_mspin_ns && t->cur_core < 0) {
+        mspin(&t->cur_core, 0, kern_now_ns() + g_mspin_ns);
     }
     int sampled = 0;
     while (t->cur_core < 0) {
