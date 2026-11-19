@@ -393,8 +393,13 @@ def preflight(layout, options, dest, temp, rep):
         missing += [p for p in (layout.deps / 'include', layout.deps / 'lib') if not p.is_dir()]
     if os.name == 'nt':
         names = {p.name for p in layout.dlls}
-        if not {'SDL3.dll', 'libopus-0.dll'} <= names:
-            raise InstallError('dkb.dlls_missing')
+        lacking = {'SDL3.dll', 'libopus-0.dll'} - names
+        if lacking:
+            # Name the folder and the files, so a report (#433) shows whether the package lost them or the wrong
+            # folder was searched.
+            folder = layout.dlls[0].parent if layout.dlls else (Path(options.dll_dir) if options.dll_dir else
+                                                                 layout.root / 'bin')
+            raise InstallError('dkb.dlls_missing', path=str(folder), files=', '.join(sorted(lacking)))
     if missing:
         raise InstallError('dkb.tools_missing', paths='; '.join(map(str, missing)))
     identity = translator_identity(layout)
