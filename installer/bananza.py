@@ -515,8 +515,13 @@ class Check(Step):
         need = ctx.info['romfs_size'] + (3 << 30) + (temp_need if same_disk else 0)
         ctx.reporter.emit('space', dest=str(ctx.dest), need=need, free=free, temp=str(ctx.temp),
                           temp_need=temp_need, temp_free=temp_free, same_disk=same_disk)
-        if free < need or temp_free < temp_need:
-            raise InstallError('dkb.space', need=round(need / (1 << 30), 1))
+        # Name the disk that is short: the temporary folder defaults to the setup folder (layout.temp), not the install
+        # folder, so a player who only moves the install folder to a roomier disk still fails on the setup's disk.
+        gib = lambda n: round(n / (1 << 30), 1)
+        if free < need:
+            raise InstallError('dkb.space', path=str(ctx.dest), need=gib(need), free=gib(free))
+        if temp_free < temp_need:
+            raise InstallError('dkb.temp_disk_space', path=str(ctx.temp), need=gib(temp_need), free=gib(temp_free))
         ctx.temp.mkdir(parents=True, exist_ok=True)
         self.host(ctx)
         ctx.verify_kept(self.id)

@@ -166,6 +166,37 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
             b.Check().host(ctx)   # a warning must not raise
         return [json.loads(line)['id'] for line in out.getvalue().splitlines() if json.loads(line)['type'] == 'warning']
 
+    def check_space(self, dest_free, temp_free):
+        """Run the check step's space test with the install folder and the temporary folder on two disks."""
+        self.dest.mkdir()
+        self.temp.mkdir()
+        free = {self.dest: dest_free, self.temp: temp_free}
+        real_stat = Path.stat
+        def stat(path, **kw):
+            if path in free:   # one device per folder, so the two needs are checked separately
+                return SimpleNamespace(st_dev=1 if path == self.dest else 2, st_mode=real_stat(path, **kw).st_mode)
+            return real_stat(path, **kw)
+        ctx = SimpleNamespace(dest=self.dest, temp=self.temp, info={'romfs_size': 1 << 30},
+                              reporter=Reporter(out=io.StringIO()))
+        with patch.object(b.shutil, 'disk_usage', side_effect=lambda p: SimpleNamespace(free=free[Path(p)])), \
+                patch.object(Path, 'stat', autospec=True, side_effect=stat), \
+                self.assertRaises(b.InstallError) as error:
+            b.Check().run(ctx)
+        return error.exception
+
+    def test_space_error_names_the_short_temporary_disk(self):
+        # A player who moves only the install folder to a roomy disk must learn that the setup folder's disk is full.
+        error = self.check_space(dest_free=1 << 40, temp_free=1 << 30)
+        self.assertEqual(error.id, 'dkb.temp_disk_space')
+        self.assertEqual(error.params['path'], str(self.temp))
+        self.assertEqual((error.params['need'], error.params['free']), (11.0, 1.0))
+
+    def test_space_error_names_the_short_install_disk(self):
+        error = self.check_space(dest_free=1 << 30, temp_free=1 << 40)
+        self.assertEqual(error.id, 'dkb.space')
+        self.assertEqual(error.params['path'], str(self.dest))
+        self.assertEqual((error.params['need'], error.params['free']), (4.0, 1.0))
+
     def test_low_commit_limit_warns_and_continues(self):
         self.assertEqual(self.host_warnings(commit_limit_gib=17.9), ['warn.low_commit_limit'])
 
