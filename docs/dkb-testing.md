@@ -237,8 +237,20 @@ All three settings currently require a restart. Available resolution presets are
 | Ultrawide | Aspect-ratio group | Presets |
 | --- | --- | --- |
 | Off | 16:9 | 1280x720, 1600x900, 1920x1080, 2560x1440, 2880x1620, 3840x2160 |
+| Off | 16:10 | 1280x800, 1920x1200, 2560x1600 |
 | On | 21:9 class | 2560x1080, 3440x1440, 3840x1600, 5120x2160 |
 | On | 32:9 | 3840x1080, 5120x1440 |
+
+A render resolution from 16:10 to 16:9 (1920x1200, 2560x1600; no ultrawide setting needed) is Vert+: the
+camera keeps the horizontal view of 16:9 and shows more above and below, and the HUD and menus stay whole in a
+centred 16:9 area with square pixels (the 1920x1080 UI canvas is not stretched to the taller screen). Patch set
+`dkbtall` (`recomp/patches-dkb*.txt`) calls `dkb_wide.c` `vert_plus` in the camera's projection update and reset,
+which widens the vertical field of view so that its tangent is divided by aspect / 16:9; the `dkbwide` UI sites divide
+the UI projection's y row by 16:9 / aspect instead of its x row. `dkb.log` says `ultrawide off, Vert+ (HUD in a
+centred 16:9 area)`. In play the 3D fills the whole screen; screens made only of UI (the title menu, loading tips)
+leave the bands above and below the 16:9 area in the game's clear colour (a light purple), because no layout overlay
+enlarges their backgrounds for a taller screen yet (`tools/dkb_wide_layout.py` does it for wider ones). Shapes
+taller than 16:10 (4:3, 5:4) are not accepted.
 
 The original virtual-display functions return 2880x1620 (16:9); this remains the
 default when no resolution is selected. These dimensions do not establish the native

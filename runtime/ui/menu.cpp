@@ -545,8 +545,10 @@ static void row_output_res(void) {
 }
 
 static const char *const *dkb_render_sizes(bool ultrawide, int &count) {
-    // The dkbwide patch grows the game's fixed render-target pool for larger sizes.
-    static const char *const standard[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "2880x1620", "3840x2160"};
+    // The dkbwide patch grows the game's fixed render-target pool for larger sizes. The 16:10 sizes need no ultrawide:
+    // dkb_wide.c gives them Vert+ and a centred 16:9 HUD.
+    static const char *const standard[] = {"1280x720", "1600x900", "1920x1080", "2560x1440", "2880x1620", "3840x2160",
+                                           "1280x800", "1920x1200", "2560x1600"};
     static const char *const wide[] = {"2560x1080", "3440x1440", "3840x1600", "5120x2160", "3840x1080", "5120x1440"};
     count = ultrawide ? sizeof wide / sizeof *wide : sizeof standard / sizeof *standard;
     return ultrawide ? wide : standard;
