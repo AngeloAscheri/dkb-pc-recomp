@@ -34,6 +34,21 @@ terminal inside the package folder: it names what is missing and the command tha
 - The setup logs: the installer writes one file per step under `logs/` in its temp folder, which is
   `build/install-temp` in the package folder.
 
+## For launcher authors
+
+What another frontend can rely on, on every platform (#402):
+
+- **Setup.** `python -m installer` (`setup.sh` on Linux, `setup.command` on macOS, `DKB-Setup.exe` on Windows, which
+  passes its arguments on) takes `--source PATH` or `--nup`/`--exefs`/`--romfs`, and `--dest DIR`. With `--prepare` it
+  prints `progress <0..1> <text>` lines; without, JSON events. Exit codes: 0 done, 1 failed, 2 bad command line,
+  3 cancelled. Running it again on the same `--dest` resumes or updates the install. `--help` lists every option.
+- **Game.** Start `dkb` (`dkb.exe` on Windows) from its own folder. `--set KEY=VALUE`, repeatable, gives a `dkb.ini`
+  key (or a full `TOTK_`/`DKB_` variable name) a value for that run only, without changing `dkb.ini`; an unknown key
+  exits with code 2. `--version` prints the port version and the game update; `--help` lists the options.
+- **Portable.** Saves (`profile/`), `dkb.ini`, logs (`logs/dkb.log`) and shader caches live beside the executable,
+  so the install folder can be moved, copied or deleted as a whole ([installer.md](installer.md), the install folder
+  layout).
+
 ## Reporting a bug
 
 Use the issue form (crash, graphics or bug). Add:
