@@ -509,7 +509,9 @@ static double now_s(uint64_t t0) { return (double)(plat_now_ns() - t0) / 1e9; }
 static void screen_main(void *arg) {
     (void)arg;
     uint64_t t0 = plat_now_ns();
-    Renderer r;
+    // zeroed: when vk_init fails here, the boot's prewarm can still make the device a moment later, and renderer_free
+    // below then sees a Renderer renderer_init never touched
+    Renderer r = {0};
     if (!vk_init() || !renderer_init(&r, scene_of_cfg())) {
         rt_log("splash: the start-up screen could not be made; the window opens at the game's first frame");
         if (vk_ctx()) renderer_free(&r);
