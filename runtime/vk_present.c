@@ -455,8 +455,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (wsys_minimized() || !g_sc) goto out;
 
     unsigned slot = g_frame % FRAMES;
-    if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
-        rt_log("gfx: present fence wait timed out");
+    VkResult fw = vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
+    if (fw != VK_SUCCESS) {   // the slot's command buffer may still run: this frame is skipped, nothing is reused
+        vk_device_fault_report(fw);
+        rt_log("gfx: present fence wait %s (%d)", fw == VK_TIMEOUT ? "timed out" : "failed", (int)fw);
         goto out;
     }
     uint64_t tv[2];
@@ -669,12 +671,22 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     g_frame++;
     if (cap) {
-        vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
-        vmaInvalidateAllocation(c->vma, g_cap_alloc, 0, VK_WHOLE_SIZE);
-        g_cap_w = (int)g_sc_ext.width;
-        g_cap_h = (int)g_sc_ext.height;
-        g_cap_valid = 1;
-        if (menu_shot) save_capture(menu_shot);
+        // The capture is read only once the copy into it is done. A wait that fails leaves it unread and no capture
+        // valid (the copy may still be writing the buffer); the next present of this slot waits for the fence again
+        // before its command buffer is reused, and the buffer is replaced only after the device idles (build_swapchain).
+        VkResult cw = r == VK_SUCCESS ? vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) : r;
+        if (cw == VK_SUCCESS) {
+            vmaInvalidateAllocation(c->vma, g_cap_alloc, 0, VK_WHOLE_SIZE);
+            g_cap_w = (int)g_sc_ext.width;
+            g_cap_h = (int)g_sc_ext.height;
+            g_cap_valid = 1;
+            if (menu_shot) save_capture(menu_shot);
+        } else {
+            vk_device_fault_report(cw);
+            g_cap_valid = 0;
+            rt_log("gfx: the capture of this present was not kept: %s (%d)",
+                   cw == VK_TIMEOUT ? "its copy did not finish in 5 s" : "it failed", (int)cw);
+        }
     }
 out:
     plat_rmutex_unlock(&g_pl);
