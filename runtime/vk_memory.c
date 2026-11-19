@@ -2872,7 +2872,7 @@ typedef struct {
 } BigMirror;
 static BigMirror big_mirror;
 
-// ---- staged mirror (TOTK_MIRROR_STAGED=<MiB>, <KiB>k or all; off by default)
+// ---- staged mirror (TOTK_MIRROR_STAGED=<MiB>, <KiB>k or all; auto by default: all on Windows with an NVIDIA GPU, see mirror_mode)
 // An imported pool of at least that size is never imported for the mirror's sake: the terrain arena of each layer of
 // Surf Hills is a 450 MiB CPU_CACHED pool, and its import at the first GPU use (65-85 ms in vkAllocateMemory on NVIDIA)
 // plus the full copy import -> mirror stalled one frame (#397). Importing it earlier only moved the cost: the driver
