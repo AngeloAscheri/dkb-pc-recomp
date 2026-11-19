@@ -55,8 +55,9 @@ typedef struct Fiber Fiber;
 // its core up while it ran lifted code (CW_WORSE_GAME) or while it was in a host call or SVC (CW_WORSE_HOST), holders of
 // equal priority and none worse (CW_EQ), only better holders (CW_BETTER), or worse holders all claimed by better
 // waiters (CW_NOCORE). CW_WAKE is the time from a wake-up (wake) until the woken host thread runs again holding G;
-// CW_LOCK the time a thread blocked on a guest mutex until the mutex was handed to it.
-enum { CW_WORSE_GAME, CW_WORSE_HOST, CW_EQ, CW_BETTER, CW_NOCORE, CW_WAKE, CW_LOCK, CW_N };
+// CW_LOCK the time a thread blocked on a guest mutex until the mutex was handed to it. CW_WORSE_WAKER is a worse
+// holder that is the thread whose signal just woke the waiter (it went on after its SVC: Horizon switches there).
+enum { CW_WORSE_GAME, CW_WORSE_HOST, CW_EQ, CW_BETTER, CW_NOCORE, CW_WAKE, CW_LOCK, CW_WORSE_WAKER, CW_N };
 
 struct RtThread {
     int preempt;               // first member: rt_dispatch reads it (host.h kern_preempt_pending)
@@ -345,7 +346,8 @@ static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) 
 // (TOTK_PERF_SLOW_MS), the totals every 60 presents and at exit.
 enum { CW_REL_YIELD, CW_REL_CHECKPOINT, CW_REL_ASYNC };   // how an owner gave its core up: blocked or yielded, at a
                                                           // checkpoint (SVC or indirect call), interrupted (kern_ap_yield)
-static const char *const cw_name[CW_N] = {"worse-game", "worse-host", "equal", "better", "nocore", "wake", "lock"};
+static const char *const cw_name[CW_N] = {"worse-game", "worse-host", "equal", "better", "nocore", "wake", "lock",
+                                          "worse-waker"};
 typedef struct { uint64_t n, ns, max; } CwStat;
 typedef struct {
     CwStat all[CW_N], crit[CW_N];   // every thread; the main thread and its wakers
@@ -388,8 +390,10 @@ static void cw_add(RtThread *t, int k, uint64_t a, uint64_t b) {
     if (b - s > t->cs_max[k]) t->cs_max[k] = b - s;
 }
 
-// The class of t's core wait, right after core_kick claimed (or did not claim) a holder for it.
-static int cw_class(const RtThread *t) {
+// The class of t's core wait, right after core_kick claimed (or did not claim) a holder for it; woke: it follows a
+// wake-up, whose waker is t->waker.
+static int cw_class(const RtThread *t, int woke) {
+    if (t->target && woke && t->target->handle == t->waker) return CW_WORSE_WAKER;
     if (t->target) return __atomic_load_n(&t->target->host_depth, __ATOMIC_RELAXED) > 0 ? CW_WORSE_HOST : CW_WORSE_GAME;
     int worse = 0, eq = 0;
     for (int i = 0; i < NCORE; i++)
@@ -463,7 +467,7 @@ static void cw_log(const char *what, const CwAcc *a) {
     cw_classes(all, sizeof all, a->all);
     cw_classes(crit, sizeof crit, a->crit);
     rt_log("kernel: core waits %s: %llu frames, main thread waited %.2f ms; critical path: %s; all threads: %s; "
-           "lock hand-offs %llu; worse-game waits after a wake-up %llu, ended by the holder blocking or yielding %llu, at "
+           "lock hand-offs %llu; worse-game and worse-waker waits after a wake-up %llu, ended by the holder blocking or yielding %llu, at "
            "a checkpoint %llu, interrupted %llu; asynchronous preemption: %llu stops, system calls avg %.1f us max %.1f "
            "us, %llu sent, sent to core avg %.1f us max %.1f us (%llu)",
            what, (unsigned long long)a->frames, a->main_ns / 1e6, crit, all, (unsigned long long)a->handoffs,
@@ -1382,7 +1386,7 @@ static void core_take(RtThread *t) {
     if (g_diag > 0) t->dg_cls = dg_class0(t);
     int cls = -1;
     if (g_cw_on) {
-        cls = cw_class(t);
+        cls = cw_class(t, blk == 2);
         if (!c0) c0 = kern_now_ns();
         t->cw_ap_at = 0;
     }
@@ -1410,7 +1414,7 @@ static void core_take(RtThread *t) {
     if (cls >= 0) {
         uint64_t now = kern_now_ns();
         cw_add(t, cls, c0, now);
-        if (cls == CW_WORSE_GAME) {
+        if (cls == CW_WORSE_GAME || cls == CW_WORSE_WAKER) {
             g_cwf.rel[t->cw_rel]++;
             g_cwf.worse_wake += blk == 2;
         }
