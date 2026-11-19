@@ -80,6 +80,13 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   them for each slow frame (`TOTK_PERF_SLOW_MS`), every 60 presents and at exit. They cost a few clock reads per
   blocking wait, so they stay on in plain runs, where `TOTK_CORE_DIAG` (holder samples, timed waits, log lines) is
   for diagnosis runs.
+- Directed core hand-off (`TOTK_SCHED_HANDOFF=1`, off by default; `ab` for an in-run A/B). Horizon reschedules a core
+  as the SVC that made a better thread runnable returns; here the woken thread asks for a core only once its host thread
+  runs, and the waker, already out of the SVC, gives its core up at its next SVC or indirect call. With the hand-off
+  the waker gives its core to the best thread its SVC woke as the SVC returns (or as it blocks, for
+  WaitProcessWideKeyAtomic), when that thread is strictly better, may run there, has no free core and no core waiter as
+  good comes first; a caller inside an SDK spin lock or with a deferred preemption keeps its core (`kernel.c`,
+  "directed core hand-off"). `--probe-kernel` checks both cases.
 - Host work gives the core back. Queue submits, presents, GPU waits, shader translation, `nn::fs` calls and NVN memory pool setup run without a core (`NVN_BLOCKING`, `kern_core_away`), as the Switch blocks those threads in IPC, so a thread blocked in the driver or on a file does not hold up guest threads.
 - Spin waits. Loops that only another thread can end (857 in 1.4.3, 864 in 1.2.1, found by `tools/spin_waits.py`, the
   nxnative search) send their back-edges through `rt_spin_gate`, which pauses the core once per pass and hands it to a

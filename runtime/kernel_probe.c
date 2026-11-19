@@ -429,6 +429,94 @@ static void test_cores(Cpu *c) {
     CHECK(ok || !gate, "virtual cores");
 }
 
+// ---- directed core hand-off (kernel.c, TOTK_SCHED_HANDOFF): threads on core 3 alone. A holder L (priority 50) hands
+// a mutex to a waiter H (40). Case 1: L releases it with ArbitrateUnlock, then runs host code without an SVC for
+// 20 ms, where nothing stops it (the asynchronous preemption only interrupts lifted code); with the hand-off H gets the
+// core as the SVC returns, without it at L's next SVC, 20 ms later. Case 2: L releases it inside
+// WaitProcessWideKeyAtomic, which blocks L, while X (55) waits for the core at the end of a SleepThread; with the
+// hand-off the core goes to H, without it to X, which returns from the SVC and runs host code 20 ms before it exits.
+typedef struct { volatile uint32_t *lock, *key; uint32_t tag; int mode; } HoJob;
+static volatile uint32_t g_hol __attribute__((aligned(8))), g_hok __attribute__((aligned(8)));
+static volatile uint32_t g_ho_h;   // H's handle, for L to watch
+static volatile uint64_t g_ho_t0, g_ho_at, g_ho_xs;   // L's release, H's acquisition, X's sleep start
+static uint64_t a_ho_holder, a_ho_waiter, a_ho_busy;
+
+#define HO_XSLEEP_NS 100000000ll
+
+static void busy_ns(uint64_t ns) {
+    uint64_t until = kern_now_ns() + ns;
+    while (kern_now_ns() < until) plat_pause();
+}
+
+static void ho_holder(Cpu *c) {
+    HoJob *j = arg_p(c, 0);
+    user_lock(c, j->lock, j->tag);
+    while (!g_ho_h || kern_thread_state(g_ho_h) != KERN_WAIT_LOCK) sleep_ms(c, 1);   // the core is free meanwhile
+    if (j->mode == 2)   // holding the core until 10 ms after X's sleep has ended: X waits for it in SleepThread
+        while (kern_now_ns() < g_ho_xs + HO_XSLEEP_NS + 10000000) plat_pause();
+    g_ho_t0 = kern_now_ns();
+    if (j->mode == 1) user_unlock(c, j->lock, j->tag);
+    else sv(c, 0x1C, ga(j->lock), ga(j->key), j->tag, 50000000);   // times out: no one signals the key
+    busy_ns(20000000);
+    exit_thread(c);
+}
+
+static void ho_waiter(Cpu *c) {
+    HoJob *j = arg_p(c, 0);
+    user_lock(c, j->lock, j->tag);
+    g_ho_at = kern_now_ns();
+    user_unlock(c, j->lock, j->tag);
+    exit_thread(c);
+}
+
+static void ho_busy(Cpu *c) {
+    g_ho_xs = kern_now_ns();
+    sv(c, 0x0B, HO_XSLEEP_NS, 0, 0, 0);
+    busy_ns(20000000);
+    exit_thread(c);
+}
+
+static uint32_t on_core3(Cpu *c, uint64_t entry, void *arg, int prio) {
+    uint32_t h = create(c, entry, arg, prio, -2);
+    CHECK(sv(c, 0x0F, h, 3, 1u << 3, 0) == 0, "SetThreadCoreMask %#x to core 3", h);
+    return h;
+}
+
+static double ho_case(Cpu *c, int mode) {
+    g_hol = g_hok = 0;
+    g_ho_h = 0;
+    g_ho_t0 = g_ho_at = g_ho_xs = 0;
+    uint32_t hx = 0;
+    if (mode == 2) {   // X first, so that it is asleep before L takes the core
+        hx = on_core3(c, a_ho_busy, NULL, 55);
+        start(c, hx);
+        while (!g_ho_xs) sleep_ms(c, 1);
+    }
+    HoJob jl = {.lock = &g_hol, .key = &g_hok, .mode = mode}, jh = jl;
+    uint32_t hl = on_core3(c, a_ho_holder, &jl, 50), hh = on_core3(c, a_ho_waiter, &jh, 40);
+    jl.tag = hl;
+    jh.tag = hh;
+    start(c, hl);
+    while (ld(&g_hol) != hl) sleep_ms(c, 1);
+    g_ho_h = hh;
+    start(c, hh);
+    join(c, hh);
+    join(c, hl);
+    if (hx) join(c, hx);
+    return g_ho_at > g_ho_t0 ? (double)(g_ho_at - g_ho_t0) / 1e6 : -1;
+}
+
+static void test_handoff(Cpu *c) {
+    int on = __atomic_load_n(&kern_sched_handoff, __ATOMIC_RELAXED);
+    double d1 = ho_case(c, 1), d2 = ho_case(c, 2);
+    int ok = d1 >= 0 && d2 >= 0 && (!on || (d1 < 5 && d2 < 5));
+    printf("core hand-off (%s): a better waiter got a released mutex's core after %.3f ms (ArbitrateUnlock, holder "
+           "busy 20 ms after it) and %.3f ms (WaitProcessWideKeyAtomic, a worse thread queued for the core): %s\n",
+           on ? "TOTK_SCHED_HANDOFF on, want under 5 ms" : "off, about 20 ms expected", d1, d2,
+           !ok ? "FAIL" : on ? "ok" : "ok (not checked)");
+    CHECK(ok, "core hand-off");
+}
+
 // ---- fibers: two fibers switch to each other; each checks its callee-saved registers, sp and tpidr survive
 typedef struct { uint64_t self, other; int id; } FiberJob;
 static volatile int32_t g_switches, g_runs[3];
@@ -625,6 +713,7 @@ static void probe_main(Cpu *c) {
     test_arbiter(c);
     test_events(c);
     test_cores(c);
+    test_handoff(c);
     test_fibers(c);
     test_exit(c);
     test_lifted_ticks(c);
@@ -781,6 +870,9 @@ int probe_kernel(void) {
     a_fiber_exit_thread = hostfn_register("probe-kernel fiber exit thread", fiber_exit_thread);
     a_fiber_exit_fn = hostfn_register("probe-kernel fiber exit", fiber_exit_fn);
     a_tick_worker = hostfn_register("probe-kernel tick worker", tick_worker);
+    a_ho_holder = hostfn_register("probe-kernel hand-off holder", ho_holder);
+    a_ho_waiter = hostfn_register("probe-kernel hand-off waiter", ho_waiter);
+    a_ho_busy = hostfn_register("probe-kernel hand-off busy", ho_busy);
     a_fib_init = hostfn_register(KERN_SYM_INITIALIZE_FIBER, kern_fiber_initialize);   // the loader's addresses
     a_fib_fin = hostfn_register(KERN_SYM_FINALIZE_FIBER, kern_fiber_finalize);
     a_fib_switch = hostfn_register(KERN_SYM_SWITCH_TO_FIBER, kern_fiber_switch);

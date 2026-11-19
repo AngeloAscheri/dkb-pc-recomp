@@ -300,6 +300,10 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c));           // start the guest ma
 int kern_core_away(void);                                  // give the virtual core up around a blocking host wait
 void kern_core_back(int *away);
 void kern_checkpoint(void);                                // preemption point, at every SVC and indirect call
+// TOTK_SCHED_HANDOFF (kernel.c, "directed core hand-off"): rt_svc calls kern_svc_return after each SVC while it is
+// nonzero. Off unless set; with "ab" the present switches it with the A/B blocks.
+extern int kern_sched_handoff;
+void kern_svc_return(void);
 // A preempt request is pending for the thread (Cpu.thread): its RtThread starts with the flag (kernel.c).
 static inline int kern_preempt_pending(const void *thread) { return __atomic_load_n((const int *)thread, __ATOMIC_RELAXED); }
 // Set once before guest threads start (TOTK_CORE_DIAG, TOTK_ASYNC_PREEMPT): host calls (hostfn.c) and SVCs (svc.c) count their depth in

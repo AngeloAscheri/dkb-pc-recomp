@@ -123,6 +123,13 @@ struct RtThread {
     int cw_rel;                // as a core waiter: how the core it got was given up (CW_REL_*)
     uint64_t cs_epoch;         // the main thread's wait the cs_ counts belong to (g_cw_epoch)
     uint64_t cs_ns[CW_N], cs_n[CW_N], cs_max[CW_N];   // this thread's waits during that wait of the main thread
+    // TOTK_SCHED_HANDOFF (holding G; see "directed core hand-off")
+    int ho_transit;            // woken by wake() while it handed off, not yet back from block_inner (has not run)
+    int ho_got;                // given a core in transit by its waker; core_take finishes the take
+    RtThread *ho_cand;         // as a waker: the best thread woken since its last SVC return, never dereferenced
+    uint64_t ho_cand_id;       // before ho_cand_h shows that thread still exists
+    uint32_t ho_cand_h;
+    int ho_cand_prio;
 };
 
 static PlatMutex G = PLAT_MUTEX_INIT;
@@ -165,6 +172,9 @@ static WaitRec g_rw[RW_N], g_mw[RW_N];                   // the render and main 
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
 static int g_cw_on = 1;   // core wait counters on (TOTK_CORE_WAITS, read at each present by kern_core_waits_frame)
+int kern_sched_handoff;   // TOTK_SCHED_HANDOFF on (written holding G: cores_enabled, then each present for "ab")
+static int g_ho_mode;
+static void ho_note(RtThread *t);
 
 static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t ns) {
     for (int i = 0; i < RW_N; i++)
@@ -256,6 +266,7 @@ static void wake(RtThread *t, uint32_t res) {
     if (g_cw_on) t->cw_woke_at = kern_now_ns();
     if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
     if (g_crit_on) crit_add(CRIT_WAKE, t->handle, t->waker, 0, 0, t->wake_at);
+    if (kern_sched_handoff) ho_note(t);
     plat_cond_signal(&t->cv);
 }
 
@@ -328,6 +339,11 @@ static int cores_enabled(void) {
                    "core that the game's per-core data needs; for experiments only, the game can fail");
         diag_init();
         ap_init();
+        g_ho_mode = g_cores_on ? rt_knob("SCHED_HANDOFF", "0") : 0;
+        kern_sched_handoff = RT_KNOB_ON(g_ho_mode);
+        if (g_ho_mode)
+            rt_log("kernel: directed core hand-off at SVC return %s (TOTK_SCHED_HANDOFF)",
+                   g_ho_mode == 2 ? "in the B blocks of TOTK_AB" : "on");
     }
     return g_cores_on;
 }
@@ -486,6 +502,7 @@ void kern_core_waits_frame(uint64_t frame, uint64_t interval_ns, int log) {
     CwAcc f, w = {0};
     lock();
     g_cw_on = RT_KNOB_ON(g_cw_mode);
+    if (g_ho_mode == 2) __atomic_store_n(&kern_sched_handoff, rt_ab(), __ATOMIC_RELAXED);
     g_cwf.frames = 1;
     f = g_cwf;
     memset(&g_cwf, 0, sizeof g_cwf);
@@ -1270,8 +1287,9 @@ static void core_grant(int c) {
     plat_cond_signal(&b->cv);
 }
 
-static void core_put(RtThread *t) {
-    if (t->cur_core < 0) return;
+// t gives its core up; the core it held, now free, or -1 when it held none.
+static int core_release(RtThread *t) {
+    if (t->cur_core < 0) return -1;
     int c = t->cur_core;
     if (t->preempt && t->pre_since) {   // sched trace: time from the preempt request to this release
         uint64_t d = kern_now_ns() - t->pre_since;
@@ -1290,7 +1308,12 @@ static void core_put(RtThread *t) {
     t->cur_core = -1;
     t->preempt = 0;
     g_core_owner[c] = NULL;
-    core_grant(c);
+    return c;
+}
+
+static void core_put(RtThread *t) {
+    int c = core_release(t);
+    if (c >= 0) core_grant(c);
 }
 
 // Whether a waiter better than t may run on core c.
@@ -1351,8 +1374,13 @@ static void core_kick(void) {
     }
 }
 
+static void ho_arrive(RtThread *t);
+
 static void core_take(RtThread *t) {
-    if (t->cur_core >= 0) return;
+    if (t->cur_core >= 0) {
+        if (t->ho_got) ho_arrive(t);
+        return;
+    }
     if (!cores_enabled()) {
         acct(t, S_RUN);
         return;
@@ -1438,6 +1466,93 @@ static void core_take(RtThread *t) {
     acct(t, S_RUN);
 }
 
+// ---- directed core hand-off (TOTK_SCHED_HANDOFF=1, off by default; "ab" switches it with the A/B blocks)
+// Horizon reschedules a core as an SVC that changed the scheduling state returns (Eglantine k_scheduler.cpp,
+// KScheduler::EnableScheduling and RescheduleCurrentCore when the scheduler lock is released): a thread the SVC made
+// runnable that is better than the caller runs at once. Here a woken thread only asks for a core once its host thread
+// has woken (a few microseconds) and core_take has found none free; core_kick then marks a holder, often the waker
+// itself, which by then has left the SVC and goes on to its next SVC or indirect call (about 26 us in Bananza's mutex
+// convoys: a worker at priority 54 hands a mutex to a priority-53 thread with ArbitrateUnlock and keeps the core).
+// With the hand-off, wake() notes the best thread woken (ho_note), and where the waker can switch at once it gives that
+// thread its core directly, while the woken thread's host thread is still on its way out of block_inner:
+// - kern_svc_return, after every SVC: if the woken thread is strictly better than the caller (inheritance included),
+//   may run on the caller's core and finds no free core it may use, and no thread waiting for a core that may use the
+//   caller's core is as good; then any preempt request that came during the SVC is honoured (kern_checkpoint).
+// - block, when the SVC that woke it then blocks the caller (WaitProcessWideKeyAtomic hands its mutex over and waits):
+//   the core goes to the woken thread on the same conditions, priority aside, instead of to the best core waiter.
+// Departures from Horizon: the woken thread gets the waker's core rather than its own active core (the virtual cores
+// let any thread take any core in its mask, as core_take does), and a caller inside an SDK spin lock (TLR+0x100
+// disable_count) or with a preemption deferred to SVC 0x36 (TLR+0x102 set: pinned until then) keeps its core, as at a
+// checkpoint, where Horizon's SVC return ignores the user disable count and only a pinned thread stays. No thread is
+// interrupted: the switch happens on the caller's own host thread, between lifted instructions.
+
+// t's candidate if that thread still exists, cleared (holding G).
+static RtThread *ho_cand_take(RtThread *t) {
+    RtThread *w = t->ho_cand;
+    t->ho_cand = NULL;
+    return w && h_peek(t->ho_cand_h, O_THREAD) == w && w->id == t->ho_cand_id ? w : NULL;
+}
+
+// wake(): t was just woken; remember it on the waker if it is the waker's best so far (holding G).
+static void ho_note(RtThread *t) {
+    t->ho_transit = 1;
+    RtThread *k = tcur;
+    if (!k || k == t || k->cur_core < 0 || (k->ho_cand && k->ho_cand_prio <= t->prio)) return;
+    k->ho_cand = t;
+    k->ho_cand_id = t->id;
+    k->ho_cand_h = t->handle;
+    k->ho_cand_prio = t->prio;
+}
+
+// Gives t's core to w, which t woke and which has not run since (holding G); blocking: t is about to block, so its
+// priority and spin lock state do not matter. 1 if it did.
+static int ho_give(RtThread *t, RtThread *w, int blocking) {
+    int c = t->cur_core;
+    if (c < 0 || !w->ho_transit || w->cur_core >= 0 || !core_allowed(w, c)) return 0;
+    int wp = prio_of(w);
+    if (!blocking && (wp >= prio_of(t) || (g_ap > 0 && (ap_tlr(t)[0] || ap_tlr(t)[1])))) return 0;
+    for (int i = 0; i < NCORE; i++)
+        if (core_allowed(w, i) && !g_core_owner[i]) return 0;   // w takes a free core itself
+    for (const RtThread *q = g_core_wait; q; q = q->cnext)
+        if (core_allowed(q, c) && prio_of(q) <= wp) return 0;  // a core waiter as good came first
+    core_release(t);
+    w->cur_core = c;
+    g_core_owner[c] = w;
+    w->ho_got = 1;
+    core_count();
+    if (g_diag > 0) w->dg_rel = g_dg_rel;
+    if (rt_trace & RT_TRACE_SCHED) w->grant_at = kern_now_ns();
+    return 1;   // wake() has signalled w's host thread already
+}
+
+// core_take of a thread that got its core in transit: what core_take does after taking a free core.
+static void ho_arrive(RtThread *t) {
+    t->ho_got = 0;
+    t->cw_blk = 0;
+    t->cw_core0 = 0;
+    t->target = NULL;
+    if (t->grant_at) {
+        uint64_t d = kern_now_ns() - t->grant_at;
+        t->lg_ns += d;
+        t->lg_n++;
+        if (d > t->lg_max) t->lg_max = d;
+        t->grant_at = 0;
+    }
+    acct(t, S_RUN);
+}
+
+void kern_svc_return(void) {
+    RtThread *t = tcur;
+    if (!t) return;
+    if (t->ho_cand) {
+        lock();
+        RtThread *w = ho_cand_take(t);
+        if (w && ho_give(t, w, 0)) core_take(t);
+        unlock();
+    }
+    kern_checkpoint();   // a request from a core waiter that came during the SVC
+}
+
 static uint32_t block(RtThread *t, int kind, int64_t ns) {
     t->waker = 0;
     if (ns == 0) return block_inner(t, kind, ns);
@@ -1447,10 +1562,12 @@ static uint32_t block(RtThread *t, int kind, int64_t ns) {
         g_cw_main_t0 = t0;
     }
     t->cw_woke_at = 0;
-    core_put(t);
+    RtThread *w = t->ho_cand ? ho_cand_take(t) : NULL;
+    if (!w || !ho_give(t, w, 1)) core_put(t);
     acct(t, st_of(kind));
     t->nblk++;
     uint32_t r = block_inner(t, kind, ns);
+    t->ho_transit = 0;
     if (t0) {
         uint64_t now = kern_now_ns();
         t->cw_blk = 1;
