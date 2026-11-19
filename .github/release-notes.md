@@ -3,6 +3,9 @@
 - Recording a draw costs about 14% less: unchanged index and vertex buffers and dynamic states are no longer bound again, and uniform buffers are found faster. On 6 logical processors frames over 50 ms in the heaviest scene tested fell from about 22 to 15 a minute (`TOTK_DYN_KEEP=0` brings back the old dynamic-state path).
 - The replay and its Vulkan recorder run above normal priority while a frame is submitted, so the game's loading threads no longer starve them on CPUs with few cores: on 6 logical processors a level transition's replay fell from about 11 ms a frame to 0.25 ms.
 - #419 Keep the Bananza installer tests independent of the host's free space and symlink rights (@wrothgaril)
+- #420 DKB-Launcher.exe: a small Windows launcher that installs the build tools from the latest release (@wrothgaril)
+- #422 Stamp release files with the commit time (@GlebShekovtsov)
+- #425 Name the disk that is short of space in the Bananza installer (@cybersecurityhandle)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 
 New files in the package table of that release:
