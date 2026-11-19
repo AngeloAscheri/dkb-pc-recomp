@@ -375,7 +375,7 @@ uint32_t input_pad_choose(InputPadSelection *s, const InputPadDevice *devices, i
         for (int i = 0; i < count; i++) {
             int known = 0;
             for (int j = 0; j < s->count; j++) if (devices[i].id == s->ids[j]) known = 1;
-            if (!known && !(s->keep && pad_list_has(devices, count, current))) {
+            if (!known && (!(s->keep && pad_list_has(devices, count, current)) || !strcmp(devices[i].key, preferred))) {
                 // If several devices arrive in one poll, the last enumerated arrival wins.
                 s->pending = devices[i].id;
                 s->automatic = 1;

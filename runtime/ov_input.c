@@ -30,7 +30,7 @@ enum { STYLE_FULL_KEY = 1, STYLE_HANDHELD = 2, ATTR_CONNECTED = 1 };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint32_t styles = STYLE_FULL_KEY;
-static int enabled, allowed = 1, allowed2 = 1, mouse_ready, keyboard_ready;
+static int enabled, allowed = 1, allowed2 = 1, supported2 = 1, mouse_ready, keyboard_ready;
 static int64_t sample;
 
 static uint32_t pad_id(void) { return ov_handheld() ? 0x20u : 0u; }
@@ -61,7 +61,7 @@ static void ov_supported_ids(Cpu *c) {
     for (uint64_t i = 0; i < n; i++) ok |= ids[i] == pad_id(), ok2 |= ids[i] == 1;
     plat_mutex_lock(&lock);
     allowed = ok;
-    allowed2 = ok2;
+    allowed2 = supported2 = ok2;
     plat_mutex_unlock(&lock);
 }
 
@@ -137,20 +137,22 @@ static void ov_disconnect(Cpu *c) {
 }
 
 // Result ShowControllerSupport(ControllerSupportResultInfo *out, const ControllerSupportArg &arg): the controllers are
-// already connected, so the applet returns at once with the players connected now, as Eglantine's controller applet
-// does without its UI (applet_controller.cpp Controller::ConfigurationComplete): enable_single_mode gives one player,
-// else player 1 plus player 2 when its gamepad is there, capped at player_count_max. The argument starts with
+// already connected, so the applet returns at once with the players connected now. Eglantine's controller applet
+// without its UI caps and disconnects the controllers past max_players, 1 in single mode
+// (DefaultControllerApplet::ReconfigureControllers, core/frontend/applets/controller.cpp), and
+// Controller::ConfigurationComplete (applet_controller.cpp) only counts the connected players. Here: single mode gives
+// one player, else player 1 plus player 2 when its gamepad is there, capped at player_count_max. The argument starts with
 // ControllerSupportArgHeader {s8 player_count_min, player_count_max; bool take_over, left_justify, permit_joy_dual,
 // single_mode, identification_color}.
 static void ov_controller_support(Cpu *c) {
     ControllerSupportResult *out = arg_p(c, 0);
     const int8_t *arg = arg_p(c, 1);
-    plat_mutex_lock(&lock);
-    allowed2 = 1;
-    plat_mutex_unlock(&lock);
     int lo = arg ? arg[0] : 1, hi = arg ? arg[1] : 1, single = arg && arg[5];
-    int n = single ? 1 : 1 + player2(NULL);
-    if (hi > 0 && n > hi) n = hi;
+    plat_mutex_lock(&lock);
+    allowed2 = supported2 && !single && hi != 1;   // players past the maximum are disconnected
+    int p2 = allowed2;
+    plat_mutex_unlock(&lock);
+    int n = 1 + (p2 && player2(NULL));
     rt_log("hid: controller support applet (players %d..%d%s): %d player%s", lo, hi, single ? ", single mode" : "", n,
            n > 1 ? "s" : "");
     if (out) *out = (ControllerSupportResult){.players = (int8_t)n, .selected = pad_id()};

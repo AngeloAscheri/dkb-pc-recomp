@@ -916,6 +916,10 @@ int input_poll2(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
     int on = 0;
     plat_mutex_lock(&lock);
     if (!state) start();
+    if (state == 1 && !cfg_bool("TOTK_COOP") && pad2) {
+        SDL_CloseGamepad(pad2);
+        pad2 = NULL;
+    }
     if (state == 1 && cfg_bool("TOTK_COOP")) {
         pad2_scan();
         if (pad2) {
