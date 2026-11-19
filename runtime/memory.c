@@ -1082,6 +1082,10 @@ static void cl_thread(void *arg) {
             plat_mutex_lock(&lock);
             int ok = touch_range(x, a + n - x < CL_SLICE ? a + n - x : CL_SLICE, 0);
             plat_mutex_unlock(&lock);
+            // `lock` is not fair, and this loop would take it again at once: a guest thread waiting for it in SetHeapSize,
+            // MapMemory or QueryMemory could be passed over for a whole range (about 225 slices for the terrain pool).
+            // Giving up the time slice lets a waiter in after one slice.
+            plat_yield();
             if (!ok) {
                 if (plat_inc64(&cl_failed) <= 4)
                     rt_log("mem: a background commit failed at %#llx: the rest of %#llx+%#llx stays reserved",
