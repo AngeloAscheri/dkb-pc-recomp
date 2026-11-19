@@ -1,5 +1,6 @@
 ## Draft: next release (since 0.4.2)
 
+- 16:10 screens (1280x800, 1920x1200, 2560x1600): the view grows taller and the HUD stays whole in a centred 16:9 area (#249). Tested on 3.2.0.
 - Local co-op: a second gamepad plays Pauline (Pause > Co-op mode > Share controllers, #240). `coop = 0` turns it off. Tested with a simulated second pad only; reports with two real pads are welcome.
 - Recording a draw costs about 14% less: unchanged index and vertex buffers and dynamic states are no longer bound again, and uniform buffers are found faster. On 6 logical processors frames over 50 ms in the heaviest scene tested fell from about 22 to 15 a minute (`TOTK_DYN_KEEP=0` brings back the old dynamic-state path).
 - The replay and its Vulkan recorder run above normal priority while a frame is submitted, so the game's loading threads no longer starve them on CPUs with few cores: on 6 logical processors a level transition's replay fell from about 11 ms a frame to 0.25 ms.
