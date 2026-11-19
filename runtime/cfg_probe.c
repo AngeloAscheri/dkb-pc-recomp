@@ -350,6 +350,24 @@ int probe_cfg(void) {
     input_map_face_spec(&input_map, PAD_LAYOUT_XBOX, face);
     CHECK(!strcmp(face, "s?nw"), "face spec: an unbound face button reads '?' (the layout's folder loads)");
     input_map_reset();
+    // The Switch-letter overlay (romfs.c keys_prompts_init): the letter each glyph must show, from the labels printed
+    // on the pad (Xbox: s A, e B, w X, n Y; Nintendo: s B, e A, w Y, n X).
+    char keys[5];
+    input_map_face_keys("sewn", 0, keys);
+    CHECK(!strcmp(keys, "ABXY"), "face keys: the Xbox table on an Xbox-labelled pad is the game's own letters");
+    input_map_face_keys("esnw", 1, keys);
+    CHECK(!strcmp(keys, "ABXY"), "face keys: the Nintendo table on a Nintendo-labelled pad is the game's own letters");
+    input_map_face_keys("esnw", 0, keys);
+    CHECK(!strcmp(keys, "BAYX"), "face keys: xbox_prompts (Nintendo table, Xbox labels) swaps A with B and X with Y");
+    input_map_face_keys("senw", 0, keys);
+    CHECK(!strcmp(keys, "ABYX"), "face keys: X and Y swapped on an Xbox pad give ABYX (romfs-patches-keys-ABYX)");
+    CHECK(input_map_bind("X", "pad:west") && input_map_bind("Y", "pad:north"), "face keys: Nintendo X and Y swapped");
+    input_map_face_spec(&input_map, PAD_LAYOUT_NINTENDO, face);
+    input_map_face_keys(face, 1, keys);
+    CHECK(!strcmp(keys, "ABYX"), "face keys: bind lines read through the spec");
+    input_map_face_keys("s?nw", 0, keys);
+    CHECK(!strcmp(keys, "A?YX"), "face keys: an unbound button reads '?' (no folder covers it)");
+    input_map_reset();
     CHECK(input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_RPADDLE1] = 1}, PAD_LAYOUT_XBOX) == 0,
           "pad layout: a back paddle is unbound by default");
     CHECK(input_map_bind("ZL", "pad:default, pad:rpaddle1") &&

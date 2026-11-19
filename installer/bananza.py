@@ -43,6 +43,12 @@ TALL_SIZES = ('1280x800', '1680x1050', '1920x1200', '2560x1600')
 # and B over the Nintendo one; positions of A, B, X, Y in tools/dkb_ps_prompts.py).
 PS_FOLDERS = {'romfs-patches-ps': 'xbox', 'romfs-patches-ps-nintendo': 'nintendo', 'romfs-patches-ps-senw': 'senw',
               'romfs-patches-ps-eswn': 'eswn'}
+# The Switch-letter overlays for a pad whose face buttons are not where the game's letters say (runtime/romfs.c
+# keys_prompts_init): the A, B, X, Y glyphs with their letters permuted, each folder named by what it shows
+# (tools/dkb_ps_prompts.py --keys). ABYX swaps X and Y, BAXY A and B, BAYX both (pad_layout = xbox_prompts).
+KEY_FOLDERS = {'romfs-patches-keys-ABYX': 'ABYX', 'romfs-patches-keys-BAXY': 'BAXY', 'romfs-patches-keys-BAYX': 'BAYX'}
+PROMPT_ARGS = {**{name: ('--layout', layout) for name, layout in PS_FOLDERS.items()},
+               **{name: ('--keys', keys) for name, keys in KEY_FOLDERS.items()}}
 WIDE_FOLDERS = (tuple(f'romfs-patches-{size}{suffix}' for size in WIDE_SIZES for suffix in ('', '-hud-edges')) +
                 tuple(f'romfs-patches-{size}' for size in TALL_SIZES))
 COMMIT_WARN_GIB = 24   # the game commits about 14 GB; README asks for 16 GB of RAM plus a large page file
@@ -947,17 +953,18 @@ class WideLayouts(Step):
 
 
 class PadPrompts(Step):
-    """The PlayStation button prompts (tools/dkb_ps_prompts.py): one overlay per face-button layout, from the user's font."""
+    """The PlayStation button prompts (tools/dkb_ps_prompts.py): one overlay per face-button layout, and the
+    Switch-letter overlays (--keys), from the user's font."""
     id = 'dkb_prompts'
 
     def key(self, ctx):
-        return digest(ctx.keys['dkb_data'], ctx.info['game'], PS_FOLDERS, source_key(ctx.layout, 'tools/dkb_ps_prompts.py'))
+        return digest(ctx.keys['dkb_data'], ctx.info['game'], PROMPT_ARGS, source_key(ctx.layout, 'tools/dkb_ps_prompts.py'))
 
     def current(self, ctx, record):
         try:
-            return (set(record.get('outputs', {})) == set(PS_FOLDERS) and
+            return (set(record.get('outputs', {})) == set(PROMPT_ARGS) and
                     all((ctx.dest / name / 'manifest.tsv').is_file() and
-                        tree_key(ctx.dest / name) == record['outputs'][name] for name in PS_FOLDERS))
+                        tree_key(ctx.dest / name) == record['outputs'][name] for name in PROMPT_ARGS))
         except OSError:
             return False
 
@@ -969,10 +976,10 @@ class PadPrompts(Step):
         staged = ctx.temp / 'build' / 'ps-prompts'
         owned_dir(ctx, staged)
         try:
-            for name, layout in PS_FOLDERS.items():
+            for name, (option, value) in PROMPT_ARGS.items():
                 run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_ps_prompts.py',
-                                        '--romfs', ctx.dest / 'romfs', '--out', staged / name, '--layout', layout,
-                                        '--installer-workspace', ctx.temp], name=f'{self.id}-{layout}')
+                                        '--romfs', ctx.dest / 'romfs', '--out', staged / name, option, value,
+                                        '--installer-workspace', ctx.temp], name=f'{self.id}-{value}')
         except InstallError as error:
             if error.id != 'dkb.tool_failed':   # path/ownership failures still stop setup
                 raise
@@ -981,13 +988,13 @@ class PadPrompts(Step):
             # Optional: the Switch prompts stay. Nothing is published and nothing recorded, so the next setup retries.
             return {'prepared': False}
         plain_outputs(ctx)
-        for name in PS_FOLDERS:   # each manifest last, as WideLayouts
+        for name in PROMPT_ARGS:   # each manifest last, as WideLayouts
             folder = staged / name
             for source in sorted(folder.rglob('*')):
                 if source.is_file() and source.name != 'manifest.tsv':
                     copy_file(source, ctx.dest / name / source.relative_to(folder))
             copy_file(folder / 'manifest.tsv', ctx.dest / name / 'manifest.tsv')
-        return {'outputs': {name: tree_key(ctx.dest / name) for name in PS_FOLDERS}}
+        return {'outputs': {name: tree_key(ctx.dest / name) for name in PROMPT_ARGS}}
 
 
 def fsr4_platform():
