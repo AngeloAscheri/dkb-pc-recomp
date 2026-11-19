@@ -12,6 +12,7 @@ The files are read from raw.githubusercontent.com at the tag, a public download 
 saved next to the libraries (its MIT part asks that the notice go with copies).
 """
 import hashlib
+import http.client
 import os
 import urllib.error
 import urllib.request
@@ -30,6 +31,10 @@ FILES = (
 )
 CHUNK = 1 << 20
 TIMEOUT = 60
+# What a download can raise besides our own refusal: a connection or HTTP error (URLError, a subclass of OSError), a
+# reply cut short or garbled (http.client.HTTPException: IncompleteRead on a chunked or proxied reply), a file that
+# cannot be written or renamed (OSError).
+NET_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError)
 
 
 class FetchError(Exception):
@@ -58,16 +63,20 @@ def _get(url, size, sha, out, progress=None, base=None):
                 f.write(block)
                 if progress:
                     progress((base or 0) + got)
-    except (urllib.error.URLError, OSError) as e:
+    except NET_ERRORS as e:
         part.unlink(missing_ok=True)
-        raise FetchError(out.name, str(getattr(e, 'reason', e))) from e
+        raise FetchError(out.name, str(getattr(e, 'reason', e)) or type(e).__name__) from e
     except FetchError:
         part.unlink(missing_ok=True)
         raise
     if got != size or h.hexdigest() != sha:
         part.unlink(missing_ok=True)
         raise FetchError(out.name, f'{got} bytes with SHA-256 {h.hexdigest()}, expected {size} bytes with {sha}')
-    os.replace(part, out)
+    try:
+        os.replace(part, out)
+    except OSError as e:   # the old file in use (dkb.exe running) or the folder not writable
+        part.unlink(missing_ok=True)
+        raise FetchError(out.name, str(e)) from e
 
 
 def license_text(repo=REPO):
@@ -76,8 +85,8 @@ def license_text(repo=REPO):
     try:
         with urllib.request.urlopen(repo + path, timeout=TIMEOUT) as r:
             data = r.read(size + 1)
-    except (urllib.error.URLError, OSError) as e:
-        raise FetchError('license', str(getattr(e, 'reason', e))) from e
+    except NET_ERRORS as e:
+        raise FetchError('license', str(getattr(e, 'reason', e)) or type(e).__name__) from e
     if len(data) != size or hashlib.sha256(data).hexdigest() != sha:
         raise FetchError('license', f'{len(data)} bytes with SHA-256 {hashlib.sha256(data).hexdigest()}, expected {sha}')
     return data.decode('utf-8')
@@ -100,7 +109,10 @@ def fetch(folder, progress=None, repo=REPO):
     """Fetches the license and the libraries of TAG into folder, each checked before it takes its name. A file
     already there with the pinned hash is kept. progress(done_bytes) reports the bytes fetched so far."""
     folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise FetchError(str(folder), str(e)) from e
     done = 0
     for path, name, size, sha in (LICENSE, *FILES):
         out = folder / name

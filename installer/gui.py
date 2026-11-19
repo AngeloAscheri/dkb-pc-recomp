@@ -437,11 +437,13 @@ class App:
         text.configure(state='disabled')
         result = {}
 
-        def fetch():   # a worker thread: Tk is touched only from show()
+        def fetch():   # a worker thread: Tk is touched only from show(), which waits for result
             try:
                 result['text'] = fsr4.license_text()
             except fsr4.FetchError as error:
                 result['error'] = error.args[1]
+            except Exception as error:   # anything else must not leave the window loading with Accept disabled
+                result['error'] = f'{type(error).__name__}: {error}'
 
         def show():
             if not win.winfo_exists():

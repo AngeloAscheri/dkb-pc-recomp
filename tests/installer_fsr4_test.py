@@ -3,7 +3,8 @@
 The pinned table (LICENSE, FILES) is replaced by stand-ins with their own sizes and hashes. Checked: the license text
 comes back only with its pinned hash; fetch() puts every file in place and installed() then holds; a file already in
 place with its hash is not fetched again; a file whose bytes differ, or that is longer than pinned, is refused and
-leaves no file and no .part behind; a server that does not answer raises FetchError, not an OSError.
+leaves no file and no .part behind; a server that does not answer, a reply cut short (IncompleteRead) and a
+refused rename raise FetchError, not an OSError or an HTTPException.
 """
 import hashlib
 import http.server
@@ -113,6 +114,29 @@ class Fsr4Test(unittest.TestCase):
             fsr4.fetch(self.dir, repo=self.repo)
         with self.assertRaises(fsr4.FetchError):
             fsr4.license_text('http://127.0.0.1:9/')
+
+    def test_cut_reply_and_failed_rename_warn(self):
+        # A reply cut short (http.client.IncompleteRead, an HTTPException, not an OSError) and a rename refused (the old
+        # file in use) must come back as FetchError, which the step turns into a warning, never escape it.
+        import http.client
+        class Cut:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self, n=-1):
+                raise http.client.IncompleteRead(b'partial', 100)
+        with mock.patch.object(fsr4.urllib.request, 'urlopen', return_value=Cut()):
+            with self.assertRaises(fsr4.FetchError):
+                fsr4.license_text(self.repo)
+            with self.assertRaises(fsr4.FetchError):
+                fsr4.fetch(self.dir, repo=self.repo)
+        self.assertEqual([p.name for p in self.dir.iterdir()], [])
+        with mock.patch.object(fsr4.os, 'replace', side_effect=PermissionError('in use')):
+            with self.assertRaises(fsr4.FetchError) as caught:
+                fsr4.fetch(self.dir, repo=self.repo)
+        self.assertIn('in use', caught.exception.args[1])
+        self.assertEqual([p.name for p in self.dir.iterdir()], [])   # no .part left
 
     def test_pinned_release(self):
         self.pins.stop()   # the real table: one release, AMD's repository at its tag, every file with a hash
