@@ -310,7 +310,11 @@ void kern_host_left(void *thread);                         // back at depth 0 wi
 int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
                                                            // asynchronous preemption counters)
-void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present
+// perf_present, every present: closes the frame's core wait counters (kernel.c); log bit 0 logs this frame, bit 1 the
+// window since the previous bit-1 call.
+void kern_core_waits_frame(uint64_t frame, uint64_t interval_ns, int log);
+void kern_core_waits_exit(void);                           // the run's core wait counters (TOTK_TRACE=perf, at exit)
+void kern_sched_report(uint64_t frame);                   // TOTK_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
 struct IpcSession;

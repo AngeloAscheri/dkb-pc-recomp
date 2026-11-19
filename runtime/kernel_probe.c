@@ -651,6 +651,85 @@ static int cmp_u64(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
+// ---- costs the kernel's scheduling pays, printed only (no pass or fail; the numbers depend on the machine): a clock
+// read (kernel.c's core wait counters take a few per wait), a stop and resume of a running thread as the asynchronous
+// preemption does it (kernel.c ap_try: plat_intr_stop, plat_intr_resume, without and with a context write), and a
+// wake-up through a condition variable to a thread blocked on it (kernel.c wake to the waiter's return from block).
+static volatile int g_spin_stop, g_pp_turn;
+static PlatIntr *volatile g_spin_intr;
+static PlatMutex g_ppm = PLAT_MUTEX_INIT;
+static PlatCond g_ppc[2] = {PLAT_COND_INIT, PLAT_COND_INIT};
+static uint64_t g_pp_sent;
+static uint64_t g_pp_lat[400];
+
+static void bench_spinner(void *arg) {
+    (void)arg;
+    g_spin_intr = plat_intr_self();
+    while (!__atomic_load_n(&g_spin_stop, __ATOMIC_RELAXED)) plat_pause();
+}
+
+static void bench_ponger(void *arg) {   // side 1: waits for its turn, notes the wake latency, gives the turn back
+    (void)arg;
+    plat_mutex_lock(&g_ppm);
+    for (int i = 0; i < 400; i++) {
+        while (g_pp_turn != 1) plat_cond_wait(&g_ppc[1], &g_ppm);
+        g_pp_lat[i] = plat_now_ns() - g_pp_sent;
+        g_pp_turn = 0;
+        plat_cond_signal(&g_ppc[0]);
+    }
+    plat_mutex_unlock(&g_ppm);
+}
+
+static void bench_sched(void) {
+    enum { CLK = 1000000, STOPS = 400 };
+    uint64_t t0 = plat_now_ns(), sink = 0;
+    for (int i = 0; i < CLK; i++) sink += plat_now_ns();
+    double clk = (double)(plat_now_ns() - t0) / CLK;
+    g_spin_stop = 0;
+    PlatThread *s = plat_thread_new(bench_spinner, NULL, "probe-kernel spinner");
+    while (s && !g_spin_intr) plat_yield();
+    static uint64_t a[STOPS], b[STOPS];
+    int ok = s && g_spin_intr;
+    for (int i = 0; ok && i < STOPS; i++) {
+        uint64_t rip, rsp, x = plat_now_ns();
+        ok = plat_intr_stop(g_spin_intr, &rip, &rsp);
+        if (ok) plat_intr_resume(g_spin_intr, 0);
+        uint64_t y = plat_now_ns();
+        if (ok) ok = plat_intr_stop(g_spin_intr, &rip, &rsp);
+        if (ok) plat_intr_resume(g_spin_intr, rip);   // a context write sending it back where it was
+        a[i] = y - x, b[i] = plat_now_ns() - y;
+        plat_sleep_ns(20000);
+    }
+    g_spin_stop = 1;
+    if (s) plat_thread_join(s);
+    if (g_spin_intr) plat_intr_free(g_spin_intr);
+    if (ok) {
+        qsort(a, STOPS, sizeof *a, cmp_u64);
+        qsort(b, STOPS, sizeof *b, cmp_u64);
+    }
+    PlatThread *p = plat_thread_new(bench_ponger, NULL, "probe-kernel ponger");
+    plat_mutex_lock(&g_ppm);
+    for (int i = 0; p && i < 400; i++) {
+        plat_mutex_unlock(&g_ppm);
+        plat_sleep_ns(i & 1 ? 0 : 50000);   // half the wake-ups find the waiter asleep a while, half just after
+        plat_mutex_lock(&g_ppm);
+        g_pp_sent = plat_now_ns();
+        g_pp_turn = 1;
+        plat_cond_signal(&g_ppc[1]);
+        while (g_pp_turn != 0) plat_cond_wait(&g_ppc[0], &g_ppm);
+    }
+    plat_mutex_unlock(&g_ppm);
+    if (p) {
+        plat_thread_join(p);
+        qsort(g_pp_lat, 400, sizeof *g_pp_lat, cmp_u64);
+    }
+    printf("  scheduling costs: clock read %.1f ns; stop and resume of a running thread %s median %.1f us p90 %.1f max "
+           "%.1f, with a context write median %.1f us p90 %.1f max %.1f; condition variable wake-up median %.1f us p90 "
+           "%.1f max %.1f (%llu)\n", clk, ok ? "" : "(failed)", a[STOPS / 2] / 1e3, a[STOPS * 9 / 10] / 1e3,
+           a[STOPS - 1] / 1e3, b[STOPS / 2] / 1e3, b[STOPS * 9 / 10] / 1e3, b[STOPS - 1] / 1e3, g_pp_lat[200] / 1e3,
+           g_pp_lat[360] / 1e3, g_pp_lat[399] / 1e3, (unsigned long long)(sink & 1));
+}
+
 static void test_platform(void) {
     PlatThread *t = plat_thread_new(plat_worker, (void *)(intptr_t)1, "probe-kernel plat");
     CHECK(t, "plat_thread_new");
@@ -686,6 +765,7 @@ static void test_platform(void) {
     qsort(over, N, sizeof *over, cmp_u64);
     printf("  plat_sleep_ns(1 ms) overshoot: median %.3f ms, max %.3f ms\n", over[N / 2] / 1e6, over[N - 1] / 1e6);
     CHECK(over[N / 2] < 500000, "plat_sleep_ns(1 ms) median overshoot %.3f ms (want < 0.5)", over[N / 2] / 1e6);
+    bench_sched();
 }
 
 int probe_kernel(void) {

@@ -50,6 +50,14 @@ static const char *const s_name[S_N] = {"off", "run", "core", "host", "sleep", "
 typedef struct Event { int signaled, refs; } Event;
 typedef struct Fiber Fiber;
 
+// Core wait counters (see "core wait counters" below): what a ready thread waited for. A core wait is classed by the
+// holders of the cores the thread may run on, as core_kick left them when the wait began: a worse holder asked to give
+// its core up while it ran lifted code (CW_WORSE_GAME) or while it was in a host call or SVC (CW_WORSE_HOST), holders of
+// equal priority and none worse (CW_EQ), only better holders (CW_BETTER), or worse holders all claimed by better
+// waiters (CW_NOCORE). CW_WAKE is the time from a wake-up (wake) until the woken host thread runs again holding G;
+// CW_LOCK the time a thread blocked on a guest mutex until the mutex was handed to it.
+enum { CW_WORSE_GAME, CW_WORSE_HOST, CW_EQ, CW_BETTER, CW_NOCORE, CW_WAKE, CW_LOCK, CW_N };
+
 struct RtThread {
     int preempt;               // first member: rt_dispatch reads it (host.h kern_preempt_pending)
     int host_depth;            // second member: host calls and SVCs in progress, while kern_host_track (host.h)
@@ -105,6 +113,15 @@ struct RtThread {
     uint32_t dg_svc;           // the thread's latest SVC (TOTK_CORE_DIAG: what an owner in a host call is in)
     struct DgRel { uint64_t kick, host_end, pc, lr; int host, pre, prio; uint32_t h; } dg_rel;   // as a waiter: the
                                                                                                  // owner that released
+    // core wait counters (holding G)
+    uint64_t cw_woke_at;       // when wake() ended the current wait
+    uint64_t cw_core0;         // set by block: the core wait that follows starts here
+    int cw_blk;                // set by block for core_take: 1 after a wait that timed out, 2 after a wake-up
+    uint64_t cw_ap_at;         // as a core waiter: when its first asynchronous preemption was sent
+    int cw_prio;               // as a core waiter: its priority in the latest core_kick
+    int cw_rel;                // as a core waiter: how the core it got was given up (CW_REL_*)
+    uint64_t cs_epoch;         // the main thread's wait the cs_ counts belong to (g_cw_epoch)
+    uint64_t cs_ns[CW_N], cs_n[CW_N], cs_max[CW_N];   // this thread's waits during that wait of the main thread
 };
 
 static PlatMutex G = PLAT_MUTEX_INIT;
@@ -146,6 +163,7 @@ typedef struct { int st; uint32_t waker; uint64_t obj, ns; } WaitRec;
 static WaitRec g_rw[RW_N], g_mw[RW_N];                   // the render and main thread's waits by object and waker
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
+static int g_cw_on = 1;   // core wait counters on (TOTK_CORE_WAITS, read at each present by kern_core_waits_frame)
 
 static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t ns) {
     for (int i = 0; i < RW_N; i++)
@@ -234,6 +252,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->woke = 1;
     t->wres = res;
     t->waker = tcur ? tcur->handle : 0;
+    if (g_cw_on) t->cw_woke_at = kern_now_ns();
     if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
     if (g_crit_on) crit_add(CRIT_WAKE, t->handle, t->waker, 0, 0, t->wake_at);
     plat_cond_signal(&t->cv);
@@ -313,6 +332,191 @@ static int cores_enabled(void) {
 }
 
 static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) & 1); }
+
+// ---- core wait counters (on by default; TOTK_CORE_WAITS=0 turns them off, =ab on in the B blocks of TOTK_AB only)
+// How long ready threads wait for a virtual core, by what holds the cores they may use (CW_*), and how much of it lies
+// on the frame's critical path, taken as the main thread and the threads whose signal ends its waits: a waker's own
+// core waits, wake-ups and mutex waits count when they fall inside the main thread's wait it ended (one level: the
+// waker's own wakers are not followed). Horizon gives a core to a strictly better ready thread at once (KScheduler
+// UpdateHighestPriorityThreads and the reschedule interrupt), so CW_WORSE_GAME on that path is time the console does
+// not spend; it leaves an equal-priority thread running until it blocks or yields, as core_kick does (CW_EQ). Two clock
+// reads per blocking wait (block start, return from the wake-up), one in wake(), two per core wait that does not find
+// a free core; everything else is additions under G. TOTK_TRACE=perf logs a line per slow frame
+// (TOTK_PERF_SLOW_MS), the totals every 60 presents and at exit.
+enum { CW_REL_YIELD, CW_REL_CHECKPOINT, CW_REL_ASYNC };   // how an owner gave its core up: blocked or yielded, at a
+                                                          // checkpoint (SVC or indirect call), interrupted (kern_ap_yield)
+static const char *const cw_name[CW_N] = {"worse-game", "worse-host", "equal", "better", "nocore", "wake", "lock"};
+typedef struct { uint64_t n, ns, max; } CwStat;
+typedef struct {
+    CwStat all[CW_N], crit[CW_N];   // every thread; the main thread and its wakers
+    uint64_t frames, main_ns, handoffs, worse_wake, rel[3];
+    uint64_t stops, stop_ns, stop_max, sent, sent_n, sent_ns, sent_max;   // asynchronous preemption: stop and resume
+                                                                          // pairs and their system calls, interruptions
+                                                                          // sent, sent until the waiter got a core
+    struct { uint32_t h; int prio; uint64_t ns; } wk[4];   // the main thread's wakers by the wait they ended
+} CwAcc;
+static CwAcc g_cwf, g_cww, g_cwr;   // this frame, this 60-present window, the run
+static uint64_t g_cw_epoch, g_cw_main_t0;   // the main thread's current wait: its number and start (0: not waiting)
+static int g_kick_op[NCORE], g_put_why;   // core_kick: the holders' priorities; core_put: how the core is given up (CW_REL_*)
+static int g_cw_mode = -1;
+
+static void cw_stat(CwStat *s, uint64_t d) {
+    s->n++;
+    s->ns += d;
+    if (d > s->max) s->max = d;
+}
+
+// One wait of class k on thread t over [a, b] (holding G).
+static void cw_add(RtThread *t, int k, uint64_t a, uint64_t b) {
+    uint64_t d = b > a ? b - a : 0;
+    cw_stat(&g_cwf.all[k], d);
+    if (t->is_main) {   // its own mutex waits are what the path is made of, not a part of it
+        if (k != CW_LOCK) cw_stat(&g_cwf.crit[k], d);
+        return;
+    }
+    if (!g_cw_main_t0) return;
+    if (t->cs_epoch != g_cw_epoch) {
+        memset(t->cs_ns, 0, sizeof t->cs_ns);
+        memset(t->cs_n, 0, sizeof t->cs_n);
+        memset(t->cs_max, 0, sizeof t->cs_max);
+        t->cs_epoch = g_cw_epoch;
+    }
+    uint64_t s = a > g_cw_main_t0 ? a : g_cw_main_t0;   // only the part inside the main thread's wait
+    if (b <= s) return;
+    t->cs_ns[k] += b - s;
+    t->cs_n[k]++;
+    if (b - s > t->cs_max[k]) t->cs_max[k] = b - s;
+}
+
+// The class of t's core wait, right after core_kick claimed (or did not claim) a holder for it.
+static int cw_class(const RtThread *t) {
+    if (t->target) return __atomic_load_n(&t->target->host_depth, __ATOMIC_RELAXED) > 0 ? CW_WORSE_HOST : CW_WORSE_GAME;
+    int worse = 0, eq = 0;
+    for (int i = 0; i < NCORE; i++)
+        if (core_allowed(t, i) && g_core_owner[i]) {
+            worse |= g_kick_op[i] > t->cw_prio;
+            eq |= g_kick_op[i] == t->cw_prio;
+        }
+    return worse ? CW_NOCORE : eq ? CW_EQ : CW_BETTER;
+}
+
+// The main thread blocks (t0) and comes back with its core (now), woken by t->waker or not (holding G): the waker's
+// waits inside this one go to the critical path.
+static void cw_main_end(RtThread *t, uint64_t t0, uint64_t now) {
+    g_cw_main_t0 = 0;
+    g_cwf.main_ns += now - t0;
+    RtThread *x = t->waker ? h_peek(t->waker, O_THREAD) : NULL;
+    if (!x || x == t) return;
+    if (x->cs_epoch == g_cw_epoch)
+        for (int k = 0; k < CW_N; k++) {
+            CwStat *s = &g_cwf.crit[k];
+            s->n += x->cs_n[k];
+            s->ns += x->cs_ns[k];
+            if (x->cs_max[k] > s->max) s->max = x->cs_max[k];
+        }
+    int i = 0, lo = 0;
+    for (; i < 4 && g_cwf.wk[i].h && g_cwf.wk[i].h != x->handle; i++)
+        if (g_cwf.wk[i].ns < g_cwf.wk[lo].ns) lo = i;
+    if (i == 4) {   // full: the smallest goes if this waker already has more
+        if (g_cwf.wk[lo].ns >= now - t0) return;
+        i = lo;
+        g_cwf.wk[i].ns = 0;
+    }
+    g_cwf.wk[i].h = x->handle;
+    g_cwf.wk[i].prio = x->prio;
+    g_cwf.wk[i].ns += now - t0;
+}
+
+static void cw_merge(CwAcc *d, const CwAcc *s) {
+    for (int k = 0; k < CW_N; k++)
+        for (int c = 0; c < 2; c++) {
+            CwStat *a = c ? &d->crit[k] : &d->all[k];
+            const CwStat *b = c ? &s->crit[k] : &s->all[k];
+            a->n += b->n;
+            a->ns += b->ns;
+            if (b->max > a->max) a->max = b->max;
+        }
+    d->frames += s->frames;
+    d->main_ns += s->main_ns;
+    d->handoffs += s->handoffs;
+    d->worse_wake += s->worse_wake;
+    for (int i = 0; i < 3; i++) d->rel[i] += s->rel[i];
+    d->stops += s->stops;
+    d->stop_ns += s->stop_ns;
+    if (s->stop_max > d->stop_max) d->stop_max = s->stop_max;
+    d->sent += s->sent;
+    d->sent_n += s->sent_n;
+    d->sent_ns += s->sent_ns;
+    if (s->sent_max > d->sent_max) d->sent_max = s->sent_max;
+}
+
+static int cw_classes(char *s, size_t size, const CwStat *st) {
+    int o = 0;
+    for (int k = 0; k < CW_N && o < (int)size; k++)
+        o += snprintf(s + o, size - o, "%s%s %.2f ms %llu max %.3f", k ? ", " : "", cw_name[k], st[k].ns / 1e6,
+                      (unsigned long long)st[k].n, st[k].max / 1e6);
+    return o;
+}
+
+static void cw_log(const char *what, const CwAcc *a) {
+    char all[640], crit[640];
+    cw_classes(all, sizeof all, a->all);
+    cw_classes(crit, sizeof crit, a->crit);
+    rt_log("kernel: core waits %s: %llu frames, main thread waited %.2f ms; critical path: %s; all threads: %s; "
+           "lock hand-offs %llu; worse-game waits after a wake-up %llu, ended by the holder blocking or yielding %llu, at "
+           "a checkpoint %llu, interrupted %llu; asynchronous preemption: %llu stops, system calls avg %.1f us max %.1f "
+           "us, %llu sent, sent to core avg %.1f us max %.1f us (%llu)",
+           what, (unsigned long long)a->frames, a->main_ns / 1e6, crit, all, (unsigned long long)a->handoffs,
+           (unsigned long long)a->worse_wake, (unsigned long long)a->rel[0], (unsigned long long)a->rel[1],
+           (unsigned long long)a->rel[2], (unsigned long long)a->stops, a->stops ? a->stop_ns / 1e3 / a->stops : 0.0,
+           a->stop_max / 1e3, (unsigned long long)a->sent, a->sent_n ? a->sent_ns / 1e3 / a->sent_n : 0.0,
+           a->sent_max / 1e3, (unsigned long long)a->sent_n);
+}
+
+void kern_core_waits_frame(uint64_t frame, uint64_t interval_ns, int log) {
+    if (g_cw_mode < 0) {
+        g_cw_mode = rt_knob("CORE_WAITS", "1");
+        if (g_cw_mode != 1)
+            rt_log("kernel: core wait counters %s (TOTK_CORE_WAITS)", g_cw_mode ? "in the B blocks of TOTK_AB" : "off");
+    }
+    CwAcc f, w = {0};
+    lock();
+    g_cw_on = RT_KNOB_ON(g_cw_mode);
+    g_cwf.frames = 1;
+    f = g_cwf;
+    memset(&g_cwf, 0, sizeof g_cwf);
+    cw_merge(&g_cww, &f);
+    cw_merge(&g_cwr, &f);
+    int win = (log & 2) != 0;
+    if (win) {
+        w = g_cww;
+        memset(&g_cww, 0, sizeof g_cww);
+    }
+    unlock();
+    if (log & 1) {
+        char what[160];
+        int o = snprintf(what, sizeof what, "frame %llu (%.1f ms) main's wakers", (unsigned long long)frame,
+                         interval_ns / 1e6);
+        for (int i = 0; i < 4 && f.wk[i].h && o < (int)sizeof what; i++)
+            o += snprintf(what + o, sizeof what - o, " %#x p%d %.1f", f.wk[i].h, f.wk[i].prio, f.wk[i].ns / 1e6);
+        cw_log(what, &f);
+    }
+    if (win) {
+        char what[64];
+        snprintf(what, sizeof what, "frames to %llu", (unsigned long long)frame);
+        cw_log(what, &w);
+    }
+}
+
+void kern_core_waits_exit(void) {   // on an exit path: a lock that stays held does not stop the exit
+    int got = 0;
+    for (int i = 0; i < 200 && !(got = plat_mutex_trylock(&G)); i++) plat_sleep_ms(1);
+    if (!got) return;
+    CwAcc r = g_cwr;
+    cw_merge(&r, &g_cwf);
+    unlock();
+    cw_log("run total (exit)", &r);
+}
 
 // ---- asynchronous preemption (TOTK_ASYNC_PREEMPT, on unless 0)
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ 33e8fa8 (8bf0893, PR #488; MIT, Copyright (c) 2026
@@ -685,6 +889,16 @@ static int ap_try(RtThread *w) {
         g_ap_sent++;
         r = AP_SENT;
     }
+    if (g_cw_on) {   // core wait counters: the cost of a stop and resume, and when the first interruption went out
+        uint64_t d = kern_now_ns() - now;
+        g_cwf.stops++;
+        g_cwf.stop_ns += d;
+        if (d > g_cwf.stop_max) g_cwf.stop_max = d;
+        if (r == AP_SENT) {
+            g_cwf.sent++;
+            if (!w->cw_ap_at) w->cw_ap_at = now;
+        }
+    }
     if (r == AP_SENT && g_ap_log < AP_LOG_N) {
         g_ap_log++;
         rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
@@ -1047,6 +1261,7 @@ static void core_grant(int c) {
     g_core_owner[c] = b;
     core_count();
     if (g_diag > 0) b->dg_rel = g_dg_rel;
+    b->cw_rel = g_put_why;
     if (rt_trace & RT_TRACE_SCHED) b->grant_at = kern_now_ns();
     plat_cond_signal(&b->cv);
 }
@@ -1089,9 +1304,10 @@ static int core_better_waiter(const RtThread *t, int c) {
 static void core_kick(void) {
     RtThread *w[64];
     int wp[64], op[NCORE], n = 0, claimed = 0;
-    for (int i = 0; i < NCORE; i++) op[i] = g_core_owner[i] ? prio_of(g_core_owner[i]) : 0;
+    for (int i = 0; i < NCORE; i++) g_kick_op[i] = op[i] = g_core_owner[i] ? prio_of(g_core_owner[i]) : 0;
     for (RtThread *p = g_core_wait; p && n < 64; p = p->cnext) {
         int i = n++, pp = prio_of(p);
+        p->cw_prio = pp;
         for (; i > 0 && (wp[i - 1] > pp || (wp[i - 1] == pp && w[i - 1]->cseq > p->cseq)); i--) {
             w[i] = w[i - 1];
             wp[i] = wp[i - 1];
@@ -1142,6 +1358,10 @@ static void core_take(RtThread *t) {
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++)
         if (core_allowed(t, i) && !g_core_owner[i]) c = i;
+    int blk = t->cw_blk;   // core wait counters: 1 after a blocking wait that timed out, 2 after a wake-up (block)
+    uint64_t c0 = t->cw_core0;
+    t->cw_blk = 0;
+    t->cw_core0 = 0;
     if (c >= 0) {
         t->cur_core = c;
         g_core_owner[c] = t;
@@ -1160,6 +1380,12 @@ static void core_take(RtThread *t) {
     }
     core_kick();
     if (g_diag > 0) t->dg_cls = dg_class0(t);
+    int cls = -1;
+    if (g_cw_on) {
+        cls = cw_class(t);
+        if (!c0) c0 = kern_now_ns();
+        t->cw_ap_at = 0;
+    }
     if (g_ap_int && t->target && t->cur_core < 0) {   // most waits end within microseconds: spin before interrupting
         uint64_t end = kern_now_ns() + AP_FIRST_NS;
         unlock();
@@ -1181,6 +1407,22 @@ static void core_take(RtThread *t) {
         }
     }
     if (g_diag > 0) dg_done(t);
+    if (cls >= 0) {
+        uint64_t now = kern_now_ns();
+        cw_add(t, cls, c0, now);
+        if (cls == CW_WORSE_GAME) {
+            g_cwf.rel[t->cw_rel]++;
+            g_cwf.worse_wake += blk == 2;
+        }
+        if (t->cw_ap_at) {   // an asynchronous preemption was sent for this wait: from then until the core
+            uint64_t d = now - t->cw_ap_at;
+            g_cwf.sent_n++;
+            g_cwf.sent_ns += d;
+            if (d > g_cwf.sent_max) g_cwf.sent_max = d;
+            t->cw_ap_at = 0;
+        }
+        if (t->is_main && !blk) g_cwf.main_ns += now - c0;   // inside block, cw_main_end counts the whole wait
+    }
     if (t->grant_at) {
         uint64_t d = kern_now_ns() - t->grant_at;
         t->lg_ns += d;
@@ -1195,11 +1437,28 @@ static void core_take(RtThread *t) {
 static uint32_t block(RtThread *t, int kind, int64_t ns) {
     t->waker = 0;
     if (ns == 0) return block_inner(t, kind, ns);
+    uint64_t t0 = g_cw_on ? kern_now_ns() : 0;   // core wait counters
+    if (t0 && t->is_main) {
+        g_cw_epoch++;
+        g_cw_main_t0 = t0;
+    }
+    t->cw_woke_at = 0;
     core_put(t);
     acct(t, st_of(kind));
     t->nblk++;
     uint32_t r = block_inner(t, kind, ns);
+    if (t0) {
+        uint64_t now = kern_now_ns();
+        t->cw_blk = 1;
+        if (t->cw_woke_at) {   // woken, not timed out
+            t->cw_blk = 2;
+            cw_add(t, CW_WAKE, t->cw_woke_at, now);
+            if (kind == W_LOCK) cw_add(t, CW_LOCK, t0, t->cw_woke_at);
+        }
+        t->cw_core0 = now;
+    }
     core_take(t);
+    if (t0 && t->is_main) cw_main_end(t, t0, kern_now_ns());
     return r;
 }
 
@@ -1284,7 +1543,9 @@ void kern_checkpoint(void) {
         t->preempt = 0;
         g_ap_deferred++;
     } else if (better) {
+        g_put_why = CW_REL_CHECKPOINT;
         core_put(t);   // clears preempt (after the sched trace reads it)
+        g_put_why = CW_REL_YIELD;
         core_take(t);
     } else {
         t->preempt = 0;
@@ -1309,7 +1570,9 @@ void kern_ap_yield(void) {
             t->dg_lr = t->cur->x[30];
         }
         g_ap_taken++;
+        g_put_why = CW_REL_ASYNC;
         core_put(t);
+        g_put_why = CW_REL_YIELD;
         core_take(t);
     }
     unlock();
@@ -1319,7 +1582,9 @@ void kern_ap_yield(void) {
 static void ap_sync(RtThread *t) {
     lock();
     if (g_ap > 0 && t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) {
+        g_put_why = CW_REL_CHECKPOINT;
         core_put(t);
+        g_put_why = CW_REL_YIELD;
         core_take(t);
     }
     unlock();
@@ -1547,6 +1812,7 @@ static void lock_handoff(uint64_t addr) {
             break;
         }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
+    g_cwf.handoffs++;
     wake(w, 0);
 }
 

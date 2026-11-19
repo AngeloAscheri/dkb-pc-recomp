@@ -73,6 +73,13 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   best waiter, and one inside an SDK spin lock (TLR+0x100 `disable_count`) is not preempted: its interrupt flag is set
   and the switch happens at SVC 0x36. `TOTK_ASYNC_PREEMPT=2` keeps those two without interrupting. The interruption is
   Win32 (SuspendThread, SetThreadContext); another host needs a signal handler there, as MacNativeGames has.
+- Core wait counters (on unless `TOTK_CORE_WAITS=0`; `ab` for an in-run A/B). Each wait for a core is classed by what
+  holds the cores the thread may use: a worse thread in game code or in a host call (Horizon would have switched at
+  once), an equal one, only better ones; also the host's wake-up latency and guest mutex waits. The waits of the main
+  thread and of the threads whose signal ends its waits count as the frame's critical path. `TOTK_TRACE=perf` logs
+  them for each slow frame (`TOTK_PERF_SLOW_MS`), every 60 presents and at exit. They cost a few clock reads per
+  blocking wait, so they stay on in plain runs, where `TOTK_CORE_DIAG` (holder samples, timed waits, log lines) is
+  for diagnosis runs.
 - Host work gives the core back. Queue submits, presents, GPU waits, shader translation, `nn::fs` calls and NVN memory pool setup run without a core (`NVN_BLOCKING`, `kern_core_away`), as the Switch blocks those threads in IPC, so a thread blocked in the driver or on a file does not hold up guest threads.
 - Spin waits. Loops that only another thread can end (857 in 1.4.3, 864 in 1.2.1, found by `tools/spin_waits.py`, the
   nxnative search) send their back-edges through `rt_spin_gate`, which pauses the core once per pass and hands it to a
