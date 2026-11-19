@@ -2921,16 +2921,20 @@ static BigMirror big_mirror;
 //   fails (staged_import): the uses of its spans must skip them, as those of a pool whose first-use import failed;
 // - fence: from the batch of the first piece of the first staged_fill that will reuse a staging buffer, every upload
 //   batch reads as on a lost device (batch_status, upload_wait_locked): the fill's wait for that buffer must end the
-//   process with the fault report instead of spinning.
-enum { INJECT_NONE, INJECT_IMPORT, INJECT_FENCE };
+//   process with the fault report instead of spinning;
+// - sort: the staged sort thread reads as one that could not be started (st_sort_queue), so the replay thread sorts
+//   every job's owned ranges itself, the fallback a healthy run never takes.
+enum { INJECT_NONE, INJECT_IMPORT, INJECT_FENCE, INJECT_SORT };
 static int staged_inject(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_get("TOTK_STAGED_INJECT");
-        int m = !e || !*e ? INJECT_NONE : !strcmp(e, "import") ? INJECT_IMPORT : !strcmp(e, "fence") ? INJECT_FENCE : -1;
-        if (m < 0) rt_log("mem: TOTK_STAGED_INJECT=%s is not import or fence: ignored", e), m = INJECT_NONE;
+        int m = !e || !*e ? INJECT_NONE : !strcmp(e, "import") ? INJECT_IMPORT : !strcmp(e, "fence") ? INJECT_FENCE
+              : !strcmp(e, "sort") ? INJECT_SORT : -1;
+        if (m < 0) rt_log("mem: TOTK_STAGED_INJECT=%s is not import, fence or sort: ignored", e), m = INJECT_NONE;
         if (m) rt_log("mem: TOTK_STAGED_INJECT=%s: %s", e, m == INJECT_IMPORT ? "staged pools get neither a mirror nor an import"
-                      : "upload batches from a staged first fill's on read as on a lost device");
+                      : m == INJECT_FENCE ? "upload batches from a staged first fill's on read as on a lost device"
+                      : "the staged sort thread is not started, as if it could not be");
         mode = m;
     }
     return mode;
@@ -3270,7 +3274,9 @@ static void st_sorted_wait(const StJob *j, int who) {
 // staged_split_own, the job's list complete: the sort thread takes it (or this thread sorts it, see above).
 static void st_sort_queue(StJob *j) {
     plat_mutex_lock(&SS.lock);
-    if (!SS.t && !SS.failed && !(SS.t = plat_thread_new(st_sorter, NULL, "vk staged sort"))) {
+    // TOTK_STAGED_INJECT=sort: the thread is never asked for, as if plat_thread_new had failed.
+    if (!SS.t && !SS.failed &&
+        (staged_inject() == INJECT_SORT || !(SS.t = plat_thread_new(st_sorter, NULL, "vk staged sort")))) {
         SS.failed = 1;
         rt_log("mem: the staged sort thread could not be started; the replay thread sorts the owned ranges");
     }
