@@ -62,6 +62,15 @@ The log names the layout in effect (`input: gamepad layout ...`); the menu shows
 
 Esc is unbound in the game; it opens the settings menu and releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are the tables of `input_map` in `runtime/input_map.c`: the keys (platform-neutral key ids) and one gamepad table per layout (gamepad inputs by position); `runtime/input_win.c` translates Win32 virtual keys and SDL buttons.
 
+## Two players (Bananza co-op)
+
+With two gamepads connected, the second one is player 2 (`runtime/ov_input.c`, npad No.2 as a Pro Controller): in the
+pause menu, Co-op mode > Share controllers starts the game's controller check, which the host answers with both
+players at once, and player 2 plays Pauline. The first gamepad stays player 1, and a gamepad plugged in while one is
+connected joins as player 2 instead of taking player 1 over. Player 2 uses the gamepad table of its own layout and the
+`bind_` lines, and has no rumble or motion of its own. `coop = 0` (`TOTK_COOP=0`) keeps one controller. Without a
+gamepad on player 1 (keyboard only) there is no player 2. GameShare is not supported.
+
 ## Xbox button prompts
 
 `pad_layout = xbox_prompts` (*Xbox prompts (A right)* on the Controls tab) is for an Xbox pad played by position. The buttons work as with `nintendo`: the right button, labelled B, does Switch A (interact, confirm), and the bottom one, labelled A, does Switch B (run, cancel). The letters the game shows are swapped to match the labels, A with B and X with Y, so each prompt names the button to press. The other layouts leave the prompts alone: with `xbox` the Switch letters already match the labels.
@@ -218,6 +227,10 @@ A wait is reached once the wait before it held (or at the start); the lines befo
 For A/B and image tests, `TOTK_FIXED_STEP=1` (or `DKB_FIXED_STEP=1`) with the real-time step on (`TOTK_REALTIME=1`) steps the game 1/60 s per presented frame whatever the frame took, so game time is frames / 60 in every run: the game runs slower than real time when frames take longer than 1/60 s. Without the real-time step the game already steps whole vsyncs of its own present interval, which its controller can raise when a frame runs late.
 
 `TOTK_INPUT_RECORD=<file>` (`input_record` in `totk.ini`, or Input recording in the menu) writes the merged input in the same format, one line per button press and per stick segment: events before the world clock starts by tick, the rest timed; a button or stick held when the world clock starts is cut there and goes on as a timed event. The file replays as a script, which makes it the repro to attach to a bug report. The recording writes no wait lines: add them by hand where a press must follow a screen, with a `TOTK_TRACE=fs` log of the recorded run for the file and its time.
+
+`DKB_LIVE_INPUT=<file>` drives player 1 from the first line of a file the harness rewrites while the game runs
+(button names as above, `LSTICK:x:y`, `RSTICK:x:y`); `DKB_LIVE_INPUT2=<file>` does the same for player 2, which counts
+as connected while it is set (with `coop = 1`), so the two-player mode can be tested with one gamepad or none.
 
 `TOTK_TEST_PAD=<lx>,<ly>,<rx>,<ry>` attaches an SDL virtual gamepad at start whose sticks rest at these raw SDL axis values (-32768 to 32767, down is +y), so a drifting or held stick can be tested without a controller: the values go through the gamepad mapping and `TOTK_STICK_DEADZONE` like a real pad's, and `TOTK_INPUT_RECORD` shows what reached the game.
 

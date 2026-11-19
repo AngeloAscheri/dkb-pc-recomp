@@ -304,6 +304,9 @@
 # open to pair it with this PC; after that any button reconnects it. Do not pair it in the system's Bluetooth settings.
 # Over USB they work through SDL without this. Takes effect at the next start. docs/controls.md, "Switch 2 controllers".
 # switch2 = 0
+# Two-player mode (Bananza: Pause > Co-op mode > Share controllers, player 2 is Pauline): a second gamepad is player 2
+# while one is connected, and it no longer takes player 1 over when it is plugged in. 0 keeps one controller.
+# coop = 1
 # Which gamepad button is Switch A: nintendo (by position: east A, south B, west Y, north X), xbox (south A, east B,
 # west X, north Y, as an Xbox pad labels them; cross A on a PlayStation pad) or auto (nintendo for a pad with Nintendo
 # labels, xbox for the others). xbox_prompts: the buttons as nintendo, and the game's prompts swapped to the Xbox
