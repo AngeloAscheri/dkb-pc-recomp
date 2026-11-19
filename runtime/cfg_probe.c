@@ -75,6 +75,13 @@ int probe_cfg(void) {
     CHECK(EQ(cfg_get("TOTK_FPS60"), "1"), "DKB_ name wins over the TOTK_ one");
     plat_setenv("DKB_FPS60", NULL);
     plat_setenv("TOTK_FPS60", NULL);
+    // --set KEY=VALUE (main.c, cfg_set_arg): a known ini key wins over a DKB_ variable for the run; unknown keys fail.
+    plat_setenv("DKB_FPS60", "0");
+    CHECK(cfg_set_arg("fps60=1") && cfg_bool("TOTK_FPS60"), "--set fps60=1 overrides DKB_FPS60=0");
+    CHECK(cfg_set_arg("DKB_FIX_LIST_CAP=0") && !strcmp(getenv("DKB_FIX_LIST_CAP"), "0"), "--set with a full name");
+    CHECK(!cfg_set_arg("no_such_key=1") && !cfg_set_arg("fps60") && !cfg_set_arg("=1"), "--set rejects bad input");
+    plat_setenv("TOTK_FPS60", NULL);
+    plat_setenv("DKB_FIX_LIST_CAP", NULL);
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("TOTK_FPS60") == NULL, "missing file leaves no keys");

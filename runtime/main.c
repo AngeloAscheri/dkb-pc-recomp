@@ -488,7 +488,7 @@ static int selftest(void) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--set KEY=VALUE ...] [--version] [--help] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
                     "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --probe-splash | --probe-aoc | --prepare-shaders | --translate-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
@@ -548,6 +548,12 @@ static void require_cpu(void) {
 
 int main(int argc, char **argv) {
     require_cpu();
+    // --set KEY=VALUE first: mem_init and the lines below already read settings.
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--set") && !cfg_set_arg(argv[++i])) {
+            fprintf(stderr, "--set %s: not KEY=VALUE with a known setting (dkb.ini.example lists them)\n", argv[i]);
+            return 2;
+        }
     mem_init();   // first: claim the guest address space before anything else can land there; reads totk.ini
     // Right after the settings can be read and before anything loads or calls the Vulkan loader (SDL's video init,
     // vk_init): the loader reads VK_DRIVER_FILES when it first lists the drivers.
@@ -589,6 +595,17 @@ int main(int argc, char **argv) {
             printf("%s %s (%s %s)\n", rt_game_version ? "totk" : "dkb", rt_port_version,
                    rt_game_version ? "Tears of the Kingdom" : "Donkey Kong Bananza", rt_game_display);
             return 0;
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("%s [--exefs DIR] [--romfs DIR] [--profile DIR] [--set KEY=VALUE ...] [--seconds S [--shot PNG]]\n"
+                   "  --set KEY=VALUE  a dkb.ini setting for this run only (dkb.ini.example lists the keys); the file "
+                   "is not changed\n"
+                   "  --version        the port version and the game it was built for\n"
+                   "  --seconds S      play for S seconds and exit; --shot PNG saves the last frame\n"
+                   "Settings: dkb.ini next to the exe, or the environment (TOTK_ or DKB_ and the key in capitals).\n",
+                   argv[0]);
+            return 0;
+        } else if (!strcmp(argv[i], "--set")) {
+            if (++i == argc) return usage(argv[0]);   // applied at the start of main
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];

@@ -171,6 +171,10 @@ The settings keep TotK Recomp's `TOTK_` names, so its fixes apply without a rena
 
 Command-line options: `--seconds S` stops the run after S seconds of game time, and `--shot frame.png` with it saves
 that frame. A shot is for your own debugging; do not post it if it shows game content.
+`--set KEY=VALUE` (repeatable) gives a `dkb.ini` key, or a full `TOTK_`/`DKB_` variable name, a value for this run
+only, the way the environment would; `dkb.ini` is not changed, and an unknown key stops with exit code 2. A frontend
+can start the game with `dkb.exe --set output_res=2560x1440 --set fps_limit=120`. `--help` lists the options,
+`--version` prints the port version and the game update.
 
 `TOTK_SHOTS=<lo>-<hi>:<step>` saves every step-th present from lo to hi as `f<n>.png` in `TOTK_SHOTS_DIR` (the
 current folder by default), box-filtered to 480x270 (`TOTK_SHOTS_FULL=1`: full size); `TOTK_SHOTS=w<lo>-<hi>:<step>`

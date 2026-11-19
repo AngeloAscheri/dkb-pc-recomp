@@ -370,6 +370,23 @@ unsigned cfg_version(void) { return __atomic_load_n(&version, __ATOMIC_ACQUIRE);
 
 int cfg_from_env(const char *name) { return env_of(name) != NULL; }
 
+int cfg_set_arg(const char *arg) {
+    const char *eq = strchr(arg, '=');
+    char buf[64], var[80];
+    if (!eq || eq == arg || (size_t)(eq - arg) >= sizeof buf) return 0;
+    memcpy(buf, arg, (size_t)(eq - arg));
+    buf[eq - arg] = 0;
+    const char *key = norm_key(buf);
+    if (!*key) return 0;
+    // A full variable name (DKB_FIX_LIST_CAP: the patch sets are read from their own variable) is set as given.
+    if (key != buf) return plat_setenv(buf, eq + 1);
+    if (!is_known(key)) return 0;
+    snprintf(var, sizeof var, "DKB_%s", key);
+    plat_setenv(var, NULL);   // a DKB_ variable would win over the TOTK_ one (dkb_alias)
+    snprintf(var, sizeof var, "%s%s", PREFIX, key);
+    return plat_setenv(var, eq + 1);
+}
+
 void cfg_set(const char *name, const char *value) {
     if (strncmp(name, PREFIX, PREFIX_LEN) || !value) return;
     char key[64];
