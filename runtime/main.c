@@ -599,7 +599,10 @@ int main(int argc, char **argv) {
     log_open(!mode);
     if (!mode) {
         // console = 0: a frontend that starts the game gets no console window in front of the game's (#238).
-        if (!cfg_bool("TOTK_CONSOLE")) plat_console_hide();
+        if (!cfg_bool("TOTK_CONSOLE")) {
+            const char *why = plat_console_hide();
+            if (why) rt_log("console: left as is: %s", why);   // tells #364-style reports which case they hit
+        }
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         rt_boot();
         return 0;
