@@ -1182,6 +1182,9 @@ def clean(dest, temp=None, layout_temp=None):
     if not ours:
         raise InstallError('dkb.temp_unrelated', path=str(folder))
     plain_tree(folder)
+    # A setup running on this folder holds its lock: dkb.busy then. The lock is released before the delete, since
+    # Windows cannot delete a file this process holds open; a setup starting in between is the window that remains.
+    lock_temp(folder).close()
     size = folder_size(folder)
     shutil.rmtree(folder)
     return folder, size
