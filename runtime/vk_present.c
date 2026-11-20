@@ -315,7 +315,11 @@ int vk_present_hdr10(void) { return __atomic_load_n(&g_sc_hdr, __ATOMIC_ACQUIRE)
 // on the window thread, and the driver does not report the swapchain as out of date.
 static int create_swapchain(void) {
     gfx_window_take_dirty();
-    if (g_headless) return build_offscreen();
+    if (g_headless) {
+        int b = build_offscreen();
+        if (!b) gfx_window_mark_dirty();   // a failed build keeps g_sc_n at 0: mark for retry, as the window branch does
+        return b;
+    }
     if (build_swapchain()) return 1;
     gfx_window_mark_dirty();
     return 0;
@@ -730,7 +734,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = g_headless ? 0 : 1,
                         .pWaitSemaphoreInfos = &wait,
-                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
+                        .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = g_headless ? 0 : 1,
                         .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
@@ -846,6 +850,7 @@ void vk_present_release(void) {
         }
         for (uint32_t i = 0; i < g_sc_n; i++) {
             vkDestroySemaphore(c->device, g_render_done[i], NULL);
+            g_render_done[i] = VK_NULL_HANDLE;   // a later offscreen build must create fresh ones
             if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
             g_sc_view[i] = VK_NULL_HANDLE;
             if (g_sc_img_alloc[i]) {   // the offscreen pool's images (g_headless)

@@ -398,6 +398,7 @@ void wsys_client_size(int *w, int *h) {
         return;
     }
     *w = *h = 0;
+    if (!g_win) return;
 #ifdef __APPLE__
     // SDL's Cocoa window calls belong on the thread that initialises video (the process's main thread here), and the
     // present path runs on the game thread: ask the window thread, which is that one.

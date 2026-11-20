@@ -99,7 +99,9 @@ int main(void) {
                              .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     // MoltenVK (macOS) is a portability driver: the loader enumerates its devices only when the instance asks for
-    // the portability subset. The extension is absent from other loaders, so query it first.
+    // the portability subset. Only on macOS: the Khronos loader offers the extension on Windows and Linux too, and
+    // asking there would let a portability-only device through, where none was accepted before (runtime/vk_device.c).
+#ifdef __APPLE__
     {
         PFN_vkEnumerateInstanceExtensionProperties exts = (PFN_vkEnumerateInstanceExtensionProperties)
             gipa(NULL, "vkEnumerateInstanceExtensionProperties");
@@ -118,6 +120,7 @@ int main(void) {
             free(ext_list);
         }
     }
+#endif
     VkInstance inst = VK_NULL_HANDLE;
     VkResult r = create ? create(&ci, NULL, &inst) : VK_ERROR_INITIALIZATION_FAILED;
     if (r != VK_SUCCESS) {

@@ -102,7 +102,7 @@ static const CfgMeta metas[] = {
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"CONSOLE", "1", "0|1", RESTART}, {"WINDOW_MODE", "windowed", "windowed|borderless|fullscreen", LIVE},
     {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
-    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
+    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"HEADLESS", "", NULL, RESTART}, {"GPU_INDEX", "", NULL, RESTART},
     // The path of a Vulkan ICD JSON file ("~" expands) to use instead of the system's drivers; empty: the system's.
     // vk_driver_env.c sets VK_DRIVER_FILES from it before the loader runs.
     {"VULKAN_DRIVER", "", NULL, RESTART},
