@@ -24,7 +24,7 @@ from it may be shared.
 3. To run the build on another of your machines, package a portable folder ([building.md](building.md), "Portable
    folder"). The folder holds game code: for your own machines only.
 4. The installer ([installer.md](installer.md)) is the other route to a machine without the toolchain: it builds the
-   game there from your own files. No installer release is published yet.
+   game there from your own files. Installer packages are on the repository's releases page.
 
 ## Run and collect the log
 

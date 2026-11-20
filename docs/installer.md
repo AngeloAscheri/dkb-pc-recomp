@@ -422,7 +422,7 @@ self-contained image built with `--game dkb` (see above).
 ### Bananza Linux and macOS packages
 
 Preview. `DKB-Setup-<version>-linux-x86_64.tar.gz` and `DKB-Setup-<version>-macos-arm64.zip` are built by
-`tools/make_release_posix.py --platform linux|macos --zip` in `.github/workflows/dkb-release.yml`, next to the Windows
+`tools/make_release_posix.py --platform linux|macos --pack` in `.github/workflows/dkb-release.yml`, next to the Windows
 zip. They carry no binaries and no game data: the player already has the system packages, and the build runs on their
 machine. The folder holds `installer/`, `recomp/`, `tools/` (with the translator and its vendored sources), every
 `runtime/` source and header, `data/`, `licenses/`, `THIRD_PARTY_NOTICES.md`, `LICENSE*`, `VERSION` (version and commit, as
@@ -458,8 +458,9 @@ Xft against the sniper sysroot so Russian text uses system TrueType fonts. The s
 
 The same script with `--game dkb` builds the Bananza folder (`DKB-Setup-x86_64.AppImage`): the same `python/`, `llvm/`
 and sysroot, no hactool, `runtime/libtotkrt.a` built from `generated/dkb100`, and the Bananza installer, which links that
-library instead of compiling `runtime/` from source. It needs a lifted game and .NET 10 at pack time and is built by
-hand, not in CI; the AppImage entry is `python/bin/python3 -m installer.gui` and `--check` and `--prove` apply as above.
+library instead of compiling `runtime/` from source. It needs a lifted game (or `--stub`, which builds the library
+against `tools/ci/stub/dkb100`) and .NET 10 at pack time. The release workflow (`.github/workflows/dkb-release.yml`)
+builds it with `--stub` and publishes it with a `.tar.gz` of the same folder (`--tarball`); the AppImage entry is `python/bin/python3 -m installer.gui` and `--check` and `--prove` apply as above.
 
 ```
 AppRun                starts python/bin/python3 -m installer.gui (no bytecode written into the read-only mount)
@@ -480,7 +481,8 @@ bin/                  totk_xlate, hactool, ninja, libSDL3.so.0
   SteamOS 3): the official LLVM binaries and the `cryptography` wheel are built against it. `make_release_linux.py`
   checks every ELF file in the folder against that floor (`check_glibc`), and the setup's check step stops with one
   message on an older system.
-- The setup's temp folder is `.setup-temp` inside the install folder (`--temp` changes it): the AppImage is mounted
+- The setup's temp folder (`--temp` changes it) is `.setup-temp` inside the install folder for TotK. For Bananza it is
+  `.dkb-setup` beside the install folder (AppImage), or `build/install-temp` in a source package. The AppImage is mounted
   read-only, and a Steam Deck's `/home` is often too full for the generated C while the game goes to the SD card.
 - The game keeps Mesa's shader cache in `mesa-cache` beside `totk` unless `MESA_SHADER_CACHE_DIR` is set, for the
   same reason: RADV fills its default folder in `~/.cache` up to 1 GB. The game raises that cap to 10 GiB
