@@ -27,6 +27,7 @@
 - #436 Two off-by-default scheduler settings against mutex convoys: `sched_handoff = 1` hands the core to a woken thread as an SVC returns, and `mutex_spin = <us>` polls briefly before a wait sleeps (@wrothgaril)
 - Performance presets: `preset = 1..5` (Minimum to Ultra) or `recommended`, which picks a level from the GPU's video memory, the RAM and the processor count at start. A preset only fills in defaults, so any option you set yourself still wins. The F1 menu has a Preset row.
 - `dlss_mode` picks the DLSS, FSR 3.1 and FSR 4 quality mode by name (DLAA, Quality, Balanced, Performance, Ultra Performance) while `scene_res` is `auto`.
+- #443 The pool guard at `main+0x429594` (3.2.0; 1.0.0 `main+0x410794`) checks the element it loads, not only the array: a new guard kind `load` (thanks @Felitendo for the disassembly)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 
 New files in the package table of that release:
