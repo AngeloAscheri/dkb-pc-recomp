@@ -38,7 +38,7 @@ static const char *const known[] = {
     "BIND_ZL", "BIND_ZR", "BLOCK_VIEWS_3D", "CLOTH_REALTIME", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_GAMMA", "COLOR_PRESET", "COLOR_SATURATION", "CORE_DIAG", "CORE_WAITS", "CRIT", "CRUMB_BIND", "CRIT_OUT", "CRT_FILTER", "CRT_LINES", "DESC_C0_SERIAL", "DESC_KEEP", "DESC_SAMP_GEN", "DESC_STAGE_ORIGIN", "DESC_TD_HASH", "DESC_TEMPLATE", "DEVICE_PROFILE", "DLSS_MODE", "PRESET", "DLSS_PRESET", "DLSS_WARM_FULL", "DRAW_MERGE", "DRAW_PROFILE", "DUMP", "DUMP_BUF", "DUMP_DIR", "DUMP_LOG", "DYN_KEEP", "DYN_UBO",
     "EXEFS", "EXPERIMENTAL_GEOMETRY", "FEEDBACK", "FIXED_STEP", "FIX_C0", "FIX_INDIRECT_RESET", "FIX_LQ_FOLD", "FIX_SCREEN_UV", "FIX_VS_FAULT", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES", "FLIGHT_SPIKE_MS",
     "FLIGHT_THUMBS", "CONSOLE", "COOP", "FMZ", "FMZ_SEL", "FOV", "FOV_PATCH", "FPS60", "FPS_LIMIT", "FRAME_GEN", "FRAME_GEN_BY", "FREEZE_IDLE", "FRZ_WHOLE", "FSR4_LDR", "FSR_DIR", "FREE_CORES", "FULLSCREEN", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_CHECKPOINTS", "GPU_HANG_S",
-    "GPU_INDEX", "GPU_NAME", "GS_STORAGE_WRITEBACK", "HDR", "HDR_GAME_NITS", "HDR_NATIVE", "HDR_PEAK_NITS", "HDR_SHOULDER", "HDR_TRACE", "HDR_UI_NITS", "HEAP_LAZY", "HIGHFPS_FIX", "HOST_PROPS_CACHE", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
+    "GPU_INDEX", "GPU_NAME", "GS_STORAGE_WRITEBACK", "HDR", "HDR_GAME_NITS", "HDR_NATIVE", "HDR_PEAK_NITS", "HDR_SHOULDER", "HDR_TRACE", "HDR_UI_NITS", "HEADLESS", "HEAP_LAZY", "HIGHFPS_FIX", "HOST_PROPS_CACHE", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
     "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LIST_RESTART", "LOCALE", "LOCK_HOLDS", "LOD_GUARD", "LOOKAHEAD", "MEMORY", "MEM_AVAIL_RESERVE_MB", "MEM_COMMIT_RESERVE_MB", "MEM_REPORT", "MEM_TRIM", "MENU_LANG", "MENU_THEME", "MENU_TEST",
     "MENU_TEST_DIR", "MENU_TEST_SET", "MERGE_STATS", "MINIMAL_LAYOUT", "MIRROR_GAP", "MIRROR_OWN", "MIRROR_PRESNAP", "MIRROR_STAGED", "MOTION", "MOUSE_CAMERA", "MOUSE_SENS", "MOVIE_HOST", "MOVIE_PACE", "MUTEX_SPIN", "MVK_UPSCALE_BLIT", "NAN_GUARD", "NATIVE_GS", "NX2_READ_NOWAIT",
     "NVN2_MODE_TRACE", "NVN2_MODE_TRACE_START_MS", "NVN2_MODE_TRACE_DURATION_MS", "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_DEVICE", "PAD_FULLSCREEN_HOLD", "PAD_LAYOUT", "PAD_PROMPTS", "PAR_DEFER", "PAR_DEFER_DEPTH", "PAR_INDIRECT", "PASS_GPU", "PATCH_OUTPUT", "PATCH_SCENE", "PCACHE_GATE", "PERF_OVERLAY", "PERF_SLOW_GPU_MS", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POOL_FINI_WAIT", "POOL_IMPORT_LOG", "POOL_LAZY",
@@ -57,7 +57,7 @@ static const char *const known[] = {
 static const struct { const char *key, *section; } sections[] = {
     {"FPS_LIMIT", "frame rate"}, {"FPS60", "frame rate"},
     {"REALTIME", "frame rate"}, {"CLOTH_REALTIME", "frame rate"}, {"ANTILAG", "frame rate"}, {"HIGHFPS_FIX", "frame rate"},
-    {"FULLSCREEN", "display"}, {"CONSOLE", "display"}, {"WINDOW_MODE", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"},
+    {"FULLSCREEN", "display"}, {"CONSOLE", "display"}, {"WINDOW_MODE", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"}, {"HEADLESS", "display"},
     {"GPU_INDEX", "display"}, {"VULKAN_DRIVER", "display"}, {"OUTPUT_RES", "display"}, {"RENDER_SCALE", "display"}, {"UPSCALER", "display"}, {"WINDOW_FILTER", "display"}, {"DLSS_MODE", "display"}, {"PRESET", "display"}, {"DLSS_PRESET", "display"}, {"FSR_DIR", "display"}, {"FSR4_LDR", "display"}, {"SCENE_RES", "display"},
     {"ULTRAWIDE", "display"}, {"HUD_POSITION", "display"},
     {"SHARPNESS", "display"}, {"SMAA", "display"}, {"CRT_FILTER", "display"}, {"CRT_LINES", "display"}, {"FRAME_GEN", "display"}, {"FRAME_GEN_BY", "display"}, {"ASPECT", "display"}, {"FOV", "display"}, {"COLOR_PRESET", "display"},
@@ -102,7 +102,7 @@ static const CfgMeta metas[] = {
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"CONSOLE", "1", "0|1", RESTART}, {"WINDOW_MODE", "windowed", "windowed|borderless|fullscreen", LIVE},
     {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
-    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
+    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"HEADLESS", "", NULL, RESTART}, {"GPU_INDEX", "", NULL, RESTART},
     // The path of a Vulkan ICD JSON file ("~" expands) to use instead of the system's drivers; empty: the system's.
     // vk_driver_env.c sets VK_DRIVER_FILES from it before the loader runs.
     {"VULKAN_DRIVER", "", NULL, RESTART},
