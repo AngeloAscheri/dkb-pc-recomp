@@ -31,7 +31,15 @@ jobs:
           python -m pip install -r tools/requirements.txt
           "${{ steps.py314.outputs.python-path }}" -m pip install -r tools/requirements-py314.txt
           sudo apt-get install -y xvfb
-      - name: Installer tests, tier 0
+      - name: Installer tests, tier 0, with an empty home folder
         env:
           DKB_TEST_PYTHON314: ${{ steps.py314.outputs.python-path }}
-        run: xvfb-run -a python tools/test.py --tier 0 --area installer --verbose
+        # The setup keeps everything in the install and work folders (#402): the tests run with HOME pointing at an
+        # empty folder (and the XDG folders unset, so they fall back to it), and anything left there fails the job.
+        run: |
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$home"
+          env -u XDG_CACHE_HOME -u XDG_CONFIG_HOME -u XDG_DATA_HOME HOME="$home" \
+            xvfb-run -a python tools/test.py --tier 0 --area installer --verbose
+          left=$(find "$home" -mindepth 1 | head -20)
+          if [ -n "$left" ]; then echo "written to the home folder:"; echo "$left"; exit 1; fi
