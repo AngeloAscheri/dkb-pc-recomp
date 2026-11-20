@@ -277,6 +277,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         (self.dest / 'profile').mkdir()
         (self.dest / 'profile' / 'save.bin').write_text('save')
         (self.dest / 'dkb.ini').write_text('[x]')
+        (self.dest / 'mods').mkdir()
         return b.work_folder(self.dest.resolve(), self.temp, None)
 
     def test_uninstall_keeps_saves_by_default(self):
@@ -285,11 +286,12 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertGreater(freed, 0)
         self.assertIn(str(folder), removed)
         self.assertFalse(folder.exists())
-        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), ['dkb.ini', 'profile'])
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), ['dkb.ini', 'mods', 'profile'])
         self.assertEqual((self.dest / 'profile' / 'save.bin').read_text(), 'save')
 
     def test_uninstall_can_delete_saves_too(self):
         folder = self.installed_with_saves()
+        (self.dest / '.dkb-setup.lock').unlink(missing_ok=True)   # uninstall's own lock file must go too
         b.uninstall(self.dest, self.temp, keep_saves=False)
         self.assertFalse(folder.exists())
         self.assertFalse(self.dest.exists())

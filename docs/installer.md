@@ -147,7 +147,7 @@ is nothing to delete or the folder is not ours. The install folder is never touc
 folder and size with a Delete build files button.
 
 `python -m installer --dest "<install folder>" --uninstall` removes the whole install: the work folder and everything in the
-install folder except `profile/` (saves) and `dkb.ini`, which stay. A command line cannot ask, so `--delete-saves` with it
+install folder except `profile/` (saves), `dkb.ini` and `mods/`, which stay. A command line cannot ask, so `--delete-saves` with it
 removes those too and the install folder itself. It refuses a folder without this setup's record and any link inside it,
 before deleting anything, and exits 1 while a setup runs. The finish screen has an Uninstall button that asks for
 confirmation, then asks separately whether to delete the saves (default No).

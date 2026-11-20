@@ -157,7 +157,7 @@
  "ui.build_kept": "Build files kept: {path} ({size})",
  "ui.uninstall": "Uninstall",
  "ui.uninstall_confirm": "Remove the game from {path}? Its build files are removed too.",
- "ui.uninstall_saves": "Also delete your saves (profile/) and dkb.ini?",
+ "ui.uninstall_saves": "Also delete your saves (profile/), dkb.ini and mods/?",
  "dkb.uninstall_unowned": "{path} is not an install folder made by this setup, so nothing was removed.",
  "ui.delete_build": "Delete build files",
  "ui.open_folder": "Open folder",

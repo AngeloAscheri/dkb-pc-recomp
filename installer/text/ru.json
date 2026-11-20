@@ -157,7 +157,7 @@
  "ui.build_kept": "Файлы сборки сохранены: {path} ({size})",
  "ui.uninstall": "Удалить игру",
  "ui.uninstall_confirm": "Удалить игру из {path}? Файлы сборки тоже будут удалены.",
- "ui.uninstall_saves": "Также удалить сохранения (profile/) и dkb.ini?",
+ "ui.uninstall_saves": "Также удалить сохранения (profile/), dkb.ini и mods/?",
  "dkb.uninstall_unowned": "{path} не папка установки, созданная этой программой, поэтому ничего не удалено.",
  "ui.delete_build": "Удалить файлы сборки",
  "ui.open_folder": "Открыть папку",

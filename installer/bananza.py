@@ -1201,7 +1201,7 @@ def clean_main(options):
     return 0
 
 
-KEPT_SAVES = ('profile', 'dkb.ini')   # the player's own files, kept unless asked
+KEPT_SAVES = ('profile', 'dkb.ini', 'mods')   # the player's own files (saves, settings, loose mods), kept unless asked
 
 
 def uninstall(dest, temp=None, layout_temp=None, keep_saves=True):
@@ -1222,6 +1222,9 @@ def uninstall(dest, temp=None, layout_temp=None, keep_saves=True):
         ours = False
     if not ours:
         raise InstallError('dkb.uninstall_unowned', path=str(dest))
+    # dkb.busy while a setup runs. Taken before the listing, since it creates the lock file the listing must include;
+    # released before the deletes, since Windows cannot delete a file this process holds open.
+    lock_temp(dest).close()
     entries = [p for p in dest.iterdir() if not (keep_saves and p.name.lower() in KEPT_SAVES)]
     for p in entries:
         plain_tree(p)
@@ -1238,7 +1241,6 @@ def uninstall(dest, temp=None, layout_temp=None, keep_saves=True):
         except InstallError as e:
             if e.id != 'dkb.clean_nothing':
                 raise
-    lock_temp(dest).close()   # dkb.busy while a setup runs; released since Windows cannot delete an open file
     for p in entries:
         if p.is_dir():
             freed += folder_size(p)
