@@ -421,6 +421,20 @@ log shows `RomFS mods: N files from ... (R replace, A add)`. `TOTK_ROMFS_MODS` (
 another folder, and `TOTK_ROMFS_MODS=0` turns mods off. A folder with a `manifest.tsv` is still read as a checked
 overlay.
 
+## Linux release checklist
+
+Linux stays a preview until a release passes these checks by hand. CI covers what needs no game: the runtime compiles
+for Linux (`dkb-linux.yml`), the AppImage starts its window self-test, and the installer's tier-0 tests run at every
+push (`installer-tests.yml`). Before a release, someone with the game confirms on Linux, and the release notes say
+which were done and on what:
+
+- the AppImage, the tarball (`setup.sh`) and the source package each build the game from a `.nup`;
+- the game reaches the first level and plays 10 minutes on an AMD GPU with RADV and on an NVIDIA GPU, each with its
+  driver version named;
+- a save made there loads after a restart, and the menu (F1) opens and closes;
+- sound plays without crackling, and a controller works;
+- `--play DIR` starts the game, and running the setup again on the same folder updates it without rebuilding it all.
+
 ## What to report
 
 Open an issue with the issue form, or comment on [#3](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/3)
