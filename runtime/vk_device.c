@@ -64,14 +64,22 @@ static int instance_ext_present(const char *name) {
 // Mesa's drivers (RADV on Linux and the Steam Deck) keep a shader cache of their own beside our pipeline cache, by
 // default in ~/.cache and up to 1 GB: about 35 MB in a minute of the title screen. A Deck's /home is small and the game
 // usually sits on the SD card, so unless MESA_SHADER_CACHE_DIR names a folder, it goes to mesa-cache beside the exe.
-static void mesa_cache_beside_exe(void) {
+// NVIDIA's Linux driver does the same in ~/.cache/nvidia: __GL_SHADER_DISK_CACHE_PATH sends it to nv-cache beside the
+// exe, so the install folder holds every cache and deleting it leaves nothing behind (#402). Windows drivers read
+// neither name.
+static void cache_beside_exe(const char *var, const char *name) {
     char dir[PLAT_PATH_MAX * 2];
-    if (plat_getenv("MESA_SHADER_CACHE_DIR", dir, sizeof dir)) return;
+    if (plat_getenv(var, dir, sizeof dir)) return;
     int len = plat_exe_path(dir, sizeof dir - 16);
     char *cut = len ? plat_last_sep(dir) : NULL;
     if (!cut) return;
-    strcpy(cut + 1, "mesa-cache");
-    plat_setenv("MESA_SHADER_CACHE_DIR", dir);
+    strcpy(cut + 1, name);
+    plat_setenv(var, dir);
+}
+
+static void mesa_cache_beside_exe(void) {
+    cache_beside_exe("MESA_SHADER_CACHE_DIR", "mesa-cache");
+    cache_beside_exe("__GL_SHADER_DISK_CACHE_PATH", "nv-cache");
 }
 
 #ifndef _WIN32
