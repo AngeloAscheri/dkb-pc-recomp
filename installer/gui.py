@@ -1315,6 +1315,21 @@ def start_launcher(args, layout):
     return launcher
 
 
+def play_now(dest):
+    """--play: the game in dest, started from its folder and waited for, for a frontend (#402); 1 when dest holds no
+    finished install, as the Play button would stay disabled."""
+    if sys.stderr is None:   # pythonw.exe started with no handles
+        sys.stdout = sys.stderr = open(os.devnull, 'w')
+    if install_state(dest) != 'ready':
+        print(f'--play: no finished install in {dest or "(no folder given or remembered)"}', file=sys.stderr)
+        return 1
+    try:
+        return subprocess.call(play_command(dest), cwd=dest)
+    except OSError as e:
+        print(f'--play: {play_command(dest)[0]}: {e}', file=sys.stderr)
+        return 1
+
+
 # Options only the command-line setup takes. DKB-Setup.exe and the Linux AppImage start this window with their own
 # arguments, so a frontend that passes one of these gets `python -m installer` (cli.py) with the whole command line
 # instead of a window that rejects it (#402).
@@ -1342,10 +1357,15 @@ def main(argv=None):
     ap.add_argument('--launcher', type=Path, help='the launcher exe that started this window')
     ap.add_argument('--after-update', action='store_true', help='started by the version before: rebuild the install folder')
     ap.add_argument('--allow-downgrade', action='store_true', help='also offer a latest release older than this one')
+    ap.add_argument('--play', nargs='?', const='', metavar='DIR',
+                    help='start the finished game in DIR (default: the install folder the launcher remembers) with no '
+                         'window, wait for it and return its exit code')
     args = ap.parse_args(argv)
     layout = layouts.find(args.root)
     if args.selftest:
         return selftest(layout, args.shots, args.game)
+    if args.play is not None:
+        return play_now(args.play or (Settings.load(args.base).dest if args.base else ''))
     fix_tcl_paths()
     fix_dpi_awareness()
     launcher = start_launcher(args, layout) if args.base else None
