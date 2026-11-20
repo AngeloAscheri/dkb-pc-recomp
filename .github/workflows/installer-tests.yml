@@ -1,0 +1,37 @@
+name: Installer tests (Linux)
+
+# The installer's tier-0 tests (Python only, no game files) on Linux, at every push: the setup, the Bananza steps, the
+# window's logic and a self-closing Tk run, the launcher's updates and the FSR 4 and DLSS downloads (#402). The window
+# tests need Python 3.14 (tools/requirements-py314.txt) and a display, so they run under xvfb.
+
+on:
+  push:
+    branches: [bananza, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: py314
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the test dependencies
+        run: |
+          python -m pip install -r tools/requirements.txt
+          "${{ steps.py314.outputs.python-path }}" -m pip install -r tools/requirements-py314.txt
+          sudo apt-get install -y xvfb
+      - name: Installer tests, tier 0
+        env:
+          DKB_TEST_PYTHON314: ${{ steps.py314.outputs.python-path }}
+        run: xvfb-run -a python tools/test.py --tier 0 --area installer --verbose
