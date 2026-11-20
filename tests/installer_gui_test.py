@@ -61,6 +61,15 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(e['params']['p'], 'Привет')
 
 
+class ForwardTest(unittest.TestCase):
+    def test_cli_options_go_to_the_command_line_setup(self):
+        from unittest import mock
+        from installer import gui
+        with mock.patch('installer.cli.main', return_value=7) as cli_main:
+            self.assertEqual(gui.main(['--source', 'x.nup', '--dest=out', '--prepare']), 7)
+            cli_main.assert_called_once_with(['--source', 'x.nup', '--dest=out', '--prepare'])
+
+
 class ModelTest(unittest.TestCase):
     def test_steps_follow_the_events(self):
         m = fold(START, {'type': 'plan', 'run': ['check', 'extract'], 'skip': {'lift': 'current', 'compile': 'current'}},

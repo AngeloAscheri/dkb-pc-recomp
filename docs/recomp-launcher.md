@@ -38,8 +38,9 @@ terminal inside the package folder: it names what is missing and the command tha
 
 What another frontend can rely on, on every platform (#402):
 
-- **Setup.** `python -m installer` (`setup.sh` on Linux, `setup.command` on macOS, `DKB-Setup.exe` on Windows, which
-  passes its arguments on) takes `--source PATH` or `--nup`/`--exefs`/`--romfs`, and `--dest DIR`. With `--prepare` it
+- **Setup.** `python -m installer` (`setup.sh` on Linux, `setup.command` on macOS, `DKB-Setup.exe` on Windows and the
+  AppImage on Linux, which open the setup window but hand the command line to the setup when it holds `--dest`,
+  `--source`, `--prepare` or another setup-only option) takes `--source PATH` or `--nup`/`--exefs`/`--romfs`, and `--dest DIR`. With `--prepare` it
   prints `progress <0..1> <text>` lines; without, JSON events. Exit codes: 0 done, 1 failed, 2 bad command line,
   3 cancelled. Running it again on the same `--dest` resumes or updates the install. `--help` lists every option.
 - **Game.** Start `dkb` (`dkb.exe` on Windows) from its own folder. `--set KEY=VALUE`, repeatable, gives a `dkb.ini`

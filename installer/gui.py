@@ -1315,7 +1315,19 @@ def start_launcher(args, layout):
     return launcher
 
 
+# Options only the command-line setup takes. DKB-Setup.exe and the Linux AppImage start this window with their own
+# arguments, so a frontend that passes one of these gets `python -m installer` (cli.py) with the whole command line
+# instead of a window that rejects it (#402).
+CLI_OPTIONS = ('--dest', '--source', '--prepare', '--nup', '--exefs', '--romfs', '--keys', '--update', '--verify')
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if any(a.split('=', 1)[0] in CLI_OPTIONS for a in argv):
+        if sys.stdout is None:   # pythonw.exe started with no handles: nobody reads the lines, the exit code still counts
+            sys.stdout = sys.stderr = open(os.devnull, 'w')
+        from . import cli
+        return cli.main(argv)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--shots', type=Path)
