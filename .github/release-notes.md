@@ -27,6 +27,7 @@
 - #436 Two off-by-default scheduler settings against mutex convoys: `sched_handoff = 1` hands the core to a woken thread as an SVC returns, and `mutex_spin = <us>` polls briefly before a wait sleeps (@wrothgaril)
 - Performance presets: `preset = 1..5` (Minimum to Ultra) or `recommended`, which picks a level from the GPU's video memory, the RAM and the processor count at start. A preset only fills in defaults, so any option you set yourself still wins. The F1 menu has a Preset row.
 - `dlss_mode` picks the DLSS, FSR 3.1 and FSR 4 quality mode by name (DLAA, Quality, Balanced, Performance, Ultra Performance) while `scene_res` is `auto`.
+- #444 macOS: the install check finds the Vulkan loader and the headers on Apple silicon; `DKB_HEADLESS=1` runs the game with no window for captures and scripted runs (@anthonyyya)
 - #402 `DKB-Setup.exe` and the AppImage hand a command line with `--dest`, `--source`, `--prepare` or another setup-only option to the command-line setup; `--play [DIR]` starts the finished game with no window and returns its exit code; the AppImage's folder also ships as a `.tar.gz`
 - Crash reports: a second faulting thread waits for the first one's report instead of cutting its register dump short; on Linux and macOS a fault in a driver or a Vulkan layer is reported by file name (#443, #204)
 - #443 The pool guard at `main+0x429594` (3.2.0; 1.0.0 `main+0x410794`) checks the element it loads, not only the array: a new guard kind `load` (thanks @Felitendo for the disassembly)
