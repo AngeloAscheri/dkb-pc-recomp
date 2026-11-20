@@ -578,6 +578,10 @@ class Check(Step):
             command += ['-I', ctx.layout.deps / 'include']
         if os.name != 'nt':
             command += ['-ldl']
+            homebrew = Path('/opt/homebrew/include')
+            if (homebrew / 'vulkan').is_dir():
+                # Homebrew's prefix is not in clang's default search list: the Vulkan header lives there (tools/build_game.py:384)
+                command += ['-I', homebrew]
         if ctx.layout.sysroot:
             # The release's clang has no system headers of its own: build against the sysroot, as the game does (#293)
             command += ['--target=x86_64-linux-gnu', f'--sysroot={ctx.layout.sysroot}']
