@@ -32,11 +32,13 @@ try:
 except ImportError:
     ImageGrab = None
 
+from . import bananza
 from . import dlss
 from . import fsr4
 from . import ini
 from . import layout as layouts
 from . import update
+from .runner import InstallError
 from .guilogic import (DKB_STEP_ORDER, DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Launcher, Model,
                        Process, Settings, amount, default_dest, default_game_language, describe_event, install_state,
                        parse_line, play_command, previous_version, release_page, update_status,
@@ -450,6 +452,10 @@ class App:
         self.finish_steps.pack(fill='x', pady=(0, 8))
         self.finish_notice = self.notice(f)
         self.finish_notice.pack(fill='x', pady=(8, 0))
+        self.finish_build = ttk.Frame(f)
+        self.finish_build_text = ttk.Label(self.finish_build, wraplength=520, justify='left')
+        self.finish_build_text.pack(side='left')
+        self.button(self.finish_build, 'ui.delete_build', self.delete_build).pack(side='right')
         self.play_after = self.button(bar, 'ui.play', lambda: self.play(self.model.dest), style='Accent.TButton')
         return f
 
@@ -1080,10 +1086,38 @@ class App:
             self.open_button.state(['!disabled'])
         else:
             self.open_button.state(['disabled' if not Path(m.dest or '.').is_dir() else '!disabled'])
+        self.refresh_build()
         if result == 'ok' and self.game == 'bananza' and install_state(m.dest or '') == 'ready':
             self.play_after.pack(side='right', padx=(0, 8))
         else:
             self.play_after.pack_forget()
+
+    def build_folder(self):
+        """The kept work folder of the Bananza install just made, or None when there is none."""
+        if self.game != 'bananza' or not self.model.dest:
+            return None
+        try:
+            folder = bananza.work_folder(Path(self.model.dest).resolve(), self.run_args.get('temp'), self.layout.temp)
+        except InstallError:
+            return None
+        return folder if folder.is_dir() else None
+
+    def refresh_build(self):
+        folder = self.build_folder()
+        if folder is None:
+            self.finish_build.pack_forget()
+            return
+        self.finish_build_text.configure(text=self.cat('ui.build_kept', path=folder,
+                                                       size=f'{bananza.folder_size(folder) / 2**30:.1f} GB'))
+        self.finish_build.pack(fill='x', pady=(8, 0))
+
+    def delete_build(self):
+        try:
+            bananza.clean(Path(self.model.dest), self.run_args.get('temp'), self.layout.temp)
+        except InstallError as e:
+            self.finish_build_text.configure(text=self.cat(e.id, **e.params))
+            return
+        self.refresh_build()
 
     def back(self):
         """From the finish screen: the launcher's home when the folder is built, else the form."""
@@ -1333,7 +1367,7 @@ def play_now(dest):
 # Options only the command-line setup takes. DKB-Setup.exe and the Linux AppImage start this window with their own
 # arguments, so a frontend that passes one of these gets `python -m installer` (cli.py) with the whole command line
 # instead of a window that rejects it (#402).
-CLI_OPTIONS = ('--dest', '--source', '--prepare', '--nup', '--exefs', '--romfs', '--keys', '--update', '--verify')
+CLI_OPTIONS = ('--dest', '--source', '--prepare', '--nup', '--exefs', '--romfs', '--keys', '--update', '--verify', '--clean')
 
 
 def main(argv=None):

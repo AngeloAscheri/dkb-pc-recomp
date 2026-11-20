@@ -42,7 +42,8 @@ What another frontend can rely on, on every platform (#402):
   AppImage on Linux, which open the setup window but hand the command line to the setup when it holds `--dest`,
   `--source`, `--prepare` or another setup-only option) takes `--source PATH` or `--nup`/`--exefs`/`--romfs`, and `--dest DIR`. With `--prepare` it
   prints `progress <0..1> <text>` lines; without, JSON events. Exit codes: 0 done, 1 failed, 2 bad command line,
-  3 cancelled. Running it again on the same `--dest` resumes or updates the install. `--help` lists every option.
+  3 cancelled. Running it again on the same `--dest` resumes or updates the install. `--dest DIR --clean` deletes the
+  kept build files (generated C, objects, logs) of that install and prints the freed size. `--help` lists every option.
 - **Play.** `DKB-Setup.exe --play [DIR]` (or the AppImage) starts the finished game in `DIR`, by default the install
   folder the launcher remembers, with no window, waits for it and returns its exit code; 1 when there is no finished
   install there.

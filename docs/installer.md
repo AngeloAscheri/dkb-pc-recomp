@@ -140,6 +140,12 @@ folders available until setup completes. `--verify` also hashes kept output. Cha
 table, runtime, dependencies or translator identity invalidates the corresponding steps. `--temp` selects a workspace
 base; it is kept separate from the destination and sources. Re-running setup preserves `profile/`.
 
+A finished Bananza install keeps its generated C and objects in the work folder so a later run does not lift or compile
+again. `python -m installer --dest "<install folder>" --clean` (add `--temp` if setup used it) deletes that folder, only
+when its owner file says it belongs to that destination, and prints its path and the freed size; it exits 1 when there
+is nothing to delete or the folder is not ours. The install folder is never touched. The finish screen shows the same
+folder and size with a Delete build files button.
+
 CLI exit codes and JSON events are the same as below. Lightweight checks, with no game files:
 
 ```

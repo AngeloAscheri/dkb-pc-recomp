@@ -80,6 +80,8 @@ def main(argv=None):
     ap.add_argument('--temp', type=Path, help='temp folder (default: temp/ of the release on Windows, .setup-temp in '
                                               'the install folder on Linux, build/install-temp in a repository)')
     ap.add_argument('--verify', action='store_true', help='hash every kept file, also those this release made')
+    ap.add_argument('--clean', action='store_true',
+                    help='Bananza: delete the kept build files (generated C, objects, logs) of the install in --dest')
     ap.add_argument('--game', choices=('bananza', 'totk'), help='game profile (.nup and folder inputs select Bananza)')
     ap.add_argument('--nup', type=Path, help='Bananza .nup container (base 1.0.0, with or without update 3.2.0)')
     ap.add_argument('--nup-package', choices=('latest', 'base'),
@@ -120,6 +122,10 @@ def main(argv=None):
         if found is None:
             ap.error(f'--source {args.source}: neither a .nup file nor a folder with exefs/ and romfs/ in it')
         args.nup, args.exefs, args.romfs = found
+
+    if args.clean:
+        from .bananza import clean_main
+        return clean_main(args)
 
     # Only for a person at a terminal: the window checks by itself, and its CLI subprocess and the tests are not a tty.
     if sys.stdout.isatty() and not update.disabled(args.no_update_check):

@@ -1148,6 +1148,56 @@ def write_owner(path, value):
             raise InstallError('dkb.temp_unrelated', path=str(path.parent)) from None
 
 
+def work_folder(dest, temp, layout_temp):
+    """The folder that holds this install's generated C, objects and logs, for a resolved dest."""
+    raw_base = (temp or layout_temp or dest.parent / '.dkb-setup').absolute()
+    ensure_plain(raw_base)
+    tag = hashlib.sha256(str(dest).lower().encode()).hexdigest()[:12]
+    # The work folder's name goes onto compiler and MSBuild command lines that split on spaces (issue 134): keep
+    # only characters that need no quoting. The tag already tells two destinations apart; a name that was safe
+    # keeps its folder, so an interrupted setup still resumes.
+    safe = ''.join(ch if ch.isascii() and (ch.isalnum() or ch in '._-') else '_' for ch in dest.name)
+    return raw_base.resolve() / f'dkb-{safe}-{tag}'
+
+
+def folder_size(folder):
+    return sum(p.stat().st_size for p in folder.rglob('*') if p.is_file())
+
+
+def clean(dest, temp=None, layout_temp=None):
+    """Delete the work folder of the install at dest, once its owner file says it is ours; returns (folder, bytes
+    freed). dest itself is never touched."""
+    ensure_plain(dest.absolute())
+    dest = dest.resolve()
+    folder = work_folder(dest, temp, layout_temp)
+    if not folder.is_dir():
+        raise InstallError('dkb.clean_nothing', path=str(folder))
+    try:
+        ensure_plain(folder / OWNER)
+        owner = json.loads((folder / OWNER).read_text(encoding='utf-8'))
+        ours = (isinstance(owner, dict) and owner.get('destination') == str(dest) and owner.get('temporary') == str(folder)
+                and owner.get('game') in TARGETS)
+    except (OSError, ValueError):
+        ours = False
+    if not ours:
+        raise InstallError('dkb.temp_unrelated', path=str(folder))
+    plain_tree(folder)
+    size = folder_size(folder)
+    shutil.rmtree(folder)
+    return folder, size
+
+
+def clean_main(options):
+    rep = Reporter()
+    try:
+        folder, size = clean(options.dest, options.temp, layouts.find(options.root).temp)
+    except InstallError as e:
+        rep.error(e.id, e.params)
+        return 1
+    rep.emit('cleaned', folder=str(folder), bytes=size)
+    return 0
+
+
 def main(options):
     rep = LauncherReporter() if getattr(options, 'prepare', False) else Reporter()
     locks = []
@@ -1173,17 +1223,9 @@ def main(options):
                         value and Path(value).exists()):
                     setattr(options, name, Path(value))
         layout = tool_layout(found, options)
-        raw_base = (options.temp or layout.temp or dest.parent / '.dkb-setup').absolute()
-        ensure_plain(raw_base)
-        base = raw_base.resolve()
-        if os.name != 'nt' and unsafe_temp_chars(base):
-            raise InstallError('dkb.temp_unsafe_path', path=str(base))
-        tag = hashlib.sha256(str(dest).lower().encode()).hexdigest()[:12]
-        # The work folder's name goes onto compiler and MSBuild command lines that split on spaces (issue 134): keep
-        # only characters that need no quoting. The tag already tells two destinations apart; a name that was safe
-        # keeps its folder, so an interrupted setup still resumes.
-        safe = ''.join(ch if ch.isascii() and (ch.isalnum() or ch in '._-') else '_' for ch in dest.name)
-        temp = base / f'dkb-{safe}-{tag}'
+        temp = work_folder(dest, options.temp, layout.temp)
+        if os.name != 'nt' and unsafe_temp_chars(temp.parent):
+            raise InstallError('dkb.temp_unsafe_path', path=str(temp.parent))
         info = preflight(layout, options, dest, temp, rep)
         # All read-only validation succeeded. Logs and owned output may now be created.
         temp.mkdir(parents=True, exist_ok=True)

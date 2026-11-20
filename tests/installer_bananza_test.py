@@ -243,6 +243,34 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual((target / 'keep.txt').read_text(), 'untouched')
         self.assertFalse(self.dest.exists())
 
+    def test_clean_deletes_only_an_owned_work_folder(self):
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        folder = b.work_folder(self.dest.resolve(), self.temp, None)
+        self.assertTrue(folder.is_dir())
+        expected = b.folder_size(folder)
+        before = tree(self.dest)
+        out = io.StringIO()
+        args = SimpleNamespace(dest=self.dest, temp=self.temp, root=self.root)
+        with patch.object(b.layouts, 'find', return_value=self.layout), contextlib.redirect_stdout(out):
+            self.assertEqual(b.clean_main(args), 0)
+        self.assertEqual(json.loads(out.getvalue().splitlines()[-1])['bytes'], expected)
+        self.assertFalse(folder.exists())
+        self.assertEqual(tree(self.dest), before)
+        with patch.object(b.layouts, 'find', return_value=self.layout), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.clean_main(args), 1)   # nothing left to delete
+
+    def test_clean_refuses_a_missing_or_wrong_owner_file(self):
+        folder = b.work_folder(self.dest.resolve(), self.temp, None)
+        folder.mkdir(parents=True)
+        (folder / 'keep.txt').write_text('untouched')
+        with self.assertRaises(b.InstallError):
+            b.clean(self.dest, self.temp)
+        (folder / b.OWNER).write_text(json.dumps({'game': b.GAME, 'destination': 'elsewhere', 'temporary': str(folder)}))
+        with self.assertRaises(b.InstallError):
+            b.clean(self.dest, self.temp)
+        self.assertEqual((folder / 'keep.txt').read_text(), 'untouched')
+
     def test_fsr4_only_after_accept(self):
         # Without --fsr4 nothing is fetched; accept fetches into the install folder and records the release, which a
         # later setup keeps without asking again; a failed fetch warns and is tried again; off stops it.
