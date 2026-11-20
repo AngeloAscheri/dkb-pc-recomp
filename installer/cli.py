@@ -82,6 +82,9 @@ def main(argv=None):
     ap.add_argument('--verify', action='store_true', help='hash every kept file, also those this release made')
     ap.add_argument('--clean', action='store_true',
                     help='Bananza: delete the kept build files (generated C, objects, logs) of the install in --dest')
+    ap.add_argument('--uninstall', action='store_true',
+                    help='Bananza: remove the install in --dest and its build files; keeps profile/ and dkb.ini')
+    ap.add_argument('--delete-saves', action='store_true', help='with --uninstall: also delete profile/ and dkb.ini')
     ap.add_argument('--game', choices=('bananza', 'totk'), help='game profile (.nup and folder inputs select Bananza)')
     ap.add_argument('--nup', type=Path, help='Bananza .nup container (base 1.0.0, with or without update 3.2.0)')
     ap.add_argument('--nup-package', choices=('latest', 'base'),
@@ -123,6 +126,11 @@ def main(argv=None):
             ap.error(f'--source {args.source}: neither a .nup file nor a folder with exefs/ and romfs/ in it')
         args.nup, args.exefs, args.romfs = found
 
+    if args.delete_saves and not args.uninstall:
+        ap.error('--delete-saves needs --uninstall')
+    if args.uninstall:
+        from .bananza import uninstall_main
+        return uninstall_main(args)
     if args.clean:
         from .bananza import clean_main
         return clean_main(args)

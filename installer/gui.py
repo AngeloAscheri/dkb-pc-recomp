@@ -456,6 +456,7 @@ class App:
         self.finish_build_text = ttk.Label(self.finish_build, wraplength=520, justify='left')
         self.finish_build_text.pack(side='left')
         self.button(self.finish_build, 'ui.delete_build', self.delete_build).pack(side='right')
+        self.uninstall_button = self.button(bar, 'ui.uninstall', self.uninstall)
         self.play_after = self.button(bar, 'ui.play', lambda: self.play(self.model.dest), style='Accent.TButton')
         return f
 
@@ -1089,8 +1090,10 @@ class App:
         self.refresh_build()
         if result == 'ok' and self.game == 'bananza' and install_state(m.dest or '') == 'ready':
             self.play_after.pack(side='right', padx=(0, 8))
+            self.uninstall_button.pack(side='left', padx=(8, 0))
         else:
             self.play_after.pack_forget()
+            self.uninstall_button.pack_forget()
 
     def build_folder(self):
         """The kept work folder of the Bananza install just made, or None when there is none."""
@@ -1118,6 +1121,21 @@ class App:
             self.finish_build_text.configure(text=self.cat(e.id, **e.params))
             return
         self.refresh_build()
+
+    def uninstall(self):
+        dest = Path(self.model.dest)
+        title = self.cat('ui.title')
+        if not messagebox.askyesno(title, self.cat('ui.uninstall_confirm', path=dest)):
+            return
+        saves = messagebox.askyesno(title, self.cat('ui.uninstall_saves'), default='no')
+        try:
+            bananza.uninstall(dest, self.run_args.get('temp'), self.layout.temp, keep_saves=not saves)
+        except InstallError as e:
+            messagebox.showerror(title, self.cat(e.id, **e.params))
+            return
+        self.refresh_build()
+        self.play_after.pack_forget()
+        self.uninstall_button.pack_forget()
 
     def back(self):
         """From the finish screen: the launcher's home when the folder is built, else the form."""
@@ -1367,7 +1385,7 @@ def play_now(dest):
 # Options only the command-line setup takes. DKB-Setup.exe and the Linux AppImage start this window with their own
 # arguments, so a frontend that passes one of these gets `python -m installer` (cli.py) with the whole command line
 # instead of a window that rejects it (#402).
-CLI_OPTIONS = ('--dest', '--source', '--prepare', '--nup', '--exefs', '--romfs', '--keys', '--update', '--verify', '--clean')
+CLI_OPTIONS = ('--dest', '--source', '--prepare', '--nup', '--exefs', '--romfs', '--keys', '--update', '--verify', '--clean', '--uninstall')
 
 
 def main(argv=None):

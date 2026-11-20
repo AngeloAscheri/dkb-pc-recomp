@@ -271,6 +271,50 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
             b.clean(self.dest, self.temp)
         self.assertEqual((folder / 'keep.txt').read_text(), 'untouched')
 
+    def installed_with_saves(self):
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        (self.dest / 'profile').mkdir()
+        (self.dest / 'profile' / 'save.bin').write_text('save')
+        (self.dest / 'dkb.ini').write_text('[x]')
+        return b.work_folder(self.dest.resolve(), self.temp, None)
+
+    def test_uninstall_keeps_saves_by_default(self):
+        folder = self.installed_with_saves()
+        removed, freed = b.uninstall(self.dest, self.temp)
+        self.assertGreater(freed, 0)
+        self.assertIn(str(folder), removed)
+        self.assertFalse(folder.exists())
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), ['dkb.ini', 'profile'])
+        self.assertEqual((self.dest / 'profile' / 'save.bin').read_text(), 'save')
+
+    def test_uninstall_can_delete_saves_too(self):
+        folder = self.installed_with_saves()
+        b.uninstall(self.dest, self.temp, keep_saves=False)
+        self.assertFalse(folder.exists())
+        self.assertFalse(self.dest.exists())
+
+    def test_uninstall_refuses_a_folder_that_is_not_ours(self):
+        self.dest.mkdir()
+        (self.dest / 'mine.txt').write_text('mine')
+        with self.assertRaises(b.InstallError):
+            b.uninstall(self.dest, self.temp, keep_saves=False)
+        self.assertEqual((self.dest / 'mine.txt').read_text(), 'mine')
+
+    def test_uninstall_refuses_a_link_and_deletes_nothing(self):
+        if not symlinks_allowed():
+            self.skipTest('symlinks are not allowed here')
+        folder = self.installed_with_saves()
+        outside = Path(self.work.name) / 'outside'
+        outside.mkdir()
+        (outside / 'keep.txt').write_text('keep')
+        (self.dest / 'shader-cache-link').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(b.InstallError):
+            b.uninstall(self.dest, self.temp)
+        self.assertTrue(folder.is_dir())
+        self.assertTrue((self.dest / 'dkb-install.json').is_file())
+        self.assertEqual((outside / 'keep.txt').read_text(), 'keep')
+
     def test_fsr4_only_after_accept(self):
         # Without --fsr4 nothing is fetched; accept fetches into the install folder and records the release, which a
         # later setup keeps without asking again; a failed fetch warns and is tried again; off stops it.

@@ -1201,6 +1201,69 @@ def clean_main(options):
     return 0
 
 
+KEPT_SAVES = ('profile', 'dkb.ini')   # the player's own files, kept unless asked
+
+
+def uninstall(dest, temp=None, layout_temp=None, keep_saves=True):
+    """Remove the install at dest and its work folder; returns (removed paths, bytes freed). Needs our state or owner
+    record for this destination. With keep_saves, profile/ and dkb.ini stay and dest itself stays; links are refused
+    before anything is deleted and never followed."""
+    ensure_plain(dest.absolute())
+    dest = dest.resolve()
+    ensure_plain(dest / STATE)
+    ensure_plain(dest / DEST_OWNER)
+    try:
+        old = statefile.load(dest, STATE)
+        ours = old is not None and old.get('game') in TARGETS and old.get('destination') == str(dest)
+        if not ours and old is None:
+            owner = json.loads((dest / DEST_OWNER).read_text(encoding='utf-8'))
+            ours = isinstance(owner, dict) and owner.get('destination') == str(dest) and owner.get('game') in TARGETS
+    except (OSError, ValueError, statefile.StateError):
+        ours = False
+    if not ours:
+        raise InstallError('dkb.uninstall_unowned', path=str(dest))
+    entries = [p for p in dest.iterdir() if not (keep_saves and p.name.lower() in KEPT_SAVES)]
+    for p in entries:
+        plain_tree(p)
+        if linked(p):
+            raise InstallError('dkb.path_link', path=str(p))
+    folder = work_folder(dest, temp, layout_temp)
+    plain_tree(folder)
+    removed, freed = [], 0
+    if folder.is_dir():
+        try:
+            folder, size = clean(dest, temp, layout_temp)
+            removed.append(str(folder))
+            freed += size
+        except InstallError as e:
+            if e.id != 'dkb.clean_nothing':
+                raise
+    lock_temp(dest).close()   # dkb.busy while a setup runs; released since Windows cannot delete an open file
+    for p in entries:
+        if p.is_dir():
+            freed += folder_size(p)
+            shutil.rmtree(p)
+        else:
+            freed += p.stat().st_size
+            p.unlink()
+        removed.append(str(p))
+    if not keep_saves:
+        dest.rmdir()
+    return removed, freed
+
+
+def uninstall_main(options):
+    rep = Reporter()
+    try:
+        removed, freed = uninstall(options.dest, options.temp, layouts.find(options.root).temp,
+                                   keep_saves=not options.delete_saves)
+    except InstallError as e:
+        rep.error(e.id, e.params)
+        return 1
+    rep.emit('uninstalled', removed=removed, bytes=freed, saves_kept=not options.delete_saves)
+    return 0
+
+
 def main(options):
     rep = LauncherReporter() if getattr(options, 'prepare', False) else Reporter()
     locks = []
