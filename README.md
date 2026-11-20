@@ -148,7 +148,7 @@ The toolchain is TotK Recomp's ([docs/building.md](docs/building.md)): MSYS2 UCR
 ```
 
 Everything the build writes stays under `build\` and `generated\`, which git ignores. The game commits about 14 GB (13.5 GiB at the start and
-13.75 GiB after 40 minutes, rising about 6 MB per minute; longer sessions are untested), so 16 GB of RAM plus a large page file is the minimum for now and 32 GB is comfortable. Running and testing: [docs/dkb-testing.md](docs/dkb-testing.md).
+13.75 GiB after 40 minutes, rising about 6 MB per minute; longer sessions are untested), so 16 GB of RAM plus a large page file is the minimum for now and 32 GB is comfortable. System requirements and measured frame rates: [docs/requirements.md](docs/requirements.md). Running and testing: [docs/dkb-testing.md](docs/dkb-testing.md).
 
 ## FAQ
 
