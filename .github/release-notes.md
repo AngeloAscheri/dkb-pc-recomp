@@ -27,6 +27,8 @@
 - #436 Two off-by-default scheduler settings against mutex convoys: `sched_handoff = 1` hands the core to a woken thread as an SVC returns, and `mutex_spin = <us>` polls briefly before a wait sleeps (@wrothgaril)
 - Performance presets: `preset = 1..5` (Minimum to Ultra) or `recommended`, which picks a level from the GPU's video memory, the RAM and the processor count at start. A preset only fills in defaults, so any option you set yourself still wins. The F1 menu has a Preset row.
 - `dlss_mode` picks the DLSS, FSR 3.1 and FSR 4 quality mode by name (DLAA, Quality, Balanced, Performance, Ultra Performance) while `scene_res` is `auto`.
+- #402 `DKB-Setup.exe` and the AppImage hand a command line with `--dest`, `--source`, `--prepare` or another setup-only option to the command-line setup; `--play [DIR]` starts the finished game with no window and returns its exit code; the AppImage's folder also ships as a `.tar.gz`
+- Crash reports: a second faulting thread waits for the first one's report instead of cutting its register dump short; on Linux and macOS a fault in a driver or a Vulkan layer is reported by file name (#443, #204)
 - #443 The pool guard at `main+0x429594` (3.2.0; 1.0.0 `main+0x410794`) checks the element it loads, not only the array: a new guard kind `load` (thanks @Felitendo for the disassembly)
 - Windows: `DKB-Launcher.exe`, a small launcher you download once. It installs the build tools from the latest release (size and SHA-256 checked), runs the setup on your dump, then shows Play, looks for a new release at each start (a tick box turns that off), shows its notes and updates in place with one click: it downloads only the new tools zip, keeps the old version until the new one has started, rebuilds only the steps whose inputs changed and keeps your saves (`profile/`) and `dkb.ini`. It replaces itself with the new release's launcher. The setup zip still works as before, and `DKB-Setup.exe` now passes its arguments on to the setup (#402, #140).
 
@@ -104,6 +106,8 @@ Pull requests since 0.4.1: wrothgaril, roverdrubber, thatbananaman08, GlebShekov
 |---|---|---|
 | `DKB-Setup-<version>-windows.zip` | Windows 10/11 x64 | Supported. Carries its own tools and the installer window: unpack, run `DKB-Setup.exe`, pick your dump. |
 | `DKB-Setup-<version>-linux-x86_64.tar.gz` | Linux x86-64, kernel 6.7 or later | Preview. Source package with `setup.sh`: you install the system packages it lists (`./setup.sh --check`), then it runs the command-line installer. |
+| `DKB-Setup-<version>-x86_64.AppImage` | Linux x86-64 (SteamOS, any distribution with glibc 2.31 or later) | Preview. Self-contained: bundles Python, LLVM and a sysroot, so no system packages are needed. Make it executable and run it. |
+| `DKB-Setup-<version>-x86_64.tar.gz` | Same as the AppImage | New. The AppImage's folder as a plain archive, for launchers that cannot mount an AppImage (a Flatpak sandbox): unpack, run `./setup.sh`; `./play.sh DIR` starts the finished game (#402). |
 | `DKB-Setup-<version>-macos-arm64.zip` | macOS 14.4 or later, Apple silicon | Preview. Same idea with `setup.command`. Play is not verified and the destructible terrain is missing (Metal has no geometry stage). |
 
 ## Requirements (Windows)
